@@ -1,0 +1,15 @@
+[package]
+name = "prosody-server"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "rserver"
+crate-type = ["cdylib"]
+
+[dependencies]
+mlua = { version = "^0.6", features = ["async", "lua52", "vendored", "module"] }
+tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time"] }
+lazy_static = { version ="^1.4" }
