@@ -191,28 +191,30 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 		let r = ropt.as_ref().unwrap();
 		let mut rx = main_channel.lock_rx_lua()?;
 		let _guard = r.enter();
-		loop {
-			let msg = match rx.blocking_recv() {
-				Some(v) => v,
-				None => break,
+		r.block_on(async move {
+			loop {
+				let msg = match rx.recv().await {
+					Some(v) => v,
+					None => break,
+				};
+				match msg {
+					LuaMessage::CallString(key, name, value) => {
+						// TODO: error handling should probably not exit the entire main loop (:
+						let v = lua.registry_value::<LuaAnyUserData>(&*key)?;
+						let listeners = v.get_user_value::<LuaTable>()?;
+						match listeners.get::<&'static str, Option<LuaFunction>>(name)? {
+							Some(func) => {
+								func.call::<_, ()>((value))?;
+							},
+							None => (),
+						}
+					},
+					LuaMessage::Println(text) => println!("{}", text),
+				};
+				// TODO: do this only every N seconds or so
+				lua.expire_registry_values();
 			};
-			match msg {
-				LuaMessage::CallString(key, name, value) => {
-					// TODO: error handling should probably not exit the entire main loop (:
-					let v = lua.registry_value::<LuaAnyUserData>(&*key)?;
-					let listeners = v.get_user_value::<LuaTable>()?;
-					match listeners.get::<&'static str, Option<LuaFunction>>(name)? {
-						Some(func) => {
-							func.call::<_, ()>((value))?;
-						},
-						None => (),
-					}
-				},
-				LuaMessage::Println(text) => println!("{}", text),
-			};
-			// TODO: do this only every N seconds or so
-			lua.expire_registry_values();
-		};
-		Ok(())
+			Ok(())
+		})
 	})
 }
