@@ -2,16 +2,40 @@ use mlua::prelude::*;
 
 use std::ops::{Deref, Drop};
 use std::sync::{Arc, RwLock, RwLockReadGuard, Mutex, MutexGuard};
+use std::marker::PhantomData;
 
 use lazy_static::lazy_static;
 
+use tokio::select;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+use tokio_rustls::rustls;
+
+enum Callback {
+	Error,
+	Attach,
+	Detach,
+	Incoming,
+	ReadTimeout,
+	Disconnect,
+	Drain,
+	StartTls,
+	Status,
+	Connect,
+}
 
 #[derive(Debug)]
 enum LuaMessage {
 	Println(String),
 	CallString(Arc<LuaRegistryKey>, &'static str, String),
+
+	// Timer elapsed, either drop the sender or return the time after which the next invocation should happen
+	TimerElapsed(Arc<LuaRegistryKey>, Option<Arc<LuaRegistryKey>>, oneshot::Sender<std::time::Duration>),
+
+	TcpAccept{key: Arc<LuaRegistryKey>, stream: tokio::net::TcpStream, addr: std::net::SocketAddr},
+	TlsAccept{key: Arc<LuaRegistryKey>, stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>, addr: std::net::SocketAddr},
 }
 
 struct MpscPair<T> {
@@ -34,7 +58,7 @@ impl<T> MpscPair<T> {
 }
 
 lazy_static! {
-	static ref runtime: RwLock<Option<Runtime>> = RwLock::new(Some(Builder::new_multi_thread().enable_all().build().unwrap()));
+	static ref runtime: RwLock<Option<Runtime>> = RwLock::new(Some(Builder::new_current_thread().enable_all().build().unwrap()));
 	static ref main_channel: MpscPair<LuaMessage> = MpscPair::new(1024);
 }
 
@@ -113,41 +137,321 @@ pub(crate) fn test_mksender<'l>(lua: &'l Lua, listeners: LuaTable) -> LuaResult<
 	Ok(v)
 }
 
-/* pub(crate) struct Server<'a> {
-	conn: net::TcpListener,
-	// cache them to avoid a fallible syscall when lua asks
+pub(crate) struct TimerLua {
+	guard: oneshot::Sender<()>,
+}
+
+impl LuaUserData for TimerLua {}
+
+impl TimerLua {
+	fn new<'lua>(lua: &'lua Lua, timeout: std::time::Duration, func: LuaFunction, param: Option<LuaValue>) -> LuaResult<LuaAnyUserData<'lua>> {
+		let (local_guard, remote_guard) = oneshot::channel();
+
+		let v: LuaAnyUserData = lua.create_userdata(Self{
+			guard: local_guard,
+		})?;
+		let func = lua.create_registry_value(func)?;
+		let param = match param {
+			Some(v) => Some(Arc::new(lua.create_registry_value(v)?)),
+			None => None,
+		};
+
+		let global_tx = main_channel.tx.clone();
+		TimerWorker{
+			global_tx,
+			guard: remote_guard,
+			func: Arc::new(func),
+			param,
+		}.spawn(timeout);
+		Ok(v)
+	}
+}
+
+struct TimerWorker {
+	global_tx: mpsc::Sender<LuaMessage>,
+	guard: oneshot::Receiver<()>,
+	func: Arc<LuaRegistryKey>,
+	param: Option<Arc<LuaRegistryKey>>,
+}
+
+impl TimerWorker {
+	fn spawn(mut self, timeout: std::time::Duration) {
+		tokio::spawn(async move { self.run(timeout).await });
+	}
+
+	async fn run(&mut self, mut timeout: std::time::Duration) {
+		loop {
+			select! {
+				_ = tokio::time::sleep(timeout) => {
+					let (reply_tx, reply_rx) = oneshot::channel();
+					match self.global_tx.send(LuaMessage::TimerElapsed(self.func.clone(), self.param.clone(), reply_tx)).await {
+						Ok(_) => (),
+						Err(_) => break,
+					};
+					match reply_rx.await {
+						Ok(v) => {
+							timeout = v;
+							continue;
+						},
+						// reply channel dropped a.k.a. "this callback doesn't want us called again"-
+						Err(_) => break,
+					};
+				},
+				_ = &mut self.guard => {
+					// main value dropped or requested deregistration, exit.
+					break
+				},
+			}
+		}
+	}
+}
+
+pub(crate) fn add_task<'l>(lua: &'l Lua, (timeout, func, param): (f64, LuaFunction, Option<LuaValue>)) -> LuaResult<LuaAnyUserData<'l>> {
+	let timeout = std::time::Duration::from_secs_f64(timeout);
+	let guard = runtime.read().unwrap();
+	let rt = get_runtime(&guard)?;
+	let rt_guard = rt.enter();
+	let v = TimerLua::new(lua, timeout, func, param)?;
+	Ok(v)
+}
+
+struct TcpListenerLua {
+	tx: mpsc::UnboundedSender<()>,
+	// cached for the lua
 	sockaddr: String,
 	sockport: u16,
 }
 
-impl<'a> LuaUserData for Server<'a> {
-	fn add_fields<'lua, F: LuaUserDataFields<'lua, Self>>(fields: &mut F) {
-		fields.add_field_method_get("sockname", |l: &'lua Lua, this: &Self| -> LuaResult<String> {
-			Ok(this.sockaddr)
-		});
+impl TcpListenerLua {
+	fn new<'l>(lua: &'l Lua, sock: tokio::net::TcpListener, listeners: LuaTable, tls_config: Option<Arc<rustls::ServerConfig>>) -> LuaResult<LuaAnyUserData<'l>> {
+		let addr = sock.local_addr()?;
 
-		fields.add_field_method_get("sockport", |l: &'lua Lua, this: &Self| -> LuaResult<u16> {
-			Ok(this.sockport)
-		});
-	}
+		let (tx, rx) = mpsc::unbounded_channel();
 
-	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
-		// noop
+		let v: LuaAnyUserData = lua.create_userdata(Self{
+			tx,
+			sockaddr: format!("{}", addr.ip()),
+			sockport: addr.port(),
+		})?;
+		v.set_user_value(listeners)?;
+		let key = lua.create_registry_value(v.clone())?;
+
+		let global_tx = main_channel.tx.clone();
+		TcpListenerWorker{
+			rx,
+			global_tx,
+			sock,
+			tls_config: tls_config.and_then(|x| { Some(x.into()) }),
+			key: Arc::new(key),
+		}.spawn();
+		Ok(v)
 	}
 }
 
+impl LuaUserData for TcpListenerLua {
+}
 
-pub(crate) fn addserver<'l>(_lua: &'l Lua, (addr, port, listeners, _read_size, _tls_ctx): (String, u16, LuaValue, LuaValue, LuaValue)) -> LuaResult<Server<'l>> {
-	let addr = addr.parse::<net::IpAddr>()?;
-	let sock = net::TcpListener::bind(net::SocketAddr::new(addr, port))?;
+struct StartTlsWorker {
+	global_tx: mpsc::Sender<LuaMessage>,
+	accept: tokio_rustls::Accept<tokio::net::TcpStream>,
+	addr: std::net::SocketAddr,
+	key: Arc<LuaRegistryKey>,
+}
 
-	Ok(Server{
-		conn: sock,
-		listeners,
-		sockaddr: format!("{}", addr),
-		sockport: port,
-	})
-}*/
+impl StartTlsWorker {
+	fn spawn(mut self) {
+		tokio::spawn(async move { self.run().await });
+	}
+
+	async fn run(mut self) {
+		let stream = match self.accept.await {
+			Ok(v) => v,
+			Err(e) => {
+				eprintln!("failed to start TLS on TCP stream: {}", e);
+				return
+			},
+		};
+		match self.global_tx.send(LuaMessage::TlsAccept{key: self.key, stream, addr: self.addr}).await {
+			Ok(_) => (),
+			// other side got dropped somehow, exit.
+			Err(_) => (),
+		}
+	}
+}
+
+struct TcpListenerWorker {
+	rx: mpsc::UnboundedReceiver<()>,
+	global_tx: mpsc::Sender<LuaMessage>,
+	sock: tokio::net::TcpListener,
+	tls_config: Option<tokio_rustls::TlsAcceptor>,
+	key: Arc<LuaRegistryKey>,
+}
+
+impl TcpListenerWorker {
+	fn spawn(mut self) {
+		tokio::spawn(async move { self.run().await });
+	}
+
+	async fn run(&mut self) {
+		loop {
+			select! {
+				_ = self.rx.recv() => {
+					todo!()
+				},
+				result = self.sock.accept() => match result {
+					Ok((stream, addr)) => {
+						if let Some(acceptor) = self.tls_config.as_ref() {
+							let mut buf = [0u8; 1];
+							stream.peek(&mut buf[..]).await.unwrap();
+							if buf[0] == 0x16 {
+								StartTlsWorker{
+									global_tx: self.global_tx.clone(),
+									accept: acceptor.accept(stream),
+									key: self.key.clone(),
+									addr,
+								}.spawn();
+								continue
+							}
+						};
+						match self.global_tx.send(LuaMessage::TcpAccept{key: self.key.clone(), stream, addr}).await {
+							Ok(_) => (),
+							// other side got dropped somehow, exit.
+							Err(_) => break,
+						}
+
+					},
+					Err(e) => {
+						eprintln!("failed to accept a socket from the listener: {}. I think I need to sleep on that one.", e);
+						tokio::time::sleep(std::time::Duration::new(5, 0)).await;
+					},
+				},
+			}
+		}
+	}
+}
+
+pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, _config): (String, u16, LuaTable, Option<LuaTable>)) -> LuaResult<LuaAnyUserData<'l>> {
+	let addr = addr.parse::<std::net::IpAddr>()?;
+	let addr = std::net::SocketAddr::new(addr, port);
+	let sock = std::net::TcpListener::bind(addr)?;
+	sock.set_nonblocking(true)?;
+	let guard = runtime.read().unwrap();
+	let rt = get_runtime(&guard)?;
+	let rt_guard = rt.enter();
+	let sock = tokio::net::TcpListener::from_std(sock)?;
+	let mut tls_config = rustls::ServerConfig::new(Arc::new(rustls::NoClientAuth));
+	let certs = rustls::internal::pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open("./localhost.crt")?)).unwrap();
+	let key = rustls::internal::pemfile::rsa_private_keys(&mut  std::io::BufReader::new(std::fs::File::open("./localhost.key")?)).unwrap().pop().unwrap();
+	tls_config.set_single_cert(certs, key);
+	let tls_config = Arc::new(tls_config);
+	TcpListenerLua::new(lua, sock, listeners, Some(tls_config))
+}
+
+struct TcpStreamLua<T> {
+	tx: mpsc::UnboundedSender<()>,
+	// cached for the lua
+	sockaddr: String,
+	sockport: u16,
+	_marker: PhantomData<*const T>,
+}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> TcpStreamLua<T> {
+	fn new<'l>(lua: &'l Lua, stream: T, listeners: LuaTable, addr: std::net::SocketAddr) -> LuaResult<LuaAnyUserData<'l>> {
+		let (tx, rx) = mpsc::unbounded_channel();
+
+		let v: LuaAnyUserData = lua.create_userdata(Self{
+			tx,
+			sockaddr: format!("{}", addr.ip()),
+			sockport: addr.port(),
+			_marker: PhantomData,
+		})?;
+		v.set_user_value(listeners)?;
+		let key = lua.create_registry_value(v.clone())?;
+
+		let global_tx = main_channel.tx.clone();
+		TcpStreamWorker{
+			rx,
+			global_tx,
+			sock: stream,
+			key: Arc::new(key),
+		}.spawn();
+		Ok(v)
+	}
+}
+
+impl<T> LuaUserData for TcpStreamLua<T> {}
+
+struct TcpStreamWorker<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
+	rx: mpsc::UnboundedReceiver<()>,
+	global_tx: mpsc::Sender<LuaMessage>,
+	sock: T,
+	key: Arc<LuaRegistryKey>,
+}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> TcpStreamWorker<T> {
+	fn spawn(mut self) {
+		tokio::spawn(async move { self.run().await });
+	}
+
+	async fn run(&mut self) {
+		// do nothing, drop it
+	}
+}
+
+fn proc_message<'l>(lua: &'l Lua, msg: LuaMessage) -> LuaResult<()> {
+	match msg {
+		LuaMessage::CallString(key, name, value) => {
+			let v = lua.registry_value::<LuaAnyUserData>(&*key)?;
+			let listeners = v.get_user_value::<LuaTable>()?;
+			match listeners.get::<&'static str, Option<LuaFunction>>(name)? {
+				Some(func) => {
+					func.call::<_, ()>((value))?;
+				},
+				None => (),
+			}
+		},
+		LuaMessage::Println(text) => println!("{}", text),
+		LuaMessage::TimerElapsed(func, param, reply) => {
+			let func = lua.registry_value::<LuaFunction>(&*func)?;
+			let param = match param {
+				Some(key) => Some(lua.registry_value::<LuaValue>(&*key)?),
+				None => None,
+			};
+			// TODO: we need to include the timer handle here
+			match func.call::<_, Option<f64>>((LuaValue::Nil, LuaValue::Nil, param))? {
+				Some(v) => {
+					let _ = reply.send(std::time::Duration::from_secs_f64(v));
+				},
+				None => (),
+			};
+		},
+		LuaMessage::TcpAccept{key, stream, addr} => {
+			let v = lua.registry_value::<LuaAnyUserData>(&*key)?;
+			let listeners = v.get_user_value::<LuaTable>()?;
+			println!("new connection from {}", addr);
+			let conn = TcpStreamLua::new(lua, stream, listeners.clone(), addr)?;
+			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
+				Some(func) => {
+					func.call::<_, ()>((conn))?;
+				},
+				None => (),
+			};
+		},
+		LuaMessage::TlsAccept{key, stream, addr} => {
+			let v = lua.registry_value::<LuaAnyUserData>(&*key)?;
+			let listeners = v.get_user_value::<LuaTable>()?;
+			println!("new TLS connection from {}", addr);
+			let conn = TcpStreamLua::new(lua, stream, listeners.clone(), addr)?;
+			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
+				Some(func) => {
+					func.call::<_, ()>((conn, LuaValue::Nil))?;
+				},
+				None => (),
+			};
+		},
+	};
+	Ok(())
+}
 
 pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 	/* what is the overall strategy here?
@@ -197,20 +501,12 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 					Some(v) => v,
 					None => break,
 				};
-				match msg {
-					LuaMessage::CallString(key, name, value) => {
-						// TODO: error handling should probably not exit the entire main loop (:
-						let v = lua.registry_value::<LuaAnyUserData>(&*key)?;
-						let listeners = v.get_user_value::<LuaTable>()?;
-						match listeners.get::<&'static str, Option<LuaFunction>>(name)? {
-							Some(func) => {
-								func.call::<_, ()>((value))?;
-							},
-							None => (),
-						}
+				match proc_message(lua, msg) {
+					Ok(_) => (),
+					Err(e) => {
+						eprintln!("failed to process event loop message: {}", e)
 					},
-					LuaMessage::Println(text) => println!("{}", text),
-				};
+				}
 				// TODO: do this only every N seconds or so
 				lua.expire_registry_values();
 			};

@@ -1,14 +1,14 @@
 local server = require "librserver".server;
-local ctr = 0;
-sender = server.test_mkecho({
-	onreceived = function(text)
-		print("got "..text);
-		ctr = ctr + 1;
-		if ctr < 2 then
-			sender:send("magic!");
-		end
-	end;
-});
-sender:send("test1");
-print("entering loop");
+server.add_task(1, function()
+	print("1s");
+	return 1;
+end)
+server.add_task(0.3, function()
+	print("0.3s");
+	return 0.3;
+end)
+server.add_task(1.5, function()
+	print("here goes the boom boom");
+	error "boom";
+end)
 server.loop();
