@@ -1,3 +1,10 @@
+/**
+# Timers
+
+Provides simple timer functionality. Timers are represented on the Lua side via their [`TimerHandle`] object. This object has `:close()` and `:reschedule(t)` methods which can be used to close the timer or change the time at which it fires next.
+
+On the tokio side, the timer is implemented via the [`TimerWorker`] struct.
+*/
 use mlua::prelude::*;
 
 use std::sync::Arc;
@@ -11,6 +18,14 @@ use tokio::sync::watch;
 use super::core::{Message, MAIN_CHANNEL, with_runtime_lua};
 
 
+/**
+Handle on a rust-based timer.
+
+Lua methods offered:
+
+- `:close()`: Asks the timer worker to exit immediately, invalidating the timer handle from future use.
+- `:reschedule(t)`: Reschedule the timer to run in `t` seconds, no matter what its current expiration interval is.
+*/
 struct TimerHandle {
 	schedule: Arc<watch::Sender<Instant>>,
 	close: Option<oneshot::Sender<()>>,
@@ -59,6 +74,9 @@ impl TimerHandle {
 	}
 }
 
+/**
+Tokio-side implementation of of a timer.
+*/
 struct TimerWorker {
 	global_tx: mpsc::Sender<Message>,
 	self_schedule: Arc<watch::Sender<Instant>>,
