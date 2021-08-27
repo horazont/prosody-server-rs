@@ -12,20 +12,23 @@ use super::core::{Message, MAIN_CHANNEL, with_runtime_lua};
 
 
 struct TimerHandle {
-	schedule: Arc<watch::Sender<Option<Instant>>>,
+	schedule: Arc<watch::Sender<Instant>>,
+	close: Option<oneshot::Sender<()>>,
 }
 
 impl LuaUserData for TimerHandle {
 	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
-		methods.add_method("close", |_, this: &Self, _: ()| -> LuaResult<()> {
+		methods.add_method_mut("close", |_, this: &mut Self, _: ()| -> LuaResult<()> {
 			// we do not care about the result: either the receiver is gone already (then there's also no task triggering the timer) or the receiver will pick up on the cancellation request
-			let _ = this.schedule.send(None);
+			if let Some(ch) = this.close.take() {
+				let _ = ch.send(());
+			}
 			Ok(())
 		});
 
 		methods.add_method("reschedule", |_, this: &Self, t: f64| -> LuaResult<()> {
 			// we do not care about the result: either the receiver is gone already (then there's also no task triggering the timer) or it will receive this eventually.
-			let _ = this.schedule.send(Some(Instant::now() + Duration::from_secs_f64(t)));
+			let _ = this.schedule.send(Instant::now() + Duration::from_secs_f64(t));
 			Ok(())
 		});
 	}
@@ -33,11 +36,13 @@ impl LuaUserData for TimerHandle {
 
 impl TimerHandle {
 	fn new<'lua>(lua: &'lua Lua, timeout: Duration, func: LuaFunction) -> LuaResult<LuaAnyUserData<'lua>> {
-		let (schedule_tx, schedule_rx) = watch::channel(Some(Instant::now() + timeout));
+		let (schedule_tx, schedule_rx) = watch::channel(Instant::now() + timeout);
+		let (close_tx, close_rx) = oneshot::channel();
 		let schedule_tx = Arc::new(schedule_tx);
 
 		let v: LuaAnyUserData = lua.create_userdata(Self{
 			schedule: schedule_tx.clone(),
+			close: Some(close_tx),
 		})?;
 		v.set_user_value(func)?;
 		let handle = Arc::new(lua.create_registry_value(v.clone())?);
@@ -47,6 +52,7 @@ impl TimerHandle {
 			global_tx,
 			self_schedule: schedule_tx,
 			schedule: schedule_rx,
+			close: close_rx,
 			handle,
 		}.spawn();
 		Ok(v)
@@ -55,8 +61,9 @@ impl TimerHandle {
 
 struct TimerWorker {
 	global_tx: mpsc::Sender<Message>,
-	self_schedule: Arc<watch::Sender<Option<Instant>>>,
-	schedule: watch::Receiver<Option<Instant>>,
+	self_schedule: Arc<watch::Sender<Instant>>,
+	schedule: watch::Receiver<Instant>,
+	close: oneshot::Receiver<()>,
 	handle: Arc<LuaRegistryKey>,
 }
 
@@ -82,11 +89,7 @@ impl TimerWorker {
 	async fn run(mut self) {
 		loop {
 			let now = Instant::now();
-			let target: Instant = match *self.schedule.borrow_and_update() {
-				Some(v) => v,
-				// request to exit
-				None => return,
-			};
+			let target: Instant = *self.schedule.borrow_and_update();
 			let sleeptime = target.saturating_duration_since(now);
 			// NOTE: select! is fair in the sense that it'll pick a random one if multiple futures complete. That means that the fact that we saturate the sleeptime to 0 is at most an inefficiency and not an issue with starvation of the cancellation channel.
 			select! {
@@ -95,12 +98,8 @@ impl TimerWorker {
 						Some(v) => v,
 						None => return,
 					};
-					if self.schedule.borrow().is_none() {
-						// make sure that a concurrent attempt to close the channel always takes precedence
-						return
-					}
 					// cannot fail, we hold the receiver
-					let _ = self.self_schedule.send(Some(new_target));
+					let _ = self.self_schedule.send(new_target);
 				},
 				v = self.schedule.changed() => match v {
 					// if we got a new target value, we have to reloop
@@ -108,6 +107,7 @@ impl TimerWorker {
 					// unreachable as of the time of writing, but if the sender half had been dropped, we'd want to exit
 					Err(_) => return,
 				},
+				_ = &mut self.close => return,
 			}
 		}
 	}
