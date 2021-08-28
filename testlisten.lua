@@ -1,3 +1,4 @@
+package.cpath = "./target/" .. arg[1] .. "/?.so;" .. package.cpath;
 local server = require "librserver".server;
 server.listen("0.0.0.0", 1234, {
 	onconnect = function(sock)

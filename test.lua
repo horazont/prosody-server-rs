@@ -1,3 +1,4 @@
+package.cpath = "./target/" .. arg[1] .. "/?.so;" .. package.cpath;
 local server = require"net.server";
 local task_1s = server.add_task(1, function(t)
 	print("1s at "..tostring(t));
