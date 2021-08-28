@@ -8,6 +8,7 @@ mod mainloop;
 mod timer;
 mod server;
 mod conn;
+mod tls;
 
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {

@@ -5,6 +5,7 @@ Listener sockets for stream connections are generally TCP sockets. They may addi
 */
 use mlua::prelude::*;
 
+use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -20,6 +21,8 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::with_runtime_lua;
 use crate::core::{MAIN_CHANNEL, Message, Spawn};
+
+use crate::tls;
 
 /**
 Control if and how TLS is accepted on listener sockets.
@@ -40,6 +43,39 @@ enum TlsMode {
 	Multiplex{
 		tls_config: TlsAcceptor,
 	},
+}
+
+struct UnquotedStr(&'static str);
+
+impl fmt::Debug for UnquotedStr {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		f.write_str(self.0)
+	}
+}
+
+impl fmt::Debug for TlsMode {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::Plain{tls_config: Some(_)} => {
+				f.debug_struct("TlsMode::Plain")
+					.field("tls_config", &UnquotedStr("Some(tls_config)"))
+					.finish()
+			},
+			Self::Plain{tls_config: None} => {
+				f.debug_struct("TlsMode::Plain")
+					.field("tls_config", &UnquotedStr("None"))
+					.finish()
+			},
+			Self::DirectTls{..} => {
+				f.debug_struct("TlsMode::DirectTls")
+					.finish_non_exhaustive()
+			},
+			Self::Multiplex{..} => {
+				f.debug_struct("TlsMode::Multiplex")
+					.finish_non_exhaustive()
+			},
+		}
+	}
 }
 
 impl TlsMode {
@@ -178,13 +214,27 @@ impl ListenerHandle {
 	}
 }
 
-pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, _config): (String, u16, LuaTable, Option<LuaTable>)) -> LuaResult<LuaAnyUserData<'l>> {
+pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (String, u16, LuaTable, Option<LuaTable>)) -> LuaResult<LuaAnyUserData<'l>> {
 	let addr = addr.parse::<IpAddr>()?;
 	let addr = SocketAddr::new(addr, port);
 	let sock = std::net::TcpListener::bind(addr)?;
 	sock.set_nonblocking(true)?;
+
+	let tls_config = match config {
+		None => None,
+		Some(config) => match config.get::<_, Option<LuaTable>>("tls_config")? {
+			Some(tls_config) => Some(tls::server_config_from_lua(tls_config, lua)?),
+			None => None,
+		},
+	};
+
+	let tls_mode = match tls_config {
+		Some(tls_config) => TlsMode::DirectTls{tls_config: Arc::new(tls_config).into()},
+		None => TlsMode::Plain{tls_config: None},
+	};
+
 	with_runtime_lua!{
 		let sock = TcpListener::from_std(sock)?;
-		ListenerHandle::new_lua(lua, sock, listeners, TlsMode::Plain{tls_config: None})
+		ListenerHandle::new_lua(lua, sock, listeners, tls_mode)
 	}
 }

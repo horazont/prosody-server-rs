@@ -14,6 +14,7 @@ mlua = { version = "^0.6", features = ["async", "lua52", "vendored", "module"] }
 tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 lazy_static = { version ="^1.4" }
 tokio-rustls = { version = "^0.22" }
+rustls-pemfile = { version = "^0.2" }
 log = { version = "^0.4" }
 pin-project-lite = { version = "^0.2" }
 bytes = { version = "^1" }

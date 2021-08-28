@@ -35,17 +35,15 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 			};
 		},
 		Message::TlsAccept{handle, stream, addr} => {
-			let v = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = v.get_user_value::<LuaTable>()?;
-			println!("new TLS connection from {}", addr);
-			todo!();
-			/* let conn = TcpStreamLua::new(lua, stream, listeners.clone(), addr)?;
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			let handle = conn::ConnectionHandle::wrap_tls(lua, stream, listeners.clone(), Some(addr))?;
 			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
 				Some(func) => {
-					func.call::<_, ()>((conn, LuaValue::Nil))?;
+					func.call::<_, ()>((handle, LuaValue::Nil))?;
 				},
 				None => (),
-			}; */
+			};
 		},
 		Message::Incoming{handle, data} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;

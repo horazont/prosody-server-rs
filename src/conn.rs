@@ -86,11 +86,7 @@ impl LuaUserData for ConnectionHandle {
 }
 
 impl ConnectionHandle {
-	pub(crate) fn wrap_plain<'l>(lua: &'l Lua, conn: TcpStream, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
-		let addr = match addr {
-			Some(addr) => addr,
-			None => conn.local_addr()?,
-		};
+	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: SocketAddr) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
@@ -106,14 +102,27 @@ impl ConnectionHandle {
 		ConnectionWorker{
 			global_tx,
 			rx,
-			conn: ConnectionState::PlainServer{
-				sock: conn,
-				tls_config: None,
-			},
+			conn,
 			read_size: 8192,
 			handle: Arc::new(key),
 		}.spawn();
 		Ok(v)
+	}
+
+	pub(crate) fn wrap_plain<'l>(lua: &'l Lua, conn: TcpStream, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
+		let addr = match addr {
+			Some(addr) => addr,
+			None => conn.local_addr()?,
+		};
+		Self::wrap_state(lua, ConnectionState::PlainServer{sock: conn, tls_config: None}, listeners, addr)
+	}
+
+	pub(crate) fn wrap_tls<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
+		let addr = match addr {
+			Some(addr) => addr,
+			None => conn.get_ref().0.local_addr()?,
+		};
+		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, addr)
 	}
 }
 
