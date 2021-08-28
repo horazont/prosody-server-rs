@@ -8,6 +8,8 @@ use super::core::{
 	MAIN_CHANNEL,
 };
 
+use super::conn;
+
 
 fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 	match msg {
@@ -22,17 +24,15 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 			};
 		},
 		Message::TcpAccept{handle, stream, addr} => {
-			let v = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = v.get_user_value::<LuaTable>()?;
-			println!("new connection from {}", addr);
-			todo!();
-			/* let conn = TcpStreamLua::new(lua, stream, listeners.clone(), addr)?;
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			let handle = conn::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr))?;
 			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
 				Some(func) => {
-					func.call::<_, ()>((conn))?;
+					func.call::<_, ()>(handle)?;
 				},
 				None => (),
-			}; */
+			};
 		},
 		Message::TlsAccept{handle, stream, addr} => {
 			let v = lua.registry_value::<LuaAnyUserData>(&*handle)?;
@@ -46,6 +46,26 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				},
 				None => (),
 			}; */
+		},
+		Message::Incoming{handle, data} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			match listeners.get::<&'static str, Option<LuaFunction>>("onincoming")? {
+				Some(func) => {
+					func.call::<_, ()>((handle, lua.create_string(&data)?))?;
+				},
+				None => (),
+			};
+		},
+		Message::ReadClosed{handle} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			match listeners.get::<&'static str, Option<LuaFunction>>("ondisconnect")? {
+				Some(func) => {
+					func.call::<_, ()>(handle)?;
+				},
+				None => (),
+			};
 		},
 	};
 	Ok(())

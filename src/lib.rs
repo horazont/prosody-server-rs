@@ -6,6 +6,8 @@ pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 mod core;
 mod mainloop;
 mod timer;
+mod server;
+mod conn;
 
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
@@ -14,8 +16,7 @@ fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
 	let server = lua.create_table()?;
 	server.set("loop", lua.create_function(mainloop::mainloop)?)?;
 	server.set("_add_task", lua.create_function(timer::add_task)?)?;
-	/* server.set("test_mkecho", lua.create_function(backend::test_mksender)?)?;
-	server.set("listen", lua.create_function(backend::listen)?)?; */
+	server.set("listen", lua.create_function(server::listen)?)?;
 	exports.set("server", server)?;
 
 	exports.set("version", VERSION)?;

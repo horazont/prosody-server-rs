@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, Instant};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
+use bytes::Bytes;
+
 use lazy_static::lazy_static;
 
 use tokio::net::TcpStream;
@@ -53,6 +55,15 @@ pub(crate) enum Message {
 		/// The remote address of the accepted stream
 		addr: SocketAddr,
 	},
+
+	Incoming{
+		handle: Arc<LuaRegistryKey>,
+		data: Bytes,
+	},
+
+	ReadClosed{
+		handle: Arc<LuaRegistryKey>,
+	},
 }
 
 /// Wrapper around an MpscChannel which brokers access to the rx/tx pair
@@ -85,7 +96,7 @@ impl<T> MpscChannel<T> {
 
 lazy_static! {
 	#[doc(hidden)]
-	pub(crate) static ref RUNTIME: RwLock<Option<Runtime>> = RwLock::new(Some(Builder::new_current_thread().enable_all().build().unwrap()));
+	pub(crate) static ref RUNTIME: RwLock<Option<Runtime>> = RwLock::new(Some(Builder::new_multi_thread().enable_all().build().unwrap()));
 	#[doc(hidden)]
 	pub(crate) static ref MAIN_CHANNEL: MpscChannel<Message> = MpscChannel::new(1024);
 }
@@ -95,6 +106,10 @@ pub(crate) fn get_runtime<'x>(guard: &'x RwLockReadGuard<'x, Option<Runtime>>) -
 		Some(v) => Ok(v),
 		None => Err(LuaError::RuntimeError("server backend runtime has exited".into())),
 	}
+}
+
+pub(crate) trait Spawn {
+	fn spawn(self);
 }
 
 #[macro_export]
