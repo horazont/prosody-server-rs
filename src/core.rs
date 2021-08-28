@@ -97,9 +97,14 @@ pub(crate) fn get_runtime<'x>(guard: &'x RwLockReadGuard<'x, Option<Runtime>>) -
 	}
 }
 
-pub(crate) fn with_runtime_lua<T, F: FnOnce() -> LuaResult<T>>(f: F) -> LuaResult<T> {
-	let guard = RUNTIME.read().unwrap();
-	let rt = get_runtime(&guard)?;
-	let rt_guard = rt.enter();
-	f()
+#[macro_export]
+macro_rules! with_runtime_lua {
+	($($b:stmt);*) => {
+		{
+			let guard = crate::core::RUNTIME.read().unwrap();
+			let rt = crate::core::get_runtime(&guard)?;
+			let _rt_guard = rt.enter();
+			$($b)*
+		}
+	}
 }

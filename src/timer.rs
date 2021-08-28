@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
-use super::core::{Message, MAIN_CHANNEL, with_runtime_lua};
+use crate::with_runtime_lua;
+use super::core::{Message, MAIN_CHANNEL};
 
 
 /**
@@ -149,8 +150,8 @@ impl TimerWorker {
 
 pub(crate) fn add_task<'l>(lua: &'l Lua, (timeout, func): (f64, LuaFunction)) -> LuaResult<LuaAnyUserData<'l>> {
 	let timeout = std::time::Duration::from_secs_f64(timeout);
-	with_runtime_lua(|| {
+	with_runtime_lua!{
 		let result = TimerHandle::new(lua, timeout, func);
 		result
-	})
+	}
 }
