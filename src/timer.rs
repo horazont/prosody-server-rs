@@ -27,7 +27,15 @@ Lua methods offered:
 - `:reschedule(t)`: Reschedule the timer to run in `t` seconds, no matter what its current expiration interval is.
 */
 struct TimerHandle {
+	/// Shared buffer for the most recent request for the time at which the timer should fire.
+	///
+	/// This is written from both the Lua side (via the `:reschedule()` method) and from the worker itself, which uses the watch as its own buffer for scheduling the next invocation.
 	schedule: Arc<watch::Sender<Instant>>,
+	/// Signalling channel to stop the timer and drop it.
+	///
+	/// No matter if this channel is consumed and sent, or just dropped, the worker will exit when the receiving side becomes ready or closed.
+	///
+	/// Closure is not handled via the `schedule` channel to avoid the possibility of a reschedule overwriting a close request. A close request should always take precedence.
 	close: Option<oneshot::Sender<()>>,
 }
 
@@ -53,8 +61,14 @@ impl TimerHandle {
 	fn new<'lua>(lua: &'lua Lua, timeout: Duration, func: LuaFunction) -> LuaResult<LuaAnyUserData<'lua>> {
 		let (schedule_tx, schedule_rx) = watch::channel(Instant::now() + timeout);
 		let (close_tx, close_rx) = oneshot::channel();
+		// We need to keep the transmission side of the schedule watch in an Arc, because both the Lua and the tokio side need to be able to write to it.
 		let schedule_tx = Arc::new(schedule_tx);
 
+		// The idea here is to create a Lua user data and then attach the callback function to it as user value. That helps the Lua GC keeping track of the function without us having to explicitly allocate a registry slot for it.
+		//
+		// Speaking of registry slots: We keep the TimerHandle in a registry slot. This may seem a bit odd, but we need to be able to produce a reference to it at any time from Rust code (when a timer expires), so it needs to live at least as long as the timer worker.
+		//
+		// The timer worker will generally be the only entity keeping a reference to the LuaRegistryKey under which the TimerHandle is stored, so when the worker is dropped, the timer handle will eventually be expired. The main loop is responsible for triggering the drop of expired registry keys via the corresponding Lua method.
 		let v: LuaAnyUserData = lua.create_userdata(Self{
 			schedule: schedule_tx.clone(),
 			close: Some(close_tx),
@@ -62,6 +76,7 @@ impl TimerHandle {
 		v.set_user_value(func)?;
 		let handle = Arc::new(lua.create_registry_value(v.clone())?);
 
+		// The timer worker will infrom the main (Lua) loop about expired timers via the global event channel. If the channel is full, the timer event will be delivered late, however.
 		let global_tx = MAIN_CHANNEL.clone_tx();
 		TimerWorker{
 			global_tx,
@@ -125,6 +140,7 @@ impl TimerWorker {
 					// unreachable as of the time of writing, but if the sender half had been dropped, we'd want to exit
 					Err(_) => return,
 				},
+				// request to close the timer -> exit immediately
 				_ = &mut self.close => return,
 			}
 		}
