@@ -20,6 +20,9 @@ return {
 		end;
 	};
 
+	-- SERVER FUNCTIONS
+	listen = server_impl.listen;
+
 	-- MAIN LOOP FUNCTIONS
 	loop = server_impl.loop;
 }

@@ -1,5 +1,4 @@
-package.cpath = "./target/" .. arg[1] .. "/?.so;" .. package.cpath;
-local server = require "librserver".server;
+local server = require "testserver";
 server.listen("0.0.0.0", 1234, {
 	onconnect = function(sock)
 		print("oh yeah, Lua got hold of a PLAIN TEXT socket \\o/")

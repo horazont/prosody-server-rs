@@ -1,5 +1,4 @@
-package.cpath = "./target/" .. arg[1] .. "/?.so;" .. package.cpath;
-local server = require "librserver".server;
+local server = require "testserver";
 server.listen("0.0.0.0", 1234, {
 	onconnect = function(sock)
 		-- print("connection from "..sock:ip()..":"..tostring(sock:port()));
