@@ -191,7 +191,45 @@ struct ConnectionWorker {
 	handle: Arc<LuaRegistryKey>,
 }
 
+enum ReadResult {
+	Closed,
+	Continue,
+}
+
 impl ConnectionWorker {
+	#[inline]
+	async fn proc_read_buffer(&mut self, buf: Bytes) -> Result<ReadResult, ()> {
+		if buf.len() == 0 {
+			// end of file
+			match self.global_tx.send(Message::ReadClosed{handle: self.handle.clone()}).await {
+				Ok(_) => Ok(ReadResult::Closed),
+				Err(_) => Err(()),
+			}
+		} else {
+			match self.global_tx.send(Message::Incoming{
+				handle: self.handle.clone(),
+				data: buf,
+			}).await {
+				Ok(_) => Ok(ReadResult::Continue),
+				// again, only during shutdown
+				Err(_) => Err(()),
+			}
+		}
+	}
+
+	#[inline]
+	async fn proc_write_buffer(&mut self, buf: Bytes) -> Result<(), ()> {
+		// TODO: asynchronize this in some way?
+		match self.conn.write_all(&buf).await {
+			Ok(_) => Ok(()),
+			Err(e) => {
+				// TODO: report this to lua, I guess
+				error!("write error: {}", e);
+				Err(())
+			},
+		}
+	}
+
 	async fn run_draining(mut self) {
 		select! {
 			_ = self.conn.shutdown() => return,
@@ -207,24 +245,10 @@ impl ConnectionWorker {
 			}
 			select! {
 				result = self.conn.read_buf(buf.as_mut().unwrap()) => match result {
-					Ok(_) => {
-						let buf: Bytes = buf.take().unwrap().into_inner().freeze();
-						if buf.len() == 0 {
-							// end of file
-							match self.global_tx.send(Message::ReadClosed{handle: self.handle.clone()}).await {
-								Ok(_) => (),
-								Err(_) => return,
-							}
-							return self.run_draining().await;
-						}
-						match self.global_tx.send(Message::Incoming{
-							handle: self.handle.clone(),
-							data: buf,
-						}).await {
-							Ok(_) => (),
-							// again, only during shutdown
-							Err(_) => return,
-						}
+					Ok(_) => match self.proc_read_buffer(buf.take().unwrap().into_inner().freeze()).await {
+						Ok(ReadResult::Closed) => return self.run_draining().await,
+						Ok(ReadResult::Continue) => (),
+						Err(()) => return,
 					},
 					Err(e) => {
 						warn!("read error: {}", e);
@@ -244,16 +268,9 @@ impl ConnectionWorker {
 					Some(ControlMessage::Close) => {
 						return self.run_draining().await;
 					},
-					Some(ControlMessage::Write(buf)) => {
-						// TODO: asynchronize this in some way?
-						match self.conn.write_all(&buf).await {
-							Ok(_) => (),
-							Err(e) => {
-								// TODO: report this to lua, I guess
-								error!("write error: {}", e);
-								return;
-							},
-						}
+					Some(ControlMessage::Write(buf)) => match self.proc_write_buffer(buf).await {
+						Ok(()) => (),
+						Err(()) => return,
 					},
 					None => return,
 				},
@@ -271,38 +288,17 @@ impl ConnectionWorker {
 			select! {
 				msg = self.rx.recv() => match msg {
 					Some(ControlMessage::Close) => return self.run_wclosed().await,
-					Some(ControlMessage::Write(buf)) => {
-						// TODO: asynchronize this in some way?
-						match self.conn.write_all(&buf).await {
-							Ok(_) => (),
-							Err(e) => {
-								// TODO: report this to lua, I guess
-								error!("write error: {}", e);
-								return;
-							},
-						}
+					Some(ControlMessage::Write(buf)) => match self.proc_write_buffer(buf).await {
+						Ok(()) => (),
+						Err(()) => return,
 					},
 					None => return,
 				},
 				result = self.conn.read_buf(buf.as_mut().unwrap()) => match result {
-					Ok(_) => {
-						let buf: Bytes = buf.take().unwrap().into_inner().freeze();
-						if buf.len() == 0 {
-							// end of file
-							match self.global_tx.send(Message::ReadClosed{handle: self.handle.clone()}).await {
-								Ok(_) => (),
-								Err(_) => return,
-							}
-							return self.run_rclosed().await;
-						}
-						match self.global_tx.send(Message::Incoming{
-							handle: self.handle.clone(),
-							data: buf,
-						}).await {
-							Ok(_) => (),
-							// again, only during shutdown
-							Err(_) => return,
-						}
+					Ok(_) => match self.proc_read_buffer(buf.take().unwrap().into_inner().freeze()).await {
+						Ok(ReadResult::Closed) => return self.run_rclosed().await,
+						Ok(ReadResult::Continue) => (),
+						Err(()) => return,
 					},
 					Err(e) => {
 						warn!("read error: {}", e);
