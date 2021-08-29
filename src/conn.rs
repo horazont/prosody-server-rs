@@ -105,6 +105,7 @@ impl ConnectionHandle {
 			conn,
 			read_size: 8192,
 			handle: Arc::new(key),
+			buf: None,
 		}.spawn();
 		Ok(v)
 	}
@@ -197,12 +198,26 @@ struct ConnectionWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	conn: ConnectionState,
 	read_size: usize,
+	buf: Option<Limit<BytesMut>>,
 	handle: Arc<LuaRegistryKey>,
 }
 
 enum ReadResult {
 	Closed,
 	Continue,
+}
+
+#[inline]
+fn mkbuffer(buf: &mut Option<Limit<BytesMut>>, size: usize) -> &mut Limit<BytesMut> {
+	buf.get_or_insert_with(|| {
+		BytesMut::with_capacity(size).limit(size)
+	})
+}
+
+#[inline]
+async fn read_with_buf(conn: &mut ConnectionState, buf: &mut Option<Limit<BytesMut>>, size: usize) -> io::Result<Bytes> {
+	conn.read_buf(mkbuffer(buf, size)).await?;
+	Ok(buf.take().unwrap().into_inner().freeze())
 }
 
 impl ConnectionWorker {
@@ -247,14 +262,10 @@ impl ConnectionWorker {
 	}
 
 	async fn run_wclosed(mut self) {
-		let mut buf: Option<Limit<BytesMut>> = None;
 		loop {
-			if buf.is_none() {
-				buf = Some(BytesMut::with_capacity(self.read_size).limit(self.read_size))
-			}
 			select! {
-				result = self.conn.read_buf(buf.as_mut().unwrap()) => match result {
-					Ok(_) => match self.proc_read_buffer(buf.take().unwrap().into_inner().freeze()).await {
+				result = read_with_buf(&mut self.conn, &mut self.buf, self.read_size) => match result {
+					Ok(buf) => match self.proc_read_buffer(buf).await {
 						Ok(ReadResult::Closed) => return self.run_draining().await,
 						Ok(ReadResult::Continue) => (),
 						Err(()) => return,
@@ -289,11 +300,7 @@ impl ConnectionWorker {
 	}
 
 	async fn run(mut self) {
-		let mut buf: Option<Limit<BytesMut>> = None;
 		loop {
-			if buf.is_none() {
-				buf = Some(BytesMut::with_capacity(self.read_size).limit(self.read_size))
-			}
 			select! {
 				msg = self.rx.recv() => match msg {
 					Some(ControlMessage::Close) => return self.run_wclosed().await,
@@ -303,8 +310,8 @@ impl ConnectionWorker {
 					},
 					None => return,
 				},
-				result = self.conn.read_buf(buf.as_mut().unwrap()) => match result {
-					Ok(_) => match self.proc_read_buffer(buf.take().unwrap().into_inner().freeze()).await {
+				result = read_with_buf(&mut self.conn, &mut self.buf, self.read_size) => match result {
+					Ok(buf) => match self.proc_read_buffer(buf).await {
 						Ok(ReadResult::Closed) => return self.run_rclosed().await,
 						Ok(ReadResult::Continue) => (),
 						Err(()) => return,
