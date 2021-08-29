@@ -255,6 +255,7 @@ impl ConnectionWorker {
 	}
 
 	async fn run_draining(mut self) {
+		self.buf = None;
 		select! {
 			_ = self.conn.shutdown() => return,
 			_ = self.global_tx.closed() => return,
@@ -282,6 +283,7 @@ impl ConnectionWorker {
 	}
 
 	async fn run_rclosed(mut self) {
+		self.buf = None;
 		loop {
 			select! {
 				msg = self.rx.recv() => match msg {
