@@ -12,13 +12,13 @@ server.listen("0.0.0.0", 1234, {
 		sock:close();
 	end,
 }, {
-    tls_config = {
-		sni_names = {
-			["localhost"] = {
-				certificate = "./localhost.crt",
-				key = "./localhost.key",
-			},
-		},
-	},
+    tls_direct = true,
+    tls_ctx = assert(server:tls_builder():apply({
+		mode = "server",
+		-- protocol is completely ignored in rust for now, but it is needed for the existing LuaSec backends
+		protocol = "tlsv1_2+",
+		certificate = "./certs/localhost.crt",
+		key = "./certs/localhost.key",
+	}):build()),
 });
 server.loop();

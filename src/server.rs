@@ -220,20 +220,28 @@ pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (String,
 	let sock = std::net::TcpListener::bind(addr)?;
 	sock.set_nonblocking(true)?;
 
-	let tls_config = match config {
-		None => None,
-		Some(config) => match config.get::<_, Option<LuaTable>>("tls_config")? {
-			Some(tls_config) => Some(tls::server_config_from_lua(tls_config, lua)?),
-			None => None,
+	let tls_mode = match config {
+		None => TlsMode::Plain{tls_config: None},
+		Some(config) => {
+			let tls_config =match config.get::<_, Option<LuaAnyUserData>>("tls_ctx")? {
+				Some(v) => match *tls::TlsConfig::get_ref_from_lua(&v)? {
+					tls::TlsConfig::Server{ref cfg, ..} => Some(cfg.clone()),
+					_ => return Err(LuaError::RuntimeError(format!("attempt to use non-server config with server socket"))),
+				},
+				None => None,
+			};
+
+			match tls_config {
+				Some(tls_config) => match config.get::<_, Option<bool>>("tls_direct")?.unwrap_or(false) {
+					true => TlsMode::DirectTls{tls_config: tls_config.into()},
+					false => TlsMode::Plain{tls_config: Some(tls_config.into())},
+				},
+				None => TlsMode::Plain{tls_config: None},
+			}
 		},
 	};
 
-	let tls_mode = match tls_config {
-		Some(tls_config) => TlsMode::DirectTls{tls_config: Arc::new(tls_config).into()},
-		None => TlsMode::Plain{tls_config: None},
-	};
-
-	with_runtime_lua!{
+	with_runtime_lua! {
 		let sock = TcpListener::from_std(sock)?;
 		ListenerHandle::new_lua(lua, sock, listeners, tls_mode)
 	}

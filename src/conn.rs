@@ -215,29 +215,36 @@ fn mkbuffer(buf: &mut Option<Limit<BytesMut>>, size: usize) -> &mut Limit<BytesM
 }
 
 #[inline]
-async fn read_with_buf(conn: &mut ConnectionState, buf: &mut Option<Limit<BytesMut>>, size: usize) -> io::Result<Bytes> {
+async fn read_with_buf(conn: &mut ConnectionState, buf: &mut Option<Limit<BytesMut>>, size: usize) -> io::Result<Option<Bytes>> {
 	conn.read_buf(mkbuffer(buf, size)).await?;
-	Ok(buf.take().unwrap().into_inner().freeze())
+	if buf.as_ref().unwrap().get_ref().len() == 0 {
+		Ok(None)
+	} else {
+		Ok(Some(buf.take().unwrap().into_inner().freeze()))
+	}
 }
 
 impl ConnectionWorker {
 	#[inline]
-	async fn proc_read_buffer(&mut self, buf: Bytes) -> Result<ReadResult, ()> {
-		if buf.len() == 0 {
-			// end of file
-			match self.global_tx.send(Message::ReadClosed{handle: self.handle.clone()}).await {
-				Ok(_) => Ok(ReadResult::Closed),
-				Err(_) => Err(()),
+	async fn proc_read_buffer(&mut self, buf: Option<Bytes>) -> Result<ReadResult, ()> {
+		if let Some(buf) = buf {
+			if buf.len() > 0 {
+				let result = match self.global_tx.send(Message::Incoming{
+					handle: self.handle.clone(),
+					data: buf,
+				}).await {
+					Ok(_) => Ok(ReadResult::Continue),
+					// again, only during shutdown
+					Err(_) => Err(()),
+				};
+				return result
 			}
-		} else {
-			match self.global_tx.send(Message::Incoming{
-				handle: self.handle.clone(),
-				data: buf,
-			}).await {
-				Ok(_) => Ok(ReadResult::Continue),
-				// again, only during shutdown
-				Err(_) => Err(()),
-			}
+		}
+
+		// end of file
+		match self.global_tx.send(Message::ReadClosed{handle: self.handle.clone()}).await {
+			Ok(_) => Ok(ReadResult::Closed),
+			Err(_) => Err(()),
 		}
 	}
 

@@ -18,6 +18,7 @@ fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
 	server.set("loop", lua.create_function(mainloop::mainloop)?)?;
 	server.set("_add_task", lua.create_function(timer::add_task)?)?;
 	server.set("listen", lua.create_function(server::listen)?)?;
+	server.set("new_tls_config", lua.create_function(tls::new_tls_config)?)?;
 	exports.set("server", server)?;
 
 	exports.set("version", VERSION)?;
