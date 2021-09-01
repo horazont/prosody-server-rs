@@ -45,6 +45,20 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				None => (),
 			};
 		},
+		Message::TlsStarted{handle} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			{
+				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				handle.confirm_starttls();
+			}
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
+				Some(func) => {
+					func.call::<_, ()>((handle, LuaValue::Nil))?;
+				},
+				None => (),
+			};
+		},
 		Message::Incoming{handle, data} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
@@ -61,6 +75,17 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 			match listeners.get::<&'static str, Option<LuaFunction>>("ondisconnect")? {
 				Some(func) => {
 					func.call::<_, ()>(handle)?;
+				},
+				None => (),
+			};
+		},
+		Message::Disconnect{handle, error} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			let error = error.map(|x| { format!("{}", x)});
+			match listeners.get::<&'static str, Option<LuaFunction>>("ondisconnect")? {
+				Some(func) => {
+					func.call::<_, ()>((handle, error))?;
 				},
 				None => (),
 			};

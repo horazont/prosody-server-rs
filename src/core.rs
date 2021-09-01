@@ -1,5 +1,6 @@
 use mlua::prelude::*;
 
+use std::error::Error;
 use std::net::SocketAddr;
 use std::time::{SystemTime, Instant};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
@@ -56,6 +57,12 @@ pub(crate) enum Message {
 		addr: SocketAddr,
 	},
 
+	/// TLS was started on an existing connection
+	TlsStarted{
+		/// The registry key of the connection handle
+		handle: Arc<LuaRegistryKey>,
+	},
+
 	Incoming{
 		handle: Arc<LuaRegistryKey>,
 		data: Bytes,
@@ -63,6 +70,12 @@ pub(crate) enum Message {
 
 	ReadClosed{
 		handle: Arc<LuaRegistryKey>,
+	},
+
+	Disconnect{
+		/// The registry key of the connection handle
+		handle: Arc<LuaRegistryKey>,
+		error: Option<Box<dyn Error + Send + 'static>>,
 	},
 }
 

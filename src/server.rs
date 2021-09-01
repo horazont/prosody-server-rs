@@ -161,6 +161,7 @@ struct ListenerHandle {
 	// so that we do not need a roundtrip to the worker to discover these when Lua asks
 	sockaddr: String,
 	sockport: u16,
+	tls_config: Option<Arc<tls::TlsConfig>>,
 }
 
 impl LuaUserData for ListenerHandle {
@@ -181,6 +182,10 @@ impl LuaUserData for ListenerHandle {
 			Ok(this.sockport)
 		});
 
+		methods.add_method("sslctx", |_, this: &Self, _: ()| -> LuaResult<Option<tls::TlsConfigHandle>> {
+			Ok(this.tls_config.as_ref().map(|x| { tls::TlsConfigHandle(x.clone()) }))
+		});
+
 		methods.add_method("close", |_, this: &Self, _: ()| -> LuaResult<()> {
 			// this can only fail when the socket is already dead
 			let _ = this.tx.send(ControlMessage::Close);
@@ -190,7 +195,7 @@ impl LuaUserData for ListenerHandle {
 }
 
 impl ListenerHandle {
-	fn new_lua<'l>(lua: &'l Lua, sock: TcpListener, listeners: LuaTable, tls_mode: TlsMode) -> LuaResult<LuaAnyUserData<'l>> {
+	fn new_lua<'l>(lua: &'l Lua, sock: TcpListener, listeners: LuaTable, tls_config: Option<Arc<tls::TlsConfig>>, tls_mode: TlsMode) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = sock.local_addr()?;
 		let (tx, rx) = mpsc::unbounded_channel();
 
@@ -198,6 +203,7 @@ impl ListenerHandle {
 			tx,
 			sockaddr: format!("{}", addr.ip()),
 			sockport: addr.port(),
+			tls_config,
 		})?;
 		v.set_user_value(listeners)?;
 		let key = lua.create_registry_value(v.clone())?;
@@ -214,35 +220,48 @@ impl ListenerHandle {
 	}
 }
 
-pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (String, u16, LuaTable, Option<LuaTable>)) -> LuaResult<LuaAnyUserData<'l>> {
-	let addr = addr.parse::<IpAddr>()?;
+pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (String, u16, LuaTable, Option<LuaTable>)) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+	let addr = if addr == "*" {
+		IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+	} else {
+		match addr.parse::<IpAddr>() {
+			Ok(v) => v,
+			Err(e) => return Ok(Err(format!("invalid listen address ({}): {}", e, addr))),
+		}
+	};
 	let addr = SocketAddr::new(addr, port);
-	let sock = std::net::TcpListener::bind(addr)?;
+	let sock = match std::net::TcpListener::bind(&addr) {
+		Ok(v) => v,
+		Err(e) => return Ok(Err(format!("failed to bind to {}: {}", addr, e))),
+	};
 	sock.set_nonblocking(true)?;
 
-	let tls_mode = match config {
-		None => TlsMode::Plain{tls_config: None},
+	let (tls_config, tls_mode) = match config {
+		None => (None, TlsMode::Plain{tls_config: None}),
 		Some(config) => {
-			let tls_config =match config.get::<_, Option<LuaAnyUserData>>("tls_ctx")? {
-				Some(v) => match *tls::TlsConfig::get_ref_from_lua(&v)? {
-					tls::TlsConfig::Server{ref cfg, ..} => Some(cfg.clone()),
-					_ => return Err(LuaError::RuntimeError(format!("attempt to use non-server config with server socket"))),
-				},
+			let outer_tls_config = match config.get::<_, Option<LuaAnyUserData>>("tls_ctx")? {
+				Some(v) => Some((*tls::TlsConfigHandle::get_ref_from_lua(&v)?).clone()),
 				None => None,
 			};
 
-			match tls_config {
+			let tls_config = match outer_tls_config.as_ref().map(|x| { x.as_ref() }) {
+				Some(tls::TlsConfig::Server{ref cfg, ..}) => Some(cfg.clone()),
+				Some(_) => return Err(LuaError::RuntimeError(format!("attempt to use non-server config with server socket"))),
+				None => None,
+			};
+
+			(outer_tls_config.map(|x| { x.0 }), match tls_config {
 				Some(tls_config) => match config.get::<_, Option<bool>>("tls_direct")?.unwrap_or(false) {
 					true => TlsMode::DirectTls{tls_config: tls_config.into()},
 					false => TlsMode::Plain{tls_config: Some(tls_config.into())},
 				},
 				None => TlsMode::Plain{tls_config: None},
-			}
+			})
 		},
 	};
 
 	with_runtime_lua! {
 		let sock = TcpListener::from_std(sock)?;
-		ListenerHandle::new_lua(lua, sock, listeners, tls_mode)
+		Ok(Ok(ListenerHandle::new_lua(lua, sock, listeners, tls_config, tls_mode)?))
 	}
 }

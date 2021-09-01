@@ -5,13 +5,15 @@ Sockets for stream connections are generally TCP sockets.
 */
 use mlua::prelude::*;
 
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use log::{warn, error};
+use log::{debug, warn, error};
 
 use bytes::{Bytes, BytesMut, BufMut, buf::Limit};
 
@@ -25,12 +27,14 @@ use tokio_rustls::{TlsAcceptor, server};
 use pin_project_lite::pin_project;
 
 use crate::core::{MAIN_CHANNEL, Message, Spawn};
+use crate::tls;
 
 /**
 Describe which TLS actions are currently possible on a socket.
 
 This enum is used and cached on the lua side to know which operations are possible without having to call into the worker thread for details.
 */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CachedTlsState {
 	/// No context has been set on the socket, so a starttls operation is required to pass a context.
 	NoContext,
@@ -42,9 +46,24 @@ enum CachedTlsState {
 	Established,
 }
 
+enum SocketOption {
+	KeepAlive(bool),
+}
+
+impl SocketOption {
+	fn from_lua_args<'l>(_lua: &'l Lua, option: String, _value: LuaValue) -> Result<SocketOption, String> {
+		match option.as_str() {
+			"keepalive" => Ok(SocketOption::KeepAlive(true)),
+			_ => Err(format!("socket option not supported: {}", option)),
+		}
+	}
+}
+
 enum ControlMessage {
 	Close,
 	Write(Bytes),
+	SetOption(SocketOption),
+	StartTls(Option<Arc<tls::TlsConfig>>)
 }
 
 pub(crate) struct ConnectionHandle {
@@ -52,6 +71,12 @@ pub(crate) struct ConnectionHandle {
 	tls_state: CachedTlsState,
 	sockaddr: String,
 	sockport: u16,
+}
+
+impl ConnectionHandle {
+	fn send_set_option(&self, option: SocketOption) {
+		let _ = self.tx.send(ControlMessage::SetOption(option));
+	}
 }
 
 impl LuaUserData for ConnectionHandle {
@@ -66,6 +91,49 @@ impl LuaUserData for ConnectionHandle {
 
 		methods.add_method("clientport", |_, this: &Self, _: ()| -> LuaResult<u16> {
 			Ok(this.sockport)
+		});
+
+		methods.add_method("ssl", |_, this: &Self, _: ()| -> LuaResult<bool> {
+			Ok(this.tls_state == CachedTlsState::Established)
+		});
+
+		methods.add_method("ssl_info", |_, this: &Self, _: ()| -> LuaResult<()> {
+			// TODO: return something useful here
+			Ok(())
+		});
+
+		methods.add_method("setoption", |lua, this: &Self, name: String| -> LuaResult<(bool, Option<String>)> {
+			let option = match SocketOption::from_lua_args(lua, name, LuaValue::Nil) {
+				Ok(v) => v,
+				Err(e) => return Ok((false, Some(e))),
+			};
+			this.send_set_option(option);
+			Ok((true, None))
+		});
+
+		methods.add_method_mut("starttls", |lua, this: &mut Self, ctx: Option<tls::TlsConfigHandle>| -> LuaResult<(bool, Option<String>)> {
+			Ok(match this.tls_state {
+				CachedTlsState::NoContext if ctx.is_none() => {
+					(false, Some("server socket has no TLS context associated and no context passed to starttls()".into()))
+				},
+				CachedTlsState::NoContext | CachedTlsState::Possible => {
+					let mut old_tls_state = CachedTlsState::InProgress;
+					std::mem::swap(&mut this.tls_state, &mut old_tls_state);
+					match this.tx.send(ControlMessage::StartTls(ctx.map(|x| { x.0 }))) {
+						Ok(_) => (true, None),
+						Err(_) => {
+							std::mem::swap(&mut this.tls_state, &mut old_tls_state);
+							(false, Some("failed to communicate with socket".into()))
+						}
+					}
+				},
+				CachedTlsState::InProgress => {
+					(false, Some("TLS operation is in progress".into()))
+				},
+				CachedTlsState::Established => {
+					(false, Some("TLS already established".into()))
+				},
+			})
 		});
 
 		methods.add_method("write", |lua, this: &Self, data: LuaString| -> LuaResult<usize> {
@@ -86,7 +154,7 @@ impl LuaUserData for ConnectionHandle {
 }
 
 impl ConnectionHandle {
-	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: SocketAddr) -> LuaResult<LuaAnyUserData<'l>> {
+	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: SocketAddr, tls_state: CachedTlsState) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
@@ -115,7 +183,7 @@ impl ConnectionHandle {
 			Some(addr) => addr,
 			None => conn.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::PlainServer{sock: conn, tls_config: None}, listeners, addr)
+		Self::wrap_state(lua, ConnectionState::PlainServer{sock: conn, tls_config: None}, listeners, addr, CachedTlsState::NoContext)
 	}
 
 	pub(crate) fn wrap_tls<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
@@ -123,13 +191,29 @@ impl ConnectionHandle {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, addr)
+		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, addr, CachedTlsState::Established)
+	}
+
+	pub(crate) fn confirm_starttls(&mut self) {
+		self.tls_state = CachedTlsState::Established;
 	}
 }
+
+#[derive(Debug)]
+struct OpaqueError(String);
+
+impl fmt::Display for OpaqueError {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+impl std::error::Error for OpaqueError {}
 
 pin_project! {
 	#[project = ConnectionStateProj]
 	enum ConnectionState {
+		Broken{e: Option<Box<dyn std::error::Error + Send + 'static>>},
 		PlainServer{
 			#[pin]
 			sock: TcpStream,
@@ -142,10 +226,81 @@ pin_project! {
 	}
 }
 
+impl ConnectionState {
+	fn broken_err(e: &Option<Box<dyn std::error::Error + Send + 'static>>) -> io::Error {
+		match e {
+			Some(e) => io::Error::new(io::ErrorKind::ConnectionReset, format!("connection invalidated because of a previous failed operation: {}", e)),
+			None => io::Error::new(io::ErrorKind::ConnectionReset, "connection invalidated because of a previous failed operation (unknown error)"),
+		}
+	}
+
+	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor) -> io::Result<()> {
+		match acceptor.accept(sock).await {
+			Ok(sock) => {
+				*self = Self::TlsServer{
+					sock,
+				};
+				Ok(())
+			},
+			Err(e) => {
+				// kaboom, break the thing
+				*self = Self::Broken{e: Some(Box::new(
+					OpaqueError(format!("failed to accept TLS connection: {}", e))
+				))};
+				Err(e)
+			},
+		}
+	}
+
+	async fn starttls(&mut self, ctx: Option<Arc<tls::TlsConfig>>) -> io::Result<()> {
+		let mut tmp = ConnectionState::Broken{e: None};
+		std::mem::swap(&mut tmp, self);
+		match tmp {
+			Self::Broken{ref e} => {
+				let result = Err(Self::broken_err(e));
+				*self = tmp;
+				result
+			},
+			Self::TlsServer{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
+			Self::PlainServer{sock, tls_config} => {
+				match ctx {
+					Some(cfg) => match *cfg {
+						tls::TlsConfig::Server{ref cfg, ..} => self.starttls_server(sock, TlsAcceptor::from(cfg.clone())).await,
+						tls::TlsConfig::Client(ref cfg) => {
+							todo!()
+						},
+					},
+					None => match tls_config {
+						Some(acceptor) => self.starttls_server(sock, acceptor).await,
+						None => {
+							*self = Self::PlainServer{
+								sock: sock,
+								tls_config: None,
+							};
+							Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket without TLS context"))
+						},
+					},
+				}
+			},
+		}
+	}
+}
+
+impl AsRawFd for ConnectionState {
+	fn as_raw_fd(&self) -> RawFd {
+		match self {
+			ConnectionState::Broken{e} => panic!("attempt to get fd from broken connection ({:?})", e),
+			ConnectionState::PlainServer{sock, ..} => sock.as_raw_fd(),
+			ConnectionState::TlsServer{sock} => sock.get_ref().0.as_raw_fd(),
+		}
+	}
+}
+
 impl AsyncRead for ConnectionState {
 	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
 		let this = self.project();
 		match this {
+			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
 			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_read(cx, buf),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_read(cx, buf),
 		}
@@ -156,6 +311,7 @@ impl AsyncWrite for ConnectionState {
 	fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
 		let this = self.project();
 		match this {
+			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
 			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_write(cx, buf),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_write(cx, buf),
 		}
@@ -164,6 +320,7 @@ impl AsyncWrite for ConnectionState {
 	fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
 		let this = self.project();
 		match this {
+			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
 			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_write_vectored(cx, bufs),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_write_vectored(cx, bufs),
 		}
@@ -172,6 +329,7 @@ impl AsyncWrite for ConnectionState {
 	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		let this = self.project();
 		match this {
+			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
 			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_flush(cx),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_flush(cx),
 		}
@@ -180,6 +338,7 @@ impl AsyncWrite for ConnectionState {
 	fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		let this = self.project();
 		match this {
+			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
 			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_shutdown(cx),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_shutdown(cx),
 		}
@@ -187,10 +346,17 @@ impl AsyncWrite for ConnectionState {
 
 	fn is_write_vectored(&self) -> bool {
 		match self {
+			Self::Broken{..} => false,
 			Self::PlainServer{sock, ..} => sock.is_write_vectored(),
 			Self::TlsServer{sock, ..} => sock.is_write_vectored(),
 		}
 	}
+}
+
+enum MsgResult {
+	WriteClosed,
+	Continue,
+	Exit,
 }
 
 struct ConnectionWorker {
@@ -289,17 +455,62 @@ impl ConnectionWorker {
 		}
 	}
 
+	fn set_keepalive(&self, enabled: bool) -> Result<(), io::Error> {
+		nix::sys::socket::setsockopt(
+			self.conn.as_raw_fd(),
+			nix::sys::socket::sockopt::KeepAlive,
+			&enabled,
+		)?;
+		Ok(())
+	}
+
+	#[inline]
+	async fn proc_msg(&mut self, msg: ControlMessage) -> MsgResult {
+		match msg {
+			ControlMessage::Close => MsgResult::WriteClosed,
+			ControlMessage::SetOption(option) => {
+				match option {
+					SocketOption::KeepAlive(enabled) => {
+						match self.set_keepalive(enabled) {
+							Ok(_) => (),
+							Err(e) => warn!("failed to set keepalive ({}) on socket: {}", enabled, e),
+						}
+					}
+				};
+				MsgResult::Continue
+			},
+			ControlMessage::StartTls(ctx) => {
+				match self.conn.starttls(ctx).await {
+					Ok(_) => {
+						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone()}).await {
+							Ok(_) => MsgResult::Continue,
+							Err(_) => MsgResult::Exit,
+						}
+					},
+					Err(e) => {
+						debug!("TLS handshake error: {}", e);
+						// gotta leave here.
+						let _ = self.global_tx.send(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
+						MsgResult::Exit
+					},
+				}
+			},
+			ControlMessage::Write(buf) => match self.proc_write_buffer(buf).await {
+				Ok(()) => MsgResult::Continue,
+				Err(()) => MsgResult::Exit,
+			},
+		}
+	}
+
 	async fn run_rclosed(mut self) {
 		self.buf = None;
 		loop {
 			select! {
 				msg = self.rx.recv() => match msg {
-					Some(ControlMessage::Close) => {
-						return self.run_draining().await;
-					},
-					Some(ControlMessage::Write(buf)) => match self.proc_write_buffer(buf).await {
-						Ok(()) => (),
-						Err(()) => return,
+					Some(msg) => match self.proc_msg(msg).await {
+						MsgResult::Exit => return,
+						MsgResult::Continue => (),
+						MsgResult::WriteClosed => return self.run_draining().await,
 					},
 					None => return,
 				},
@@ -312,10 +523,10 @@ impl ConnectionWorker {
 		loop {
 			select! {
 				msg = self.rx.recv() => match msg {
-					Some(ControlMessage::Close) => return self.run_wclosed().await,
-					Some(ControlMessage::Write(buf)) => match self.proc_write_buffer(buf).await {
-						Ok(()) => (),
-						Err(()) => return,
+					Some(msg) => match self.proc_msg(msg).await {
+						MsgResult::Exit => return,
+						MsgResult::Continue => (),
+						MsgResult::WriteClosed => return self.run_wclosed().await,
 					},
 					None => return,
 				},

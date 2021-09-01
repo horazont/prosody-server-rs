@@ -58,6 +58,7 @@ impl rustls::ResolvesServerCert for DefaultingSNIResolver {
 }
 
 
+#[derive(Clone)]
 pub(crate) enum TlsConfig {
 	Server{
 		cfg: Arc<rustls::ServerConfig>,
@@ -66,14 +67,25 @@ pub(crate) enum TlsConfig {
 	Client(Arc<rustls::ClientConfig>),
 }
 
-impl TlsConfig {
+#[derive(Clone)]
+pub(crate) struct TlsConfigHandle(pub(crate) Arc<TlsConfig>);
+
+impl TlsConfigHandle {
 	pub(crate) fn get_ref_from_lua<'l>(v: &'l LuaAnyUserData<'l>) -> LuaResult<Ref<'l, Self>> {
 		v.borrow()
 	}
+
+	pub(crate) fn as_ref(&self) -> &TlsConfig {
+		&*self.0
+	}
 }
 
-impl LuaUserData for TlsConfig {
-	// TODO: all the SNI stuff
+impl LuaUserData for TlsConfigHandle {
+	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
+		methods.add_method("set_sni_host", |_, this: &Self, (hostname, cert, key): (String, String, String)| -> LuaResult<Result<bool, String>> {
+			Ok(Err("to be implemented".into()))
+		});
+	}
 }
 
 fn read_certs<P: AsRef<Path>>(fname: P) -> io::Result<Vec<rustls::Certificate>> {
@@ -143,17 +155,17 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	cfg.cert_resolver = resolver.clone();
 	cfg.ignore_client_order = true;
 
-	Ok(Ok(lua.create_userdata(TlsConfig::Server{
+	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Server{
 		cfg: Arc::new(cfg),
 		resolver,
-	})?))
+	})))?))
 }
 
 
 pub(crate) fn new_tls_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	match config.get::<_, String>("mode") {
 		Ok(v) if v == "server" => parse_server_config(lua, config),
-		Ok(v) if v == "client" => todo!(),
+		Ok(v) if v == "client" => Ok(Err("not yet implemented".into())),
 		Ok(v) => Ok(Err(format!("must be either \"server\" or \"client\", got {:?}", v))),
 		Err(e) => Ok(Err(format!("mode is absent or of invalid type: {}", e))),
 	}
