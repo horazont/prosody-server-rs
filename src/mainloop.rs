@@ -37,7 +37,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::TlsAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
-			let handle = conn::ConnectionHandle::wrap_tls(lua, stream, listeners.clone(), Some(addr))?;
+			let handle = conn::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr))?;
 			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
 				Some(func) => {
 					func.call::<_, ()>((handle, LuaValue::Nil))?;

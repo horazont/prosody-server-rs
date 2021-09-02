@@ -4,7 +4,7 @@ use std::cell::Ref;
 use std::collections::HashMap;
 use std::io;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{File, read_dir};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -64,7 +64,9 @@ pub(crate) enum TlsConfig {
 		cfg: Arc<rustls::ServerConfig>,
 		resolver: Arc<DefaultingSNIResolver>,
 	},
-	Client(Arc<rustls::ClientConfig>),
+	Client{
+		cfg: Arc<rustls::ClientConfig>
+	},
 }
 
 #[derive(Clone)]
@@ -109,7 +111,7 @@ fn read_first_key<P: AsRef<Path>>(fname: P) -> io::Result<rustls::PrivateKey> {
 	Ok(keys.remove(0))
 }
 
-fn certificatekey_from_lua<'l>(tbl: LuaTable, lua: &'l Lua) -> LuaResult<Option<rustls::sign::CertifiedKey>> {
+fn certificatekey_from_lua<'l>(tbl: &'l LuaTable, lua: &'l Lua) -> LuaResult<Option<rustls::sign::CertifiedKey>> {
 	let cert_file = tbl.get::<_, Option<LuaString>>("certificate")?;
 	let key_file = tbl.get::<_, Option<LuaString>>("key")?;
 	if cert_file.is_none() && key_file.is_none() {
@@ -139,9 +141,28 @@ fn certificatekey_from_lua<'l>(tbl: LuaTable, lua: &'l Lua) -> LuaResult<Option<
 	}))
 }
 
+fn cast_option_value<'l, T: FromLua<'l>>(lua: &'l Lua, name: &str, v: LuaValue<'l>) -> Result<T, String> {
+	match T::from_lua(v, lua) {
+		Ok(v) => Ok(v),
+		Err(e) => Err(format!("invalid value for {:?} option ({})", name, e)),
+	}
+}
+
+fn borrow_str<'l>(lua: &'l Lua, name: &str, v: &'l LuaValue<'l>) -> Result<&'l str, String> {
+	match v {
+		LuaValue::String(ref s) => {
+			match s.to_str() {
+				Ok(v) => Ok(v),
+				Err(e) => Err(format!("invalid value for {:?} option (invalid UTF-8)", name)),
+			}
+		},
+		_ => Err(format!("invalid value for {:?} option (invalid type, expected str)", name)),
+	}
+}
+
 fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let resolver = DefaultingSNIResolver::new();
-	let default_keypair = match certificatekey_from_lua(config, lua) {
+	let default_keypair = match certificatekey_from_lua(&config, lua) {
 		Ok(v) => v,
 		Err(e) => return Ok(Err(format!("invalid keypair: {}", e))),
 	};
@@ -151,6 +172,20 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	let resolver = Arc::new(resolver);
 
 	let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
+	// TODO: handle verify in some way
+	for kv in config.pairs::<LuaString, LuaValue>() {
+		let (k, v) = match kv {
+			Ok(kv) => kv,
+			// skip invalid keys
+			Err(e) => continue,
+		};
+		let k = match k.to_str() {
+			Ok(k) => k,
+			// skip invalid keys
+			Err(e) => continue,
+		};
+		// TODO...
+	}
 	cfg.versions = vec![rustls::ProtocolVersion::TLSv1_2, rustls::ProtocolVersion::TLSv1_3];
 	cfg.cert_resolver = resolver.clone();
 	cfg.ignore_client_order = true;
@@ -158,6 +193,93 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Server{
 		cfg: Arc::new(cfg),
 		resolver,
+	})))?))
+}
+
+macro_rules! strerror {
+	($e:expr) => {
+		match $e {
+			Ok(v) => v,
+			Err(e) => return Ok(Err(format!("{}", e))),
+		}
+	}
+}
+
+struct NullVerifier();
+
+impl rustls::ServerCertVerifier for NullVerifier {
+	fn verify_server_cert(
+			&self,
+			roots: &rustls::RootCertStore,
+			presented_certs: &[rustls::Certificate],
+			dns_name: webpki::DNSNameRef<'_>,
+			ocsp_response: &[u8]) -> Result<rustls::ServerCertVerified, rustls::TLSError>
+	{
+		Ok(rustls::ServerCertVerified::assertion())
+	}
+}
+
+fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+	let mut cfg = rustls::ClientConfig::new();
+	for kv in config.pairs::<LuaString, LuaValue>() {
+		let (k, v) = match kv {
+			Ok(kv) => kv,
+			// skip invalid keys
+			Err(e) => continue,
+		};
+		let k = match k.to_str() {
+			Ok(k) => k,
+			// skip invalid keys
+			Err(e) => continue,
+		};
+		match k {
+			"cafile" => {
+				let fname = strerror!(borrow_str(lua, k, &v));
+				let f = strerror!(File::open(fname));
+				let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
+			},
+			"capath" => {
+				let dirname = strerror!(borrow_str(lua, k, &v));
+				for entry in strerror!(read_dir(dirname)) {
+					let entry = match entry {
+						Ok(entry) => entry,
+						Err(_) => continue,
+					};
+					let f = strerror!(File::open(entry.path()));
+					let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
+				}
+			},
+			"verify" => {
+				let vs = match v {
+					LuaValue::Table(_) => {
+						strerror!(Vec::<String>::from_lua(v, lua))
+					},
+					LuaValue::String(_) => {
+						let value = strerror!(borrow_str(lua, k, &v));
+						vec![value.into()]
+					},
+					_ => return Ok(Err(format!("invalid value for {:?} option (expected str or table)", k))),
+				};
+				for v in vs {
+					match v.as_str() {
+						"none" => cfg.dangerous().set_certificate_verifier(
+							Arc::new(NullVerifier())
+						),
+						"peer" => cfg.dangerous().set_certificate_verifier(
+							Arc::new(rustls::WebPKIVerifier::new())
+						),
+						// no idea what this one is supposed to do?!
+						"client_once" => (),
+						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v)))
+					}
+				}
+			},
+			// ignore unknown keys(?)
+			&_ => continue,
+		}
+	}
+	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Client{
+		cfg: Arc::new(cfg),
 	})))?))
 }
 

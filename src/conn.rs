@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream};
 use tokio::sync::mpsc;
 
-use tokio_rustls::{TlsAcceptor, server};
+use tokio_rustls::{TlsAcceptor, TlsConnector, server, client};
 
 use pin_project_lite::pin_project;
 
@@ -34,16 +34,66 @@ Describe which TLS actions are currently possible on a socket.
 
 This enum is used and cached on the lua side to know which operations are possible without having to call into the worker thread for details.
 */
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 enum CachedTlsState {
 	/// No context has been set on the socket, so a starttls operation is required to pass a context.
-	NoContext,
-	/// A context has been set on the socket, so a starttls operation may not pass a socket.
-	Possible,
-	/// A starttls operation has been initiated; cannot start another one.
+	NoConfig,
+	MayAccept(Arc<rustls::ServerConfig>),
+	MayConnect(webpki::DNSName, Arc<rustls::ClientConfig>),
+	/* AcceptInProgress(Arc<rustls::ServerConfig>),
+	ConnectInProgress(webpki::DNSName, Arc<rustls::ClientConfig>), */
 	InProgress,
-	/// TLS has been established, either via a previous starttls operation or because the socket was accepted with TLS right away.
 	Established,
+}
+
+impl CachedTlsState {
+	fn transition(&mut self, given_config: Option<&tls::TlsConfig>) -> Result<ControlMessage, String> {
+		match self {
+			Self::InProgress => Err("TLS operation already in progress".into()),
+			Self::Established => Err("TLS already established".into()),
+			Self::NoConfig => match given_config {
+				// We can only *accept* connections based on the given config, as we lack a target hostname
+				Some(tls::TlsConfig::Client{..}) => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
+				Some(tls::TlsConfig::Server{cfg, ..}) => {
+					*self = Self::InProgress;
+					Ok(ControlMessage::AcceptTls(cfg.clone()))
+				},
+				None => Err("cannot start TLS connection without context".into()),
+			},
+			Self::MayAccept(cfg) => match given_config {
+				// We can only *accept* connections based on the given config, as we lack a target hostname
+				Some(tls::TlsConfig::Client{..}) => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
+				Some(tls::TlsConfig::Server{cfg, ..}) => {
+					let msg = ControlMessage::AcceptTls(cfg.clone());
+					*self = Self::InProgress;
+					Ok(msg)
+				},
+				None => {
+					let msg = ControlMessage::AcceptTls(cfg.clone());
+					*self = Self::InProgress;
+					Ok(msg)
+				},
+			},
+			Self::MayConnect(name, cfg) => match given_config {
+				// We can only *accept* connections based on the given config, as we lack a target hostname
+				Some(tls::TlsConfig::Client{cfg}) => {
+					let msg = ControlMessage::ConnectTls(name.clone(), cfg.clone());
+					*self = Self::InProgress;
+					Ok(msg)
+				},
+				Some(tls::TlsConfig::Server{cfg, ..}) => {
+					let msg = ControlMessage::AcceptTls(cfg.clone());
+					*self = Self::InProgress;
+					Ok(msg)
+				},
+				None => {
+					let msg = ControlMessage::ConnectTls(name.clone(), cfg.clone());
+					*self = Self::InProgress;
+					Ok(msg)
+				},
+			},
+		}
+	}
 }
 
 enum SocketOption {
@@ -63,7 +113,8 @@ enum ControlMessage {
 	Close,
 	Write(Bytes),
 	SetOption(SocketOption),
-	StartTls(Option<Arc<tls::TlsConfig>>)
+	AcceptTls(Arc<rustls::ServerConfig>),
+	ConnectTls(webpki::DNSName, Arc<rustls::ClientConfig>),
 }
 
 pub(crate) struct ConnectionHandle {
@@ -94,7 +145,10 @@ impl LuaUserData for ConnectionHandle {
 		});
 
 		methods.add_method("ssl", |_, this: &Self, _: ()| -> LuaResult<bool> {
-			Ok(this.tls_state == CachedTlsState::Established)
+			Ok(match this.tls_state {
+				CachedTlsState::Established => true,
+				_ => false,
+			})
 		});
 
 		methods.add_method("ssl_info", |_, this: &Self, _: ()| -> LuaResult<()> {
@@ -112,28 +166,12 @@ impl LuaUserData for ConnectionHandle {
 		});
 
 		methods.add_method_mut("starttls", |lua, this: &mut Self, ctx: Option<tls::TlsConfigHandle>| -> LuaResult<(bool, Option<String>)> {
-			Ok(match this.tls_state {
-				CachedTlsState::NoContext if ctx.is_none() => {
-					(false, Some("server socket has no TLS context associated and no context passed to starttls()".into()))
-				},
-				CachedTlsState::NoContext | CachedTlsState::Possible => {
-					let mut old_tls_state = CachedTlsState::InProgress;
-					std::mem::swap(&mut this.tls_state, &mut old_tls_state);
-					match this.tx.send(ControlMessage::StartTls(ctx.map(|x| { x.0 }))) {
-						Ok(_) => (true, None),
-						Err(_) => {
-							std::mem::swap(&mut this.tls_state, &mut old_tls_state);
-							(false, Some("failed to communicate with socket".into()))
-						}
-					}
-				},
-				CachedTlsState::InProgress => {
-					(false, Some("TLS operation is in progress".into()))
-				},
-				CachedTlsState::Established => {
-					(false, Some("TLS already established".into()))
-				},
-			})
+			let ctx_arc = ctx.map(|x| { x.0 });
+			let ctx_ref = ctx_arc.as_ref().map(|x| { &**x });
+			match this.tls_state.transition(ctx_ref) {
+				Ok(_) => Ok((true, None)),
+				Err(e) => Ok((false, Some(e))),
+			}
 		});
 
 		methods.add_method("write", |lua, this: &Self, data: LuaString| -> LuaResult<usize> {
@@ -159,7 +197,7 @@ impl ConnectionHandle {
 
 		let v = lua.create_userdata(Self{
 			tx,
-			tls_state: CachedTlsState::NoContext,
+			tls_state,
 			sockaddr: format!("{}", addr.ip()),
 			sockport: addr.port(),
 		})?;
@@ -183,10 +221,10 @@ impl ConnectionHandle {
 			Some(addr) => addr,
 			None => conn.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::PlainServer{sock: conn, tls_config: None}, listeners, addr, CachedTlsState::NoContext)
+		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, addr, CachedTlsState::NoConfig)
 	}
 
-	pub(crate) fn wrap_tls<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
+	pub(crate) fn wrap_tls_server<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = match addr {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
@@ -214,14 +252,17 @@ pin_project! {
 	#[project = ConnectionStateProj]
 	enum ConnectionState {
 		Broken{e: Option<Box<dyn std::error::Error + Send + 'static>>},
-		PlainServer{
+		Plain{
 			#[pin]
 			sock: TcpStream,
-			tls_config: Option<TlsAcceptor>,
 		},
 		TlsServer{
 			#[pin]
 			sock: server::TlsStream<TcpStream>,
+		},
+		TlsClient{
+			#[pin]
+			sock: client::TlsStream<TcpStream>,
 		},
 	}
 }
@@ -252,7 +293,25 @@ impl ConnectionState {
 		}
 	}
 
-	async fn starttls(&mut self, ctx: Option<Arc<tls::TlsConfig>>) -> io::Result<()> {
+	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector) -> io::Result<()> {
+		match connector.connect(name, sock).await {
+			Ok(sock) => {
+				*self = Self::TlsClient{
+					sock,
+				};
+				Ok(())
+			},
+			Err(e) => {
+				// kaboom, break the thing
+				*self = Self::Broken{e: Some(Box::new(
+					OpaqueError(format!("failed to initiate TLS connection: {}", e))
+				))};
+				Err(e)
+			},
+		}
+	}
+
+	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>) -> io::Result<()> {
 		let mut tmp = ConnectionState::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -261,27 +320,22 @@ impl ConnectionState {
 				*self = tmp;
 				result
 			},
-			Self::TlsServer{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::PlainServer{sock, tls_config} => {
-				match ctx {
-					Some(cfg) => match *cfg {
-						tls::TlsConfig::Server{ref cfg, ..} => self.starttls_server(sock, TlsAcceptor::from(cfg.clone())).await,
-						tls::TlsConfig::Client(ref cfg) => {
-							todo!()
-						},
-					},
-					None => match tls_config {
-						Some(acceptor) => self.starttls_server(sock, acceptor).await,
-						None => {
-							*self = Self::PlainServer{
-								sock: sock,
-								tls_config: None,
-							};
-							Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket without TLS context"))
-						},
-					},
-				}
+			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
+			Self::Plain{sock} => self.starttls_client(sock, name, ctx.into()).await,
+		}
+	}
+
+	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>) -> io::Result<()> {
+		let mut tmp = ConnectionState::Broken{e: None};
+		std::mem::swap(&mut tmp, self);
+		match tmp {
+			Self::Broken{ref e} => {
+				let result = Err(Self::broken_err(e));
+				*self = tmp;
+				result
 			},
+			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
+			Self::Plain{sock} => self.starttls_server(sock, ctx.into()).await,
 		}
 	}
 }
@@ -289,9 +343,10 @@ impl ConnectionState {
 impl AsRawFd for ConnectionState {
 	fn as_raw_fd(&self) -> RawFd {
 		match self {
-			ConnectionState::Broken{e} => panic!("attempt to get fd from broken connection ({:?})", e),
-			ConnectionState::PlainServer{sock, ..} => sock.as_raw_fd(),
-			ConnectionState::TlsServer{sock} => sock.get_ref().0.as_raw_fd(),
+			Self::Broken{e} => panic!("attempt to get fd from broken connection ({:?})", e),
+			Self::Plain{sock, ..} => sock.as_raw_fd(),
+			Self::TlsServer{sock} => sock.get_ref().0.as_raw_fd(),
+			Self::TlsClient{sock} => sock.get_ref().0.as_raw_fd(),
 		}
 	}
 }
@@ -301,8 +356,9 @@ impl AsyncRead for ConnectionState {
 		let this = self.project();
 		match this {
 			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_read(cx, buf),
+			ConnectionStateProj::Plain{sock, ..} => sock.poll_read(cx, buf),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_read(cx, buf),
+			ConnectionStateProj::TlsClient{sock} => sock.poll_read(cx, buf),
 		}
 	}
 }
@@ -312,8 +368,9 @@ impl AsyncWrite for ConnectionState {
 		let this = self.project();
 		match this {
 			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_write(cx, buf),
+			ConnectionStateProj::Plain{sock, ..} => sock.poll_write(cx, buf),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_write(cx, buf),
+			ConnectionStateProj::TlsClient{sock} => sock.poll_write(cx, buf),
 		}
 	}
 
@@ -321,8 +378,9 @@ impl AsyncWrite for ConnectionState {
 		let this = self.project();
 		match this {
 			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_write_vectored(cx, bufs),
+			ConnectionStateProj::Plain{sock, ..} => sock.poll_write_vectored(cx, bufs),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_write_vectored(cx, bufs),
+			ConnectionStateProj::TlsClient{sock} => sock.poll_write_vectored(cx, bufs),
 		}
 	}
 
@@ -330,8 +388,9 @@ impl AsyncWrite for ConnectionState {
 		let this = self.project();
 		match this {
 			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_flush(cx),
+			ConnectionStateProj::Plain{sock, ..} => sock.poll_flush(cx),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_flush(cx),
+			ConnectionStateProj::TlsClient{sock} => sock.poll_flush(cx),
 		}
 	}
 
@@ -339,16 +398,18 @@ impl AsyncWrite for ConnectionState {
 		let this = self.project();
 		match this {
 			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::PlainServer{sock, ..} => sock.poll_shutdown(cx),
+			ConnectionStateProj::Plain{sock, ..} => sock.poll_shutdown(cx),
 			ConnectionStateProj::TlsServer{sock} => sock.poll_shutdown(cx),
+			ConnectionStateProj::TlsClient{sock} => sock.poll_shutdown(cx),
 		}
 	}
 
 	fn is_write_vectored(&self) -> bool {
 		match self {
 			Self::Broken{..} => false,
-			Self::PlainServer{sock, ..} => sock.is_write_vectored(),
+			Self::Plain{sock, ..} => sock.is_write_vectored(),
 			Self::TlsServer{sock, ..} => sock.is_write_vectored(),
+			Self::TlsClient{sock, ..} => sock.is_write_vectored(),
 		}
 	}
 }
@@ -479,8 +540,24 @@ impl ConnectionWorker {
 				};
 				MsgResult::Continue
 			},
-			ControlMessage::StartTls(ctx) => {
-				match self.conn.starttls(ctx).await {
+			ControlMessage::AcceptTls(ctx) => {
+				match self.conn.starttls_accept(ctx).await {
+					Ok(_) => {
+						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone()}).await {
+							Ok(_) => MsgResult::Continue,
+							Err(_) => MsgResult::Exit,
+						}
+					},
+					Err(e) => {
+						debug!("TLS handshake error: {}", e);
+						// gotta leave here.
+						let _ = self.global_tx.send(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
+						MsgResult::Exit
+					},
+				}
+			},
+			ControlMessage::ConnectTls(name, ctx) => {
+				match self.conn.starttls_connect(name.as_ref(), ctx).await {
 					Ok(_) => {
 						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone()}).await {
 							Ok(_) => MsgResult::Continue,
