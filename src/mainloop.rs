@@ -23,6 +23,16 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				None => (),
 			};
 		},
+		Message::Connect{handle} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
+				Some(func) => {
+					func.call::<_, ()>(handle)?;
+				},
+				None => (),
+			};
+		},
 		Message::TcpAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;

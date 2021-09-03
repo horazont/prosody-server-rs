@@ -13,6 +13,8 @@ use tokio_rustls::rustls;
 
 use rustls_pemfile;
 
+use crate::strerror_ok;
+
 
 pub(crate) struct DefaultingSNIResolver {
 	default_keypair: RwLock<Option<rustls::sign::CertifiedKey>>,
@@ -196,15 +198,6 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	})))?))
 }
 
-macro_rules! strerror {
-	($e:expr) => {
-		match $e {
-			Ok(v) => v,
-			Err(e) => return Ok(Err(format!("{}", e))),
-		}
-	}
-}
-
 struct NullVerifier();
 
 impl rustls::ServerCertVerifier for NullVerifier {
@@ -234,28 +227,28 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		};
 		match k {
 			"cafile" => {
-				let fname = strerror!(borrow_str(lua, k, &v));
-				let f = strerror!(File::open(fname));
+				let fname = strerror_ok!(borrow_str(lua, k, &v));
+				let f = strerror_ok!(File::open(fname));
 				let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
 			},
 			"capath" => {
-				let dirname = strerror!(borrow_str(lua, k, &v));
-				for entry in strerror!(read_dir(dirname)) {
+				let dirname = strerror_ok!(borrow_str(lua, k, &v));
+				for entry in strerror_ok!(read_dir(dirname)) {
 					let entry = match entry {
 						Ok(entry) => entry,
 						Err(_) => continue,
 					};
-					let f = strerror!(File::open(entry.path()));
+					let f = strerror_ok!(File::open(entry.path()));
 					let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
 				}
 			},
 			"verify" => {
 				let vs = match v {
 					LuaValue::Table(_) => {
-						strerror!(Vec::<String>::from_lua(v, lua))
+						strerror_ok!(Vec::<String>::from_lua(v, lua))
 					},
 					LuaValue::String(_) => {
-						let value = strerror!(borrow_str(lua, k, &v));
+						let value = strerror_ok!(borrow_str(lua, k, &v));
 						vec![value.into()]
 					},
 					_ => return Ok(Err(format!("invalid value for {:?} option (expected str or table)", k))),
@@ -287,7 +280,7 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 pub(crate) fn new_tls_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	match config.get::<_, String>("mode") {
 		Ok(v) if v == "server" => parse_server_config(lua, config),
-		Ok(v) if v == "client" => Ok(Err("not yet implemented".into())),
+		Ok(v) if v == "client" => parse_client_config(lua, config),
 		Ok(v) => Ok(Err(format!("must be either \"server\" or \"client\", got {:?}", v))),
 		Err(e) => Ok(Err(format!("mode is absent or of invalid type: {}", e))),
 	}

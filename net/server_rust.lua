@@ -26,6 +26,9 @@ return {
 	-- SERVER FUNCTIONS
 	listen = server_impl.listen;
 
+	-- CLIENT FUNCTIONS
+	addclient = server_impl.addclient;
+
 	-- TLS FUNCTIONS
 	tls_builder = function()
 		return sslconfig._new(server_impl.new_tls_config);

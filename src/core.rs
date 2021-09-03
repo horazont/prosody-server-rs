@@ -72,6 +72,11 @@ pub(crate) enum Message {
 		handle: Arc<LuaRegistryKey>,
 	},
 
+	Connect{
+		/// The registry key of the connection handle
+		handle: Arc<LuaRegistryKey>,
+	},
+
 	Disconnect{
 		/// The registry key of the connection handle
 		handle: Arc<LuaRegistryKey>,

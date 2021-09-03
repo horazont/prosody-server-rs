@@ -19,9 +19,9 @@ use tokio::sync::mpsc;
 
 use tokio_rustls::TlsAcceptor;
 
-use crate::with_runtime_lua;
+use crate::{with_runtime_lua, strerror_ok};
 use crate::core::{MAIN_CHANNEL, Message, Spawn};
-
+use crate::conversion;
 use crate::tls;
 
 /**
@@ -220,15 +220,8 @@ impl ListenerHandle {
 	}
 }
 
-pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (String, u16, LuaTable, Option<LuaTable>)) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
-	let addr = if addr == "*" {
-		IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
-	} else {
-		match addr.parse::<IpAddr>() {
-			Ok(v) => v,
-			Err(e) => return Ok(Err(format!("invalid listen address ({}): {}", e, addr))),
-		}
-	};
+pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValue, u16, LuaTable, Option<LuaTable>)) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+	let addr = strerror_ok!(conversion::to_ipaddr(&addr));
 	let addr = SocketAddr::new(addr, port);
 	let sock = match std::net::TcpListener::bind(&addr) {
 		Ok(v) => v,

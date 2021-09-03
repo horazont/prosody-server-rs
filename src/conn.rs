@@ -26,8 +26,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, server, client};
 
 use pin_project_lite::pin_project;
 
+use crate::{with_runtime_lua, strerror_ok};
 use crate::core::{MAIN_CHANNEL, Message, Spawn};
 use crate::tls;
+use crate::conversion;
 
 /**
 Describe which TLS actions are currently possible on a socket.
@@ -212,6 +214,32 @@ impl ConnectionHandle {
 			read_size: 8192,
 			handle: Arc::new(key),
 			buf: None,
+		}.spawn();
+		Ok(v)
+	}
+
+	fn connect<'l>(lua: &'l Lua, addr: SocketAddr, listeners: LuaTable, tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>)>) -> LuaResult<LuaAnyUserData<'l>> {
+		let (tx, rx) = mpsc::unbounded_channel();
+
+		let v = lua.create_userdata(Self{
+			tx,
+			// we might establish TLS right away, in that case it doesn't matter
+			tls_state: CachedTlsState::NoConfig,
+			// this is actually correct because ip() is supposed to return the remote IP for clients
+			sockaddr: format!("{}", addr.ip()),
+			sockport: addr.port(),
+		})?;
+		v.set_user_value(listeners)?;
+		let key = lua.create_registry_value(v.clone())?;
+
+		let global_tx = MAIN_CHANNEL.clone_tx();
+		ConnectWorker{
+			global_tx,
+			rx,
+			addr,
+			tls_config,
+			read_size: 8192,
+			handle: Arc::new(key),
 		}.spawn();
 		Ok(v)
 	}
@@ -628,5 +656,106 @@ impl ConnectionWorker {
 impl Spawn for ConnectionWorker {
 	fn spawn(self) {
 		tokio::spawn(async move { self.run().await });
+	}
+}
+
+struct ConnectWorker {
+	global_tx: mpsc::Sender<Message>,
+	rx: mpsc::UnboundedReceiver<ControlMessage>,
+	addr: SocketAddr,
+	read_size: usize,
+	tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>)>,
+	handle: Arc<LuaRegistryKey>,
+}
+
+impl ConnectWorker {
+	async fn run(mut self) {
+		let sock = match TcpStream::connect(self.addr).await {
+			Ok(sock) => sock,
+			Err(e) => {
+				let _ = self.global_tx.send(Message::Disconnect{
+					handle: self.handle,
+					error: Some(Box::new(e)),
+				}).await;
+				return;
+			},
+		};
+		let conn = match self.tls_config {
+			Some((name, config)) => {
+				let connector: TlsConnector = config.into();
+				let sock = match connector.connect(name.as_ref(), sock).await {
+					Ok(sock) => sock,
+					Err(e) => {
+						let _ = self.global_tx.send(Message::Disconnect{
+							handle: self.handle,
+							error: Some(Box::new(e)),
+						}).await;
+						return;
+					},
+				};
+				ConnectionState::TlsClient{sock}
+			},
+			None => ConnectionState::Plain{sock},
+		};
+		match self.global_tx.send(Message::Connect{handle: self.handle.clone()}).await {
+			Ok(_) => (),
+			// can only happen during shutdown, drop it.
+			Err(_) => return,
+		};
+		return ConnectionWorker{
+			global_tx: self.global_tx,
+			rx: self.rx,
+			read_size: self.read_size,
+			conn,
+			buf: None,
+			handle: self.handle,
+		}.run().await;
+	}
+}
+
+impl Spawn for ConnectWorker {
+	fn spawn(self) {
+		tokio::spawn(async move { self.run().await });
+	}
+}
+
+pub(crate) fn addclient<'l>(
+		lua: &'l Lua,
+		(addr, port, listeners, read_size, tls_ctx, typ, extra): (LuaValue, u16, LuaTable, usize, Option<tls::TlsConfigHandle>, Option<LuaString>, Option<LuaTable>)
+		) -> LuaResult<Result<LuaAnyUserData<'l>, String>>
+{
+	let addr = strerror_ok!(conversion::to_ipaddr(&addr));
+	let addr = SocketAddr::new(addr, port);
+
+	let tls_ctx = match tls_ctx {
+		None => None,
+		Some(tls_ctx) => match &*tls_ctx.0 {
+			tls::TlsConfig::Client{cfg} => Some(cfg.clone()),
+			_ => return Ok(Err(format!("non-client TLS config passed to client socket"))),
+		}
+	};
+
+	// extra is required, we MUST have the server name...
+	let tls_config = match (tls_ctx, extra.as_ref()) {
+		(Some(tls_ctx), Some(extra)) => {
+			let servername = match extra.get::<_, Option<LuaString>>("servername") {
+				Ok(Some(v)) => v,
+				Ok(None) => return Ok(Err(format!("missing option servername (required for TLS, and TLS context is given)"))),
+				Err(e) => return Ok(Err(format!("invalid option servername (required for TLS, and TLS context is given): {}", e))),
+			};
+			let servername = match webpki::DNSNameRef::try_from_ascii(servername.as_bytes()) {
+				Ok(v) => v,
+				Err(e) => return Ok(Err(format!("servername is not a DNSName: {}", e))),
+			};
+			Some((servername.to_owned(), tls_ctx))
+		},
+		(Some(tls_ctx), None) => {
+			return Ok(Err(format!("cannot connect via TLS without a servername")))
+		},
+		(None, None) | (None, Some(_)) => None,
+	};
+
+	with_runtime_lua!{
+		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, tls_config)?))
 	}
 }
