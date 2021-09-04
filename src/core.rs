@@ -14,6 +14,7 @@ use lazy_static::lazy_static;
 
 use tokio::net::TcpStream;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -85,9 +86,6 @@ pub(crate) enum Message {
 		handle: LuaRegistryHandle,
 		error: Option<Box<dyn Error + Send + 'static>>,
 	},
-
-	// No-op
-	Wakeup,
 }
 
 /// Wrapper around an MpscChannel which brokers access to the rx/tx pair
@@ -129,6 +127,7 @@ lazy_static! {
 	pub(crate) static ref RUNTIME: RwLock<Option<Runtime>> = RwLock::new(Some(Builder::new_multi_thread().enable_all().build().unwrap()));
 	#[doc(hidden)]
 	pub(crate) static ref MAIN_CHANNEL: MpscChannel<Message> = MpscChannel::new(MAIN_CAPACITY);
+	pub(crate) static ref WAKEUP: Arc<sync::Notify> = Arc::new(sync::Notify::new());
 	#[doc(hidden)]
 	pub(crate) static ref GC_FLAG: AtomicBool = AtomicBool::new(false);
 }
@@ -148,11 +147,7 @@ pub(crate) struct WakeupOnDrop();
 
 impl Drop for WakeupOnDrop {
 	fn drop(&mut self) {
-		let ch = MAIN_CHANNEL.tx_ref();
-		// we only need to trigger a wakeup if no other thing is currently in the queue
-		if ch.capacity() == MAIN_CAPACITY {
-			ch.try_send(Message::Wakeup);
-		}
+		WAKEUP.notify_one();
 	}
 }
 

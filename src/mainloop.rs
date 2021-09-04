@@ -3,11 +3,14 @@ use mlua::prelude::*;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, Instant};
 
+use tokio::select;
+
 use super::core::{
 	Message,
 	RUNTIME,
 	MAIN_CHANNEL,
 	GC_FLAG,
+	WAKEUP,
 };
 
 use super::conn;
@@ -102,7 +105,6 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				None => (),
 			};
 		},
-		Message::Wakeup => (),
 	};
 	Ok(())
 }
@@ -151,15 +153,19 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 		let _guard = r.enter();
 		r.block_on(async move {
 			loop {
-				let msg = match rx.recv().await {
-					Some(v) => v,
-					None => break,
-				};
-				match proc_message(lua, msg) {
-					Ok(_) => (),
-					Err(e) => {
-						eprintln!("failed to process event loop message: {}", e)
+				select! {
+					msg = rx.recv() => match msg {
+						Some(msg) => match proc_message(lua, msg) {
+							Ok(_) => (),
+							Err(e) => {
+								eprintln!("failed to process event loop message: {}", e)
+							},
+						},
+						// this is impossible because one tx of the main channel is held in some arc at global scope
+						None => unreachable!(),
 					},
+					// iterate the loop once to trigger GC if necessary
+					_ = WAKEUP.notified() => (),
 				}
 				if let Ok(_) = GC_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
 					lua.expire_registry_values();
