@@ -14,6 +14,7 @@ use tokio_rustls::rustls;
 use rustls_pemfile;
 
 use crate::strerror_ok;
+use crate::conversion;
 
 
 pub(crate) struct DefaultingSNIResolver {
@@ -86,7 +87,7 @@ impl TlsConfigHandle {
 
 impl LuaUserData for TlsConfigHandle {
 	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
-		methods.add_method("set_sni_host", |_, this: &Self, (hostname, cert, key): (String, String, String)| -> LuaResult<Result<bool, String>> {
+		methods.add_method("set_sni_host", |_, _this: &Self, (_hostname, _cert, _key): (String, String, String)| -> LuaResult<Result<bool, String>> {
 			Ok(Err("to be implemented".into()))
 		});
 	}
@@ -113,7 +114,7 @@ fn read_first_key<P: AsRef<Path>>(fname: P) -> io::Result<rustls::PrivateKey> {
 	Ok(keys.remove(0))
 }
 
-fn certificatekey_from_lua<'l>(tbl: &'l LuaTable, lua: &'l Lua) -> LuaResult<Option<rustls::sign::CertifiedKey>> {
+fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::sign::CertifiedKey>> {
 	let cert_file = tbl.get::<_, Option<LuaString>>("certificate")?;
 	let key_file = tbl.get::<_, Option<LuaString>>("key")?;
 	if cert_file.is_none() && key_file.is_none() {
@@ -133,7 +134,7 @@ fn certificatekey_from_lua<'l>(tbl: &'l LuaTable, lua: &'l Lua) -> LuaResult<Opt
 	};
 	let key = match rustls::sign::RSASigningKey::new(&key) {
 		Ok(v) => v,
-		Err(e) => return Err(LuaError::RuntimeError(format!("invalid RSA key"))),
+		Err(_) => return Err(LuaError::RuntimeError(format!("invalid RSA key encountered in {}", key_file.to_string_lossy()))),
 	};
 	Ok(Some(rustls::sign::CertifiedKey{
 		cert: certs,
@@ -143,28 +144,16 @@ fn certificatekey_from_lua<'l>(tbl: &'l LuaTable, lua: &'l Lua) -> LuaResult<Opt
 	}))
 }
 
-fn cast_option_value<'l, T: FromLua<'l>>(lua: &'l Lua, name: &str, v: LuaValue<'l>) -> Result<T, String> {
-	match T::from_lua(v, lua) {
+fn borrow_named_str<'l>(name: &str, v: &'l LuaValue<'l>) -> Result<&'l str, String> {
+	match conversion::borrow_str(v) {
 		Ok(v) => Ok(v),
-		Err(e) => Err(format!("invalid value for {:?} option ({})", name, e)),
-	}
-}
-
-fn borrow_str<'l>(lua: &'l Lua, name: &str, v: &'l LuaValue<'l>) -> Result<&'l str, String> {
-	match v {
-		LuaValue::String(ref s) => {
-			match s.to_str() {
-				Ok(v) => Ok(v),
-				Err(e) => Err(format!("invalid value for {:?} option (invalid UTF-8)", name)),
-			}
-		},
-		_ => Err(format!("invalid value for {:?} option (invalid type, expected str)", name)),
+		Err(e) => Err(format!("invalid value for {:?}: {}", name, e)),
 	}
 }
 
 fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let resolver = DefaultingSNIResolver::new();
-	let default_keypair = match certificatekey_from_lua(&config, lua) {
+	let default_keypair = match certificatekey_from_lua(&config) {
 		Ok(v) => v,
 		Err(e) => return Ok(Err(format!("invalid keypair: {}", e))),
 	};
@@ -176,15 +165,15 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
 	// TODO: handle verify in some way
 	for kv in config.pairs::<LuaString, LuaValue>() {
-		let (k, v) = match kv {
+		let (k, _v) = match kv {
 			Ok(kv) => kv,
 			// skip invalid keys
-			Err(e) => continue,
+			Err(_) => continue,
 		};
-		let k = match k.to_str() {
+		let _k = match k.to_str() {
 			Ok(k) => k,
 			// skip invalid keys
-			Err(e) => continue,
+			Err(_) => continue,
 		};
 		// TODO...
 	}
@@ -203,10 +192,10 @@ struct NullVerifier();
 impl rustls::ServerCertVerifier for NullVerifier {
 	fn verify_server_cert(
 			&self,
-			roots: &rustls::RootCertStore,
-			presented_certs: &[rustls::Certificate],
-			dns_name: webpki::DNSNameRef<'_>,
-			ocsp_response: &[u8]) -> Result<rustls::ServerCertVerified, rustls::TLSError>
+			_roots: &rustls::RootCertStore,
+			_presented_certs: &[rustls::Certificate],
+			_dns_name: webpki::DNSNameRef<'_>,
+			_ocsp_response: &[u8]) -> Result<rustls::ServerCertVerified, rustls::TLSError>
 	{
 		Ok(rustls::ServerCertVerified::assertion())
 	}
@@ -218,21 +207,21 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		let (k, v) = match kv {
 			Ok(kv) => kv,
 			// skip invalid keys
-			Err(e) => continue,
+			Err(_) => continue,
 		};
 		let k = match k.to_str() {
 			Ok(k) => k,
 			// skip invalid keys
-			Err(e) => continue,
+			Err(_) => continue,
 		};
 		match k {
 			"cafile" => {
-				let fname = strerror_ok!(borrow_str(lua, k, &v));
+				let fname = strerror_ok!(borrow_named_str(k, &v));
 				let f = strerror_ok!(File::open(fname));
 				let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
 			},
 			"capath" => {
-				let dirname = strerror_ok!(borrow_str(lua, k, &v));
+				let dirname = strerror_ok!(borrow_named_str(k, &v));
 				for entry in strerror_ok!(read_dir(dirname)) {
 					let entry = match entry {
 						Ok(entry) => entry,
@@ -248,7 +237,7 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 						strerror_ok!(Vec::<String>::from_lua(v, lua))
 					},
 					LuaValue::String(_) => {
-						let value = strerror_ok!(borrow_str(lua, k, &v));
+						let value = strerror_ok!(borrow_named_str(k, &v));
 						vec![value.into()]
 					},
 					_ => return Ok(Err(format!("invalid value for {:?} option (expected str or table)", k))),

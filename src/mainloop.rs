@@ -120,7 +120,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 	Ok(())
 }
 
-pub(crate) fn shutdown<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
+pub(crate) fn shutdown<'l>(_lua: &'l Lua, _: ()) -> LuaResult<()> {
 	// we mustn't pass through the event queue here, because that might be full and we cannot block on it.
 	SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
 	WAKEUP.notify_one();

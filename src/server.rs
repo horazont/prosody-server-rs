@@ -7,7 +7,7 @@ use mlua::prelude::*;
 
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,7 +96,28 @@ impl TlsMode {
 					addr,
 				})
 			},
-			Self::Multiplex{tls_config} => todo!(),
+			Self::Multiplex{tls_config} => {
+				let mut buf = [0u8; 1];
+				match conn.peek(&mut buf).await? {
+					// first byte of the TLS handshake
+					1 if buf[0] == 0x16 => {
+						let conn = tls_config.accept(conn).await?;
+						Ok(Message::TlsAccept{
+							handle: handle.clone(),
+							stream: conn,
+							addr,
+						})
+					},
+					// if no byte is read or if it doesn't match -> assume plaintext
+					_ => {
+						Ok(Message::TcpAccept{
+							handle: handle.clone(),
+							stream: conn,
+							addr,
+						})
+					},
+				}
+			},
 		}
 	}
 }
@@ -257,7 +278,10 @@ pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValu
 
 			(outer_tls_config.map(|x| { x.0 }), match tls_config {
 				Some(tls_config) => match config.get::<_, Option<bool>>("tls_direct")?.unwrap_or(false) {
-					true => TlsMode::DirectTls{tls_config: tls_config.into()},
+					true => match config.get::<_, Option<bool>>("tls_auto")?.unwrap_or(false) {
+						true => TlsMode::Multiplex{tls_config: tls_config.into()},
+						false => TlsMode::DirectTls{tls_config: tls_config.into()},
+					},
 					false => TlsMode::Plain{tls_config: Some(tls_config.into())},
 				},
 				None => TlsMode::Plain{tls_config: None},

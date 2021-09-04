@@ -119,10 +119,6 @@ impl<T> MpscChannel<T> {
 	pub(crate) fn clone_tx(&self) -> mpsc::Sender<T> {
 		self.tx.clone()
 	}
-
-	pub(crate) fn tx_ref(&self) -> &mpsc::Sender<T> {
-		&self.tx
-	}
 }
 
 static MAIN_CAPACITY: usize = 1024;
@@ -172,6 +168,7 @@ impl Drop for GcOnDrop {
 
 pub(crate) struct GcLuaRegistryKey{
 	inner: LuaRegistryKey,
+	#[allow(dead_code)]
 	guard: GcOnDrop,
 }
 

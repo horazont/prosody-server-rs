@@ -1,8 +1,6 @@
 use mlua::prelude::*;
 
-use std::error;
-use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 
 #[macro_export]
@@ -27,7 +25,7 @@ macro_rules! strerror_ok {
 }
 
 
-fn borrow_str<'l>(v: &'l LuaValue<'l>) -> Result<&'l str, String> {
+pub(crate) fn borrow_str<'l>(v: &'l LuaValue<'l>) -> Result<&'l str, String> {
 	match v {
 		LuaValue::String(s) => match s.to_str() {
 			Ok(v) => Ok(v),

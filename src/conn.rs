@@ -40,7 +40,10 @@ This enum is used and cached on the lua side to know which operations are possib
 enum CachedTlsState {
 	/// No context has been set on the socket, so a starttls operation is required to pass a context.
 	NoConfig,
+	// these are currently never constructed because we don't pass TLS config info from the listener to the conn. could be done trivially if needed.
+	#[allow(dead_code)]
 	MayAccept(Arc<rustls::ServerConfig>),
+	#[allow(dead_code)]
 	MayConnect(webpki::DNSName, Arc<rustls::ClientConfig>),
 	/* AcceptInProgress(Arc<rustls::ServerConfig>),
 	ConnectInProgress(webpki::DNSName, Arc<rustls::ClientConfig>), */
@@ -153,7 +156,7 @@ impl LuaUserData for ConnectionHandle {
 			})
 		});
 
-		methods.add_method("ssl_info", |_, this: &Self, _: ()| -> LuaResult<()> {
+		methods.add_method("ssl_info", |_, _this: &Self, _: ()| -> LuaResult<()> {
 			// TODO: return something useful here
 			Ok(())
 		});
@@ -167,7 +170,7 @@ impl LuaUserData for ConnectionHandle {
 			Ok((true, None))
 		});
 
-		methods.add_method_mut("starttls", |lua, this: &mut Self, ctx: Option<tls::TlsConfigHandle>| -> LuaResult<(bool, Option<String>)> {
+		methods.add_method_mut("starttls", |_, this: &mut Self, ctx: Option<tls::TlsConfigHandle>| -> LuaResult<(bool, Option<String>)> {
 			let ctx_arc = ctx.map(|x| { x.0 });
 			let ctx_ref = ctx_arc.as_ref().map(|x| { &**x });
 			match this.tls_state.transition(ctx_ref) {
@@ -176,7 +179,7 @@ impl LuaUserData for ConnectionHandle {
 			}
 		});
 
-		methods.add_method("write", |lua, this: &Self, data: LuaString| -> LuaResult<usize> {
+		methods.add_method("write", |_, this: &Self, data: LuaString| -> LuaResult<usize> {
 			let data: Bytes = Bytes::copy_from_slice(data.as_bytes());
 			let len = data.len();
 			match this.tx.send(ControlMessage::Write(data)) {
@@ -218,7 +221,7 @@ impl ConnectionHandle {
 		Ok(v)
 	}
 
-	fn connect<'l>(lua: &'l Lua, addr: SocketAddr, listeners: LuaTable, tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>)>) -> LuaResult<LuaAnyUserData<'l>> {
+	fn connect<'l>(lua: &'l Lua, addr: SocketAddr, listeners: LuaTable, read_size: usize, tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>)>) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
@@ -238,7 +241,7 @@ impl ConnectionHandle {
 			rx,
 			addr,
 			tls_config,
-			read_size: 8192,
+			read_size,
 			handle,
 		}.spawn();
 		Ok(v)
@@ -669,7 +672,7 @@ struct ConnectWorker {
 }
 
 impl ConnectWorker {
-	async fn run(mut self) {
+	async fn run(self) {
 		let sock = match TcpStream::connect(self.addr).await {
 			Ok(sock) => sock,
 			Err(e) => {
@@ -721,9 +724,10 @@ impl Spawn for ConnectWorker {
 
 pub(crate) fn addclient<'l>(
 		lua: &'l Lua,
-		(addr, port, listeners, read_size, tls_ctx, typ, extra): (LuaValue, u16, LuaTable, usize, Option<tls::TlsConfigHandle>, Option<LuaString>, Option<LuaTable>)
+		(addr, port, listeners, read_size, tls_ctx, _typ, extra): (LuaValue, u16, LuaTable, usize, Option<tls::TlsConfigHandle>, Option<LuaString>, Option<LuaTable>)
 		) -> LuaResult<Result<LuaAnyUserData<'l>, String>>
 {
+	// TODO: honour the typ somehow? :)
 	let addr = strerror_ok!(conversion::to_ipaddr(&addr));
 	let addr = SocketAddr::new(addr, port);
 
@@ -749,13 +753,13 @@ pub(crate) fn addclient<'l>(
 			};
 			Some((servername.to_owned(), tls_ctx))
 		},
-		(Some(tls_ctx), None) => {
+		(Some(_), None) => {
 			return Ok(Err(format!("cannot connect via TLS without a servername")))
 		},
 		(None, None) | (None, Some(_)) => None,
 	};
 
 	with_runtime_lua!{
-		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, tls_config)?))
+		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, read_size, tls_config)?))
 	}
 }
