@@ -1,7 +1,9 @@
 use mlua::prelude::*;
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, Instant};
+
+use lazy_static::lazy_static;
 
 use tokio::select;
 
@@ -14,6 +16,11 @@ use super::core::{
 };
 
 use super::conn;
+
+
+lazy_static! {
+	static ref SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+}
 
 
 fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
@@ -105,7 +112,18 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				None => (),
 			};
 		},
+		Message::Signal{handle} => {
+			let func = lua.registry_value::<LuaFunction>(&*handle)?;
+			func.call::<_, ()>(())?;
+		},
 	};
+	Ok(())
+}
+
+pub(crate) fn shutdown<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
+	// we mustn't pass through the event queue here, because that might be full and we cannot block on it.
+	SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+	WAKEUP.notify_one();
 	Ok(())
 }
 
@@ -156,7 +174,7 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 				select! {
 					msg = rx.recv() => match msg {
 						Some(msg) => match proc_message(lua, msg) {
-							Ok(_) => (),
+							Ok(()) => (),
 							Err(e) => {
 								eprintln!("failed to process event loop message: {}", e)
 							},
@@ -166,6 +184,9 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 					},
 					// iterate the loop once to trigger GC if necessary
 					_ = WAKEUP.notified() => (),
+				}
+				if let Ok(_) = SHUTDOWN_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
+					break
 				}
 				if let Ok(_) = GC_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
 					lua.expire_registry_values();

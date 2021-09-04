@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 mlua = { version = "^0.6", features = ["async", "lua52", "vendored", "module"] }
-tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 lazy_static = { version ="^1.4" }
 # we need the dangerous stuff because XMPP has its own ways to verify a connection, so we mustn't rely on PKI verification alone.
 rustls = { version = "^0.19", features = ["dangerous_configuration"] }

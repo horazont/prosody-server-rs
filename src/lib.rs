@@ -10,6 +10,7 @@ mod timer;
 mod server;
 mod conn;
 mod tls;
+mod signal;
 
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
@@ -17,10 +18,12 @@ fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
 
 	let server = lua.create_table()?;
 	server.set("loop", lua.create_function(mainloop::mainloop)?)?;
+	server.set("shutdown", lua.create_function(mainloop::shutdown)?)?;
 	server.set("_add_task", lua.create_function(timer::add_task)?)?;
 	server.set("listen", lua.create_function(server::listen)?)?;
 	server.set("addclient", lua.create_function(conn::addclient)?)?;
 	server.set("new_tls_config", lua.create_function(tls::new_tls_config)?)?;
+	server.set("hook_signal", lua.create_function(signal::hook_signal)?)?;
 	exports.set("server", server)?;
 
 	exports.set("version", VERSION)?;

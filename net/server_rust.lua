@@ -34,6 +34,10 @@ return {
 		return sslconfig._new(server_impl.new_tls_config);
 	end,
 
+	-- SIGNAL FUNCTIONS
+	hook_signal = server_impl.hook_signal;
+
 	-- MAIN LOOP FUNCTIONS
 	loop = server_impl.loop;
+	shutdown = server_impl.shutdown;
 }

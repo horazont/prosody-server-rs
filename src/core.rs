@@ -86,6 +86,11 @@ pub(crate) enum Message {
 		handle: LuaRegistryHandle,
 		error: Option<Box<dyn Error + Send + 'static>>,
 	},
+
+	Signal{
+		/// The registry key of the function to invoke
+		handle: LuaRegistryHandle,
+	},
 }
 
 /// Wrapper around an MpscChannel which brokers access to the rx/tx pair
