@@ -164,36 +164,34 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 	1. The runtime: to spawn tasks when sockets get created.
 	2. The synchronous mpsc::Receiver (plus a sender zygote): to allow spawned tasks to send stuff to lua.
 	*/
-	lua.scope(|scope| {
-		let ropt = RUNTIME.read().unwrap();
-		let r = ropt.as_ref().unwrap();
-		let mut rx = MAIN_CHANNEL.lock_rx_lua()?;
-		let _guard = r.enter();
-		r.block_on(async move {
-			loop {
-				select! {
-					msg = rx.recv() => match msg {
-						Some(msg) => match proc_message(lua, msg) {
-							Ok(()) => (),
-							Err(e) => {
-								eprintln!("failed to process event loop message: {}", e)
-							},
+	let ropt = RUNTIME.read().unwrap();
+	let r = ropt.as_ref().unwrap();
+	let mut rx = MAIN_CHANNEL.lock_rx_lua()?;
+	let _guard = r.enter();
+	r.block_on(async move {
+		loop {
+			select! {
+				msg = rx.recv() => match msg {
+					Some(msg) => match proc_message(lua, msg) {
+						Ok(()) => (),
+						Err(e) => {
+							eprintln!("failed to process event loop message: {}", e)
 						},
-						// this is impossible because one tx of the main channel is held in some arc at global scope
-						None => unreachable!(),
 					},
-					// iterate the loop once to trigger GC if necessary
-					_ = WAKEUP.notified() => (),
-				}
-				if let Ok(_) = SHUTDOWN_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
-					break
-				}
-				if let Ok(_) = GC_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
-					lua.expire_registry_values();
-				}
-			};
-			Ok(())
-		})
+					// this is impossible because one tx of the main channel is held in some arc at global scope
+					None => unreachable!(),
+				},
+				// iterate the loop once to trigger GC if necessary
+				_ = WAKEUP.notified() => (),
+			}
+			if let Ok(_) = SHUTDOWN_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
+				break
+			}
+			if let Ok(_) = GC_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
+				lua.expire_registry_values();
+			}
+		};
+		Ok(())
 	})
 }
 
