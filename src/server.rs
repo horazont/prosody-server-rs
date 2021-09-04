@@ -220,14 +220,26 @@ impl ListenerHandle {
 	}
 }
 
+fn mk_listen_socket(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+	let domain = socket2::Domain::for_address(addr);
+	let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+	if domain == socket2::Domain::IPV6 {
+		// if it doesn't work, it doesn't work
+		let _ = sock.set_only_v6(true);
+	}
+	sock.set_nonblocking(true)?;
+	sock.bind(&addr.into())?;
+	sock.listen(0)?;
+	Ok(sock.into())
+}
+
 pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValue, u16, LuaTable, Option<LuaTable>)) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let addr = strerror_ok!(conversion::to_ipaddr(&addr));
 	let addr = SocketAddr::new(addr, port);
-	let sock = match std::net::TcpListener::bind(&addr) {
+	let sock = match mk_listen_socket(addr) {
 		Ok(v) => v,
 		Err(e) => return Ok(Err(format!("failed to bind to {}: {}", addr, e))),
 	};
-	sock.set_nonblocking(true)?;
 
 	let (tls_config, tls_mode) = match config {
 		None => (None, TlsMode::Plain{tls_config: None}),
