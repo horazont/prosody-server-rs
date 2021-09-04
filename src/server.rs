@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 
 use crate::{with_runtime_lua, strerror_ok};
-use crate::core::{MAIN_CHANNEL, Message, Spawn};
+use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
 use crate::conversion;
 use crate::tls;
 
@@ -79,7 +79,7 @@ impl fmt::Debug for TlsMode {
 }
 
 impl TlsMode {
-	async fn accept(&self, handle: &'_ Arc<LuaRegistryKey>, conn: TcpStream, addr: SocketAddr) -> io::Result<Message> {
+	async fn accept(&self, handle: &'_ LuaRegistryHandle, conn: TcpStream, addr: SocketAddr) -> io::Result<Message> {
 		match self {
 			Self::Plain{..} => {
 				Ok(Message::TcpAccept{
@@ -114,7 +114,7 @@ struct ListenerWorker {
 	global_tx: mpsc::Sender<Message>,
 	tls_mode: TlsMode,
 	sock: TcpListener,
-	handle: Arc<LuaRegistryKey>,
+	handle: LuaRegistryHandle,
 }
 
 impl ListenerWorker {
@@ -206,7 +206,7 @@ impl ListenerHandle {
 			tls_config,
 		})?;
 		v.set_user_value(listeners)?;
-		let key = lua.create_registry_value(v.clone())?;
+		let handle = lua.create_registry_value(v.clone())?.into();
 
 		let global_tx = MAIN_CHANNEL.clone_tx();
 		ListenerWorker{
@@ -214,7 +214,7 @@ impl ListenerHandle {
 			global_tx,
 			sock,
 			tls_mode,
-			handle: Arc::new(key),
+			handle,
 		}.spawn();
 		Ok(v)
 	}

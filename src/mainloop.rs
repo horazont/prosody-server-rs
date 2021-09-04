@@ -1,11 +1,13 @@
 use mlua::prelude::*;
 
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, Instant};
 
 use super::core::{
 	Message,
 	RUNTIME,
 	MAIN_CHANNEL,
+	GC_FLAG,
 };
 
 use super::conn;
@@ -100,6 +102,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				None => (),
 			};
 		},
+		Message::Wakeup => (),
 	};
 	Ok(())
 }
@@ -158,8 +161,9 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 						eprintln!("failed to process event loop message: {}", e)
 					},
 				}
-				// TODO: do this only every N seconds or so
-				lua.expire_registry_values();
+				if let Ok(_) = GC_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
+					lua.expire_registry_values();
+				}
 			};
 			Ok(())
 		})

@@ -27,7 +27,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, server, client};
 use pin_project_lite::pin_project;
 
 use crate::{with_runtime_lua, strerror_ok};
-use crate::core::{MAIN_CHANNEL, Message, Spawn};
+use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
 use crate::tls;
 use crate::conversion;
 
@@ -204,7 +204,7 @@ impl ConnectionHandle {
 			sockport: addr.port(),
 		})?;
 		v.set_user_value(listeners)?;
-		let key = lua.create_registry_value(v.clone())?;
+		let handle = lua.create_registry_value(v.clone())?.into();
 
 		let global_tx = MAIN_CHANNEL.clone_tx();
 		ConnectionWorker{
@@ -212,7 +212,7 @@ impl ConnectionHandle {
 			rx,
 			conn,
 			read_size: 8192,
-			handle: Arc::new(key),
+			handle,
 			buf: None,
 		}.spawn();
 		Ok(v)
@@ -230,7 +230,7 @@ impl ConnectionHandle {
 			sockport: addr.port(),
 		})?;
 		v.set_user_value(listeners)?;
-		let key = lua.create_registry_value(v.clone())?;
+		let handle = lua.create_registry_value(v.clone())?.into();
 
 		let global_tx = MAIN_CHANNEL.clone_tx();
 		ConnectWorker{
@@ -239,7 +239,7 @@ impl ConnectionHandle {
 			addr,
 			tls_config,
 			read_size: 8192,
-			handle: Arc::new(key),
+			handle,
 		}.spawn();
 		Ok(v)
 	}
@@ -454,7 +454,7 @@ struct ConnectionWorker {
 	conn: ConnectionState,
 	read_size: usize,
 	buf: Option<Limit<BytesMut>>,
-	handle: Arc<LuaRegistryKey>,
+	handle: LuaRegistryHandle,
 }
 
 enum ReadResult {
@@ -665,7 +665,7 @@ struct ConnectWorker {
 	addr: SocketAddr,
 	read_size: usize,
 	tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>)>,
-	handle: Arc<LuaRegistryKey>,
+	handle: LuaRegistryHandle,
 }
 
 impl ConnectWorker {

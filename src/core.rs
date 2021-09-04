@@ -1,9 +1,12 @@
 use mlua::prelude::*;
 
 use std::error::Error;
+use std::fmt;
 use std::net::SocketAddr;
+use std::ops::{Deref, Drop};
 use std::time::{SystemTime, Instant};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 
@@ -28,7 +31,7 @@ pub(crate) enum Message {
 	/// A timer has elapsed.
 	TimerElapsed{
 		/// The registry key of the timer handle.
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 		/// The timestamp at which the timer tripped.
 		timestamp: SystemTime,
 		/// Return value channel for the interval until the next invocation.
@@ -40,7 +43,7 @@ pub(crate) enum Message {
 	/// A plain-text TCP-like connection has been accepted.
 	TcpAccept{
 		/// The registry key of the (server) handle to which the connection belongs
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 		/// The newly accepted stream
 		stream: TcpStream,
 		/// The remote address of the accepted stream
@@ -50,7 +53,7 @@ pub(crate) enum Message {
 	/// A TLS-encrypted TCP-like connection has been accepted.
 	TlsAccept{
 		/// The registry key of the (server) handle to which the connection belongs
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 		/// The newly accepted stream
 		stream: ServerTlsStream<TcpStream>,
 		/// The remote address of the accepted stream
@@ -60,28 +63,31 @@ pub(crate) enum Message {
 	/// TLS was started on an existing connection
 	TlsStarted{
 		/// The registry key of the connection handle
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 	},
 
 	Incoming{
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 		data: Bytes,
 	},
 
 	ReadClosed{
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 	},
 
 	Connect{
 		/// The registry key of the connection handle
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 	},
 
 	Disconnect{
 		/// The registry key of the connection handle
-		handle: Arc<LuaRegistryKey>,
+		handle: LuaRegistryHandle,
 		error: Option<Box<dyn Error + Send + 'static>>,
 	},
+
+	// No-op
+	Wakeup,
 }
 
 /// Wrapper around an MpscChannel which brokers access to the rx/tx pair
@@ -110,13 +116,21 @@ impl<T> MpscChannel<T> {
 	pub(crate) fn clone_tx(&self) -> mpsc::Sender<T> {
 		self.tx.clone()
 	}
+
+	pub(crate) fn tx_ref(&self) -> &mpsc::Sender<T> {
+		&self.tx
+	}
 }
+
+static MAIN_CAPACITY: usize = 1024;
 
 lazy_static! {
 	#[doc(hidden)]
 	pub(crate) static ref RUNTIME: RwLock<Option<Runtime>> = RwLock::new(Some(Builder::new_multi_thread().enable_all().build().unwrap()));
 	#[doc(hidden)]
-	pub(crate) static ref MAIN_CHANNEL: MpscChannel<Message> = MpscChannel::new(1024);
+	pub(crate) static ref MAIN_CHANNEL: MpscChannel<Message> = MpscChannel::new(MAIN_CAPACITY);
+	#[doc(hidden)]
+	pub(crate) static ref GC_FLAG: AtomicBool = AtomicBool::new(false);
 }
 
 pub(crate) fn get_runtime<'x>(guard: &'x RwLockReadGuard<'x, Option<Runtime>>) -> LuaResult<&'x Runtime> {
@@ -128,6 +142,86 @@ pub(crate) fn get_runtime<'x>(guard: &'x RwLockReadGuard<'x, Option<Runtime>>) -
 
 pub(crate) trait Spawn {
 	fn spawn(self);
+}
+
+pub(crate) struct WakeupOnDrop();
+
+impl Drop for WakeupOnDrop {
+	fn drop(&mut self) {
+		let ch = MAIN_CHANNEL.tx_ref();
+		// we only need to trigger a wakeup if no other thing is currently in the queue
+		if ch.capacity() == MAIN_CAPACITY {
+			ch.try_send(Message::Wakeup);
+		}
+	}
+}
+
+pub(crate) struct GcOnDrop(WakeupOnDrop);
+
+impl GcOnDrop {
+	fn prepare() -> Self {
+		Self(WakeupOnDrop())
+	}
+}
+
+impl Drop for GcOnDrop {
+	fn drop(&mut self) {
+		GC_FLAG.store(true, Ordering::SeqCst);
+	}
+}
+
+pub(crate) struct GcLuaRegistryKey{
+	inner: LuaRegistryKey,
+	guard: GcOnDrop,
+}
+
+impl From<LuaRegistryKey> for GcLuaRegistryKey {
+	fn from(other: LuaRegistryKey) -> Self {
+		Self{inner: other, guard: GcOnDrop::prepare()}
+	}
+}
+
+impl Deref for GcLuaRegistryKey {
+	type Target = LuaRegistryKey;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl AsRef<LuaRegistryKey> for GcLuaRegistryKey {
+	fn as_ref(&self) -> &LuaRegistryKey {
+		&self.inner
+	}
+}
+
+#[derive(Clone)]
+pub(crate) struct LuaRegistryHandle(pub(crate) Arc<GcLuaRegistryKey>);
+
+impl From<LuaRegistryKey> for LuaRegistryHandle {
+	fn from(other: LuaRegistryKey) -> Self {
+		Self(Arc::new(other.into()))
+	}
+}
+
+impl Deref for LuaRegistryHandle {
+	type Target = LuaRegistryKey;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0.inner
+	}
+}
+
+impl AsRef<LuaRegistryKey> for LuaRegistryHandle {
+	fn as_ref(&self) -> &LuaRegistryKey {
+		&self.0.inner
+	}
+}
+
+impl fmt::Debug for LuaRegistryHandle {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		fmt::Debug::fmt(&self.0.inner, f)
+	}
 }
 
 #[macro_export]

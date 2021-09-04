@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use crate::with_runtime_lua;
-use super::core::{Message, MAIN_CHANNEL};
+use super::core::{Message, MAIN_CHANNEL, LuaRegistryHandle};
 
 
 /**
@@ -75,7 +75,7 @@ impl TimerHandle {
 			close: Some(close_tx),
 		})?;
 		v.set_user_value(func)?;
-		let handle = Arc::new(lua.create_registry_value(v.clone())?);
+		let handle = lua.create_registry_value(v.clone())?.into();
 
 		// The timer worker will infrom the main (Lua) loop about expired timers via the global event channel. If the channel is full, the timer event will be delivered late, however.
 		let global_tx = MAIN_CHANNEL.clone_tx();
@@ -98,7 +98,7 @@ struct TimerWorker {
 	self_schedule: Arc<watch::Sender<Instant>>,
 	schedule: watch::Receiver<Instant>,
 	close: oneshot::Receiver<()>,
-	handle: Arc<LuaRegistryKey>,
+	handle: LuaRegistryHandle,
 }
 
 impl TimerWorker {
