@@ -22,4 +22,4 @@ pin-project-lite = { version = "^0.2" }
 bytes = { version = "^1" }
 nix = { version = "^0.22" }
 # bounded by rustls
-webpki = { version = "*" }
+webpki = { version = "^0.21.0" }
