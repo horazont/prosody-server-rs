@@ -116,6 +116,7 @@ impl SocketOption {
 
 enum ControlMessage {
 	Close,
+	BlockReads,
 	Write(Bytes),
 	SetOption(SocketOption),
 	AcceptTls(Arc<rustls::ServerConfig>),
@@ -161,6 +162,11 @@ impl LuaUserData for ConnectionHandle {
 			Ok(())
 		});
 
+		methods.add_method("block_reads", |_, this: &Self, _: ()| -> LuaResult<()> {
+			let _ = this.tx.send(ControlMessage::BlockReads);
+			Ok(())
+		});
+
 		methods.add_method("setoption", |lua, this: &Self, name: String| -> LuaResult<(bool, Option<String>)> {
 			let option = match SocketOption::from_lua_args(lua, name, LuaValue::Nil) {
 				Ok(v) => v,
@@ -174,8 +180,15 @@ impl LuaUserData for ConnectionHandle {
 			let ctx_arc = ctx.map(|x| { x.0 });
 			let ctx_ref = ctx_arc.as_ref().map(|x| { &**x });
 			match this.tls_state.transition(ctx_ref) {
-				Ok(_) => Ok((true, None)),
-				Err(e) => Ok((false, Some(e))),
+				Ok(msg) => {
+					match this.tx.send(msg) {
+						Ok(()) => Ok((true, None)),
+						Err(_) => return Err(LuaError::RuntimeError("channel gone!".to_string())),
+					}
+				},
+				Err(e) => {
+					Ok((false, Some(e)))
+				},
 			}
 		});
 
@@ -215,6 +228,8 @@ impl ConnectionHandle {
 			rx,
 			conn,
 			read_size: 8192,
+			tx_mode: DirectionMode::Open,
+			rx_mode: DirectionMode::Open,
 			handle,
 			buf: None,
 		}.spawn();
@@ -295,6 +310,17 @@ pin_project! {
 			#[pin]
 			sock: client::TlsStream<TcpStream>,
 		},
+	}
+}
+
+impl fmt::Debug for ConnectionState {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::Broken{e} => f.debug_struct("ConnectionState::Broken").field("e", &e).finish(),
+			Self::Plain{..} => f.debug_struct("ConnectionState::Plain").finish_non_exhaustive(),
+			Self::TlsServer{..} => f.debug_struct("ConnectionState::TlsServer").finish_non_exhaustive(),
+			Self::TlsClient{..} => f.debug_struct("ConnectionState::TlsClient").finish_non_exhaustive(),
+		}
 	}
 }
 
@@ -449,6 +475,45 @@ enum MsgResult {
 	WriteClosed,
 	Continue,
 	Exit,
+	Reset,
+	ReadBlocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectionMode {
+	Closed,
+	Blocked,
+	Open,
+}
+
+impl DirectionMode {
+	fn may(&self) -> bool {
+		match self {
+			Self::Closed | Self::Blocked => false,
+			Self::Open => true,
+		}
+	}
+
+	fn may_ever(&self) -> bool {
+		match self {
+			Self::Closed => false,
+			Self::Open | Self::Blocked  => true,
+		}
+	}
+
+	fn unblock(&self) -> DirectionMode {
+		match self {
+			Self::Blocked => Self::Open,
+			Self::Open | Self::Closed => *self,
+		}
+	}
+
+	fn block(&self) -> DirectionMode {
+		match self {
+			Self::Open => Self::Blocked,
+			Self::Blocked | Self::Closed => *self,
+		}
+	}
 }
 
 struct ConnectionWorker {
@@ -457,6 +522,8 @@ struct ConnectionWorker {
 	conn: ConnectionState,
 	read_size: usize,
 	buf: Option<Limit<BytesMut>>,
+	rx_mode: DirectionMode,
+	tx_mode: DirectionMode,
 	handle: LuaRegistryHandle,
 }
 
@@ -519,34 +586,6 @@ impl ConnectionWorker {
 		}
 	}
 
-	async fn run_draining(mut self) {
-		self.buf = None;
-		select! {
-			_ = self.conn.shutdown() => return,
-			_ = self.global_tx.closed() => return,
-		}
-	}
-
-	async fn run_wclosed(mut self) {
-		loop {
-			select! {
-				result = read_with_buf(&mut self.conn, &mut self.buf, self.read_size) => match result {
-					Ok(buf) => match self.proc_read_buffer(buf).await {
-						Ok(ReadResult::Closed) => return self.run_draining().await,
-						Ok(ReadResult::Continue) => (),
-						Err(()) => return,
-					},
-					Err(e) => {
-						warn!("read error: {}", e);
-						// TODO: report this to lua, I guess
-						return
-					},
-				},
-				_ = self.global_tx.closed() => return,
-			}
-		}
-	}
-
 	fn set_keepalive(&self, enabled: bool) -> Result<(), io::Error> {
 		nix::sys::socket::setsockopt(
 			self.conn.as_raw_fd(),
@@ -575,7 +614,7 @@ impl ConnectionWorker {
 				match self.conn.starttls_accept(ctx).await {
 					Ok(_) => {
 						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone()}).await {
-							Ok(_) => MsgResult::Continue,
+							Ok(_) => MsgResult::Reset,
 							Err(_) => MsgResult::Exit,
 						}
 					},
@@ -591,7 +630,7 @@ impl ConnectionWorker {
 				match self.conn.starttls_connect(name.as_ref(), ctx).await {
 					Ok(_) => {
 						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone()}).await {
-							Ok(_) => MsgResult::Continue,
+							Ok(_) => MsgResult::Reset,
 							Err(_) => MsgResult::Exit,
 						}
 					},
@@ -607,40 +646,27 @@ impl ConnectionWorker {
 				Ok(()) => MsgResult::Continue,
 				Err(()) => MsgResult::Exit,
 			},
-		}
-	}
-
-	async fn run_rclosed(mut self) {
-		self.buf = None;
-		loop {
-			select! {
-				msg = self.rx.recv() => match msg {
-					Some(msg) => match self.proc_msg(msg).await {
-						MsgResult::Exit => return,
-						MsgResult::Continue => (),
-						MsgResult::WriteClosed => return self.run_draining().await,
-					},
-					None => return,
-				},
-				_ = self.global_tx.closed() => return,
-			}
+			ControlMessage::BlockReads => return MsgResult::ReadBlocked,
 		}
 	}
 
 	async fn run(mut self) {
 		loop {
+			if !self.rx_mode.may_ever() && !self.tx_mode.may_ever() {
+				// if the connection can neither read nor write ever again, we only shutdown and then bail out
+				self.buf = None;
+				select! {
+					_ = self.conn.shutdown() => return,
+					_ = self.global_tx.closed() => return,
+				}
+			}
+
 			select! {
-				msg = self.rx.recv() => match msg {
-					Some(msg) => match self.proc_msg(msg).await {
-						MsgResult::Exit => return,
-						MsgResult::Continue => (),
-						MsgResult::WriteClosed => return self.run_wclosed().await,
-					},
-					None => return,
-				},
-				result = read_with_buf(&mut self.conn, &mut self.buf, self.read_size) => match result {
+				result = read_with_buf(&mut self.conn, &mut self.buf, self.read_size), if self.rx_mode.may() => match result {
 					Ok(buf) => match self.proc_read_buffer(buf).await {
-						Ok(ReadResult::Closed) => return self.run_rclosed().await,
+						Ok(ReadResult::Closed) => {
+							self.rx_mode = DirectionMode::Closed;
+						},
 						Ok(ReadResult::Continue) => (),
 						Err(()) => return,
 					},
@@ -649,6 +675,23 @@ impl ConnectionWorker {
 						// TODO: report this to lua, I guess
 						return
 					},
+				},
+				msg = self.rx.recv(), if self.tx_mode.may() => match msg {
+					Some(msg) => match self.proc_msg(msg).await {
+						MsgResult::Exit => return,
+						MsgResult::Continue => (),
+						MsgResult::WriteClosed => {
+							self.tx_mode = DirectionMode::Closed;
+						},
+						MsgResult::Reset => {
+							self.tx_mode = self.tx_mode.unblock();
+							self.rx_mode = self.tx_mode.unblock();
+						},
+						MsgResult::ReadBlocked => {
+							self.rx_mode = self.rx_mode.block();
+						},
+					},
+					None => return,
 				},
 				_ = self.global_tx.closed() => return,
 			}
@@ -711,6 +754,8 @@ impl ConnectWorker {
 			read_size: self.read_size,
 			conn,
 			buf: None,
+			tx_mode: DirectionMode::Open,
+			rx_mode: DirectionMode::Open,
 			handle: self.handle,
 		}.run().await;
 	}
