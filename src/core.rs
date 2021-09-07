@@ -87,6 +87,18 @@ pub(crate) enum Message {
 		error: Option<Box<dyn Error + Send + 'static>>,
 	},
 
+	/// watchfd notification
+	Readable{
+		handle: LuaRegistryHandle,
+		confirm: oneshot::Sender<()>,
+	},
+
+	/// watchfd notification
+	Writable{
+		handle: LuaRegistryHandle,
+		confirm: oneshot::Sender<()>,
+	},
+
 	Signal{
 		/// The registry key of the function to invoke
 		handle: LuaRegistryHandle,

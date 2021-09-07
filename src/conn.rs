@@ -52,13 +52,19 @@ enum CachedTlsState {
 }
 
 impl CachedTlsState {
-	fn transition(&mut self, given_config: Option<&tls::TlsConfig>) -> Result<ControlMessage, String> {
+	fn transition(&mut self, given_config: Option<&tls::TlsConfig>, given_servername: Option<webpki::DNSNameRef>) -> Result<ControlMessage, String> {
 		match self {
 			Self::InProgress => Err("TLS operation already in progress".into()),
 			Self::Established => Err("TLS already established".into()),
 			Self::NoConfig => match given_config {
 				// We can only *accept* connections based on the given config, as we lack a target hostname
-				Some(tls::TlsConfig::Client{..}) => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
+				Some(tls::TlsConfig::Client{cfg}) => match given_servername {
+					Some(v) => {
+						*self = Self::InProgress;
+						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone()))
+					},
+					None => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
+				},
 				Some(tls::TlsConfig::Server{cfg, ..}) => {
 					*self = Self::InProgress;
 					Ok(ControlMessage::AcceptTls(cfg.clone()))
@@ -67,7 +73,13 @@ impl CachedTlsState {
 			},
 			Self::MayAccept(cfg) => match given_config {
 				// We can only *accept* connections based on the given config, as we lack a target hostname
-				Some(tls::TlsConfig::Client{..}) => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
+				Some(tls::TlsConfig::Client{cfg}) => match given_servername {
+					Some(v) => {
+						*self = Self::InProgress;
+						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone()))
+					},
+					None => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
+				},
 				Some(tls::TlsConfig::Server{cfg, ..}) => {
 					let msg = ControlMessage::AcceptTls(cfg.clone());
 					*self = Self::InProgress;
@@ -79,23 +91,29 @@ impl CachedTlsState {
 					Ok(msg)
 				},
 			},
-			Self::MayConnect(name, cfg) => match given_config {
-				// We can only *accept* connections based on the given config, as we lack a target hostname
-				Some(tls::TlsConfig::Client{cfg}) => {
-					let msg = ControlMessage::ConnectTls(name.clone(), cfg.clone());
-					*self = Self::InProgress;
-					Ok(msg)
-				},
-				Some(tls::TlsConfig::Server{cfg, ..}) => {
-					let msg = ControlMessage::AcceptTls(cfg.clone());
-					*self = Self::InProgress;
-					Ok(msg)
-				},
-				None => {
-					let msg = ControlMessage::ConnectTls(name.clone(), cfg.clone());
-					*self = Self::InProgress;
-					Ok(msg)
-				},
+			Self::MayConnect(name, cfg) => {
+				let name = match given_servername {
+					Some(name) => name.to_owned(),
+					None => name.clone(),
+				};
+				match given_config {
+					// We can only *accept* connections based on the given config, as we lack a target hostname
+					Some(tls::TlsConfig::Client{cfg}) => {
+						let msg = ControlMessage::ConnectTls(name, cfg.clone());
+						*self = Self::InProgress;
+						Ok(msg)
+					},
+					Some(tls::TlsConfig::Server{cfg, ..}) => {
+						let msg = ControlMessage::AcceptTls(cfg.clone());
+						*self = Self::InProgress;
+						Ok(msg)
+					},
+					None => {
+						let msg = ControlMessage::ConnectTls(name, cfg.clone());
+						*self = Self::InProgress;
+						Ok(msg)
+					},
+				}
 			},
 		}
 	}
@@ -162,6 +180,16 @@ impl LuaUserData for ConnectionHandle {
 			Ok(())
 		});
 
+		methods.add_method("ssl_peercertificate", |_, _this: &Self, _: ()| -> LuaResult<()> {
+			// TODO: return something useful here
+			Ok(())
+		});
+
+		methods.add_method("ssl_peerverification", |lua, _this: &Self, _: ()| -> LuaResult<(bool, LuaTable)> {
+			// TODO: return something useful here
+			Ok((false, lua.create_table()?))
+		});
+
 		methods.add_method("block_reads", |_, this: &Self, _: ()| -> LuaResult<()> {
 			let _ = this.tx.send(ControlMessage::BlockReads);
 			Ok(())
@@ -176,19 +204,22 @@ impl LuaUserData for ConnectionHandle {
 			Ok((true, None))
 		});
 
-		methods.add_method_mut("starttls", |_, this: &mut Self, ctx: Option<tls::TlsConfigHandle>| -> LuaResult<(bool, Option<String>)> {
+		methods.add_method_mut("starttls", |_, this: &mut Self, (ctx, servername): (Option<tls::TlsConfigHandle>, Option<LuaString>)| -> LuaResult<()> {
 			let ctx_arc = ctx.map(|x| { x.0 });
 			let ctx_ref = ctx_arc.as_ref().map(|x| { &**x });
-			match this.tls_state.transition(ctx_ref) {
+			let servername_ref = match servername.as_ref().map(|x| { webpki::DNSNameRef::try_from_ascii(x.as_bytes()) }) {
+				Some(Ok(v)) => Some(v),
+				Some(Err(e)) => return Err(LuaError::RuntimeError(format!("passed server name {:?} is invalid: {}", servername.unwrap().to_string_lossy(), e))),
+				None => None,
+			};
+			match this.tls_state.transition(ctx_ref, servername_ref) {
 				Ok(msg) => {
 					match this.tx.send(msg) {
-						Ok(()) => Ok((true, None)),
+						Ok(()) => Ok(()),
 						Err(_) => return Err(LuaError::RuntimeError("channel gone!".to_string())),
 					}
 				},
-				Err(e) => {
-					Ok((false, Some(e)))
-				},
+				Err(e) => return Err(LuaError::RuntimeError(format!("{}", e))),
 			}
 		});
 
@@ -204,6 +235,20 @@ impl LuaUserData for ConnectionHandle {
 		methods.add_method("close", |_, this: &Self, _: ()| -> LuaResult<()> {
 			// this can only fail when the socket is already dead
 			let _ = this.tx.send(ControlMessage::Close);
+			Ok(())
+		});
+
+		methods.add_function("setlistener", |_, (this, listeners, data): (LuaAnyUserData, LuaTable, LuaValue)| -> LuaResult<()> {
+			let old_listeners = this.get_user_value::<LuaTable>()?;
+			match old_listeners.get::<_, Option<LuaFunction>>("ondetach")? {
+				Some(func) => func.call::<_, ()>(this.clone())?,
+				None => (),
+			};
+			this.set_user_value(listeners.clone())?;
+			match listeners.get::<_, Option<LuaFunction>>("onattach")? {
+				Some(func) => func.call::<_, ()>((this.clone(), data))?,
+				None => (),
+			};
 			Ok(())
 		});
 	}
@@ -642,9 +687,14 @@ impl ConnectionWorker {
 					},
 				}
 			},
-			ControlMessage::Write(buf) => match self.proc_write_buffer(buf).await {
-				Ok(()) => MsgResult::Continue,
-				Err(()) => MsgResult::Exit,
+			ControlMessage::Write(buf) => if self.tx_mode.may() {
+				match self.proc_write_buffer(buf).await {
+					Ok(()) => MsgResult::Continue,
+					Err(()) => MsgResult::Exit,
+				}
+			} else {
+				// should this instead be a write error or something?!
+				MsgResult::Continue
 			},
 			ControlMessage::BlockReads => return MsgResult::ReadBlocked,
 		}
@@ -676,7 +726,7 @@ impl ConnectionWorker {
 						return
 					},
 				},
-				msg = self.rx.recv(), if self.tx_mode.may() => match msg {
+				msg = self.rx.recv() => match msg {
 					Some(msg) => match self.proc_msg(msg).await {
 						MsgResult::Exit => return,
 						MsgResult::Continue => (),

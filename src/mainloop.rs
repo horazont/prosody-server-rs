@@ -74,9 +74,16 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				handle.confirm_starttls();
 			}
 			let listeners = handle.get_user_value::<LuaTable>()?;
+			// TODO: this is actually called at the start of TLS negotiation...
 			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
 				Some(func) => {
-					func.call::<_, ()>((handle, LuaValue::Nil))?;
+					func.call::<_, ()>((handle.clone(), LuaValue::Nil))?;
+				},
+				None => (),
+			};
+			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
+				Some(func) => {
+					func.call::<_, ()>(handle)?;
 				},
 				None => (),
 			};
@@ -115,6 +122,22 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::Signal{handle} => {
 			let func = lua.registry_value::<LuaFunction>(&*handle)?;
 			func.call::<_, ()>(())?;
+		},
+		Message::Readable{handle, confirm} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			let func = listeners.get::<&'static str, LuaFunction>("onreadable")?;
+			func.call::<_, ()>(handle)?;
+			// we can just let confirm drop, that's good enough
+			drop(confirm);
+		},
+		Message::Writable{handle, confirm} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = handle.get_user_value::<LuaTable>()?;
+			let func = listeners.get::<&'static str, LuaFunction>("onwritable")?;
+			func.call::<_, ()>(handle)?;
+			// we can just let confirm drop, that's good enough
+			drop(confirm);
 		},
 	};
 	Ok(())
