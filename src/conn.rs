@@ -14,8 +14,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use log::{debug, warn, error};
-
 use bytes::{Bytes, BytesMut, BufMut, buf::Limit};
 
 use tokio::select;
@@ -140,6 +138,8 @@ impl SocketOption {
 enum ControlMessage {
 	Close,
 	BlockReads,
+	BlockWrites,
+	UnblockWrites,
 	Write(Bytes),
 	SetOption(SocketOption),
 	AcceptTls(Arc<rustls::ServerConfig>),
@@ -224,6 +224,16 @@ impl LuaUserData for ConnectionHandle {
 			Ok(())
 		});
 
+		methods.add_method("pause_writes", |_, this: &Self, _: ()| -> LuaResult<()> {
+			let _ = this.tx.send(ControlMessage::BlockWrites);
+			Ok(())
+		});
+
+		methods.add_method("resume_writes", |_, this: &Self, _: ()| -> LuaResult<()> {
+			let _ = this.tx.send(ControlMessage::UnblockWrites);
+			Ok(())
+		});
+
 		methods.add_method("setoption", |lua, this: &Self, name: String| -> LuaResult<(bool, Option<String>)> {
 			let option = match SocketOption::from_lua_args(lua, name, LuaValue::Nil) {
 				Ok(v) => v,
@@ -304,6 +314,7 @@ impl ConnectionHandle {
 			read_size: 8192,
 			tx_mode: DirectionMode::Open,
 			rx_mode: DirectionMode::Open,
+			tx_buf: None,
 			handle,
 			buf: None,
 		}.spawn();
@@ -551,11 +562,8 @@ impl AsyncWrite for ConnectionState {
 }
 
 enum MsgResult {
-	WriteClosed,
 	Continue,
 	Exit,
-	Reset,
-	ReadBlocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,6 +611,7 @@ struct ConnectionWorker {
 	buf: Option<Limit<BytesMut>>,
 	rx_mode: DirectionMode,
 	tx_mode: DirectionMode,
+	tx_buf: Option<BytesMut>,
 	handle: LuaRegistryHandle,
 }
 
@@ -653,16 +662,9 @@ impl ConnectionWorker {
 	}
 
 	#[inline]
-	async fn proc_write_buffer(&mut self, buf: Bytes) -> Result<(), ()> {
+	async fn proc_write_buffer(&mut self, buf: Bytes) -> io::Result<()> {
 		// TODO: asynchronize this in some way?
-		match self.conn.write_all(&buf).await {
-			Ok(_) => Ok(()),
-			Err(e) => {
-				// TODO: report this to lua, I guess
-				error!("write error: {}", e);
-				Err(())
-			},
-		}
+		self.conn.write_all(&buf).await
 	}
 
 	fn set_keepalive(&self, enabled: bool) -> Result<(), io::Error> {
@@ -675,62 +677,70 @@ impl ConnectionWorker {
 	}
 
 	#[inline]
-	async fn proc_msg(&mut self, msg: ControlMessage) -> MsgResult {
+	async fn proc_msg(&mut self, msg: ControlMessage) -> io::Result<MsgResult> {
 		match msg {
-			ControlMessage::Close => MsgResult::WriteClosed,
+			ControlMessage::Close => {
+				// TODO: send a disconnect event
+				self.conn.shutdown().await?;
+				let _ = self.global_tx.send(Message::Disconnect{handle: self.handle.clone(), error: None}).await;
+				Ok(MsgResult::Exit)
+			},
 			ControlMessage::SetOption(option) => {
 				match option {
-					SocketOption::KeepAlive(enabled) => {
-						match self.set_keepalive(enabled) {
-							Ok(_) => (),
-							Err(e) => warn!("failed to set keepalive ({}) on socket: {}", enabled, e),
-						}
-					}
+					SocketOption::KeepAlive(enabled) => self.set_keepalive(enabled)?,
 				};
-				MsgResult::Continue
+				Ok(MsgResult::Continue)
 			},
 			ControlMessage::AcceptTls(ctx) => {
-				match self.conn.starttls_accept(ctx).await {
+				self.conn.starttls_accept(ctx).await?;
+				match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify: verify::VerificationRecord::Unverified}).await {
 					Ok(_) => {
-						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify: verify::VerificationRecord::Unverified}).await {
-							Ok(_) => MsgResult::Reset,
-							Err(_) => MsgResult::Exit,
-						}
+						self.rx_mode = self.rx_mode.unblock();
+						self.tx_mode = self.tx_mode.unblock();
+						Ok(MsgResult::Continue)
 					},
-					Err(e) => {
-						debug!("TLS handshake error: {}", e);
-						// gotta leave here.
-						let _ = self.global_tx.send(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
-						MsgResult::Exit
-					},
+					Err(_) => Ok(MsgResult::Exit),
 				}
 			},
 			ControlMessage::ConnectTls(name, ctx, recorder) => {
-				match self.conn.starttls_connect(name.as_ref(), ctx, &*recorder).await {
-					Ok(verify) => {
-						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
-							Ok(_) => MsgResult::Reset,
-							Err(_) => MsgResult::Exit,
-						}
+				let verify = self.conn.starttls_connect(name.as_ref(), ctx, &*recorder).await?;
+				match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
+					Ok(_) => {
+						self.rx_mode = self.rx_mode.unblock();
+						self.tx_mode = self.tx_mode.unblock();
+						Ok(MsgResult::Continue)
 					},
-					Err(e) => {
-						debug!("TLS handshake error: {}", e);
-						// gotta leave here.
-						let _ = self.global_tx.send(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
-						MsgResult::Exit
-					},
+					Err(_) => Ok(MsgResult::Exit),
 				}
 			},
 			ControlMessage::Write(buf) => if self.tx_mode.may() {
-				match self.proc_write_buffer(buf).await {
-					Ok(()) => MsgResult::Continue,
-					Err(()) => MsgResult::Exit,
-				}
+				self.proc_write_buffer(buf).await?;
+				Ok(MsgResult::Continue)
+			} else if self.tx_mode.may_ever() {
+				let tx_buf = self.tx_buf.get_or_insert_with(|| { BytesMut::new() });
+				tx_buf.extend_from_slice(&buf);
+				Ok(MsgResult::Continue)
 			} else {
 				// should this instead be a write error or something?!
-				MsgResult::Continue
+				Ok(MsgResult::Continue)
 			},
-			ControlMessage::BlockReads => return MsgResult::ReadBlocked,
+			ControlMessage::BlockReads => {
+				self.rx_mode = self.rx_mode.block();
+				Ok(MsgResult::Continue)
+			}
+			ControlMessage::BlockWrites => {
+				self.tx_mode = self.tx_mode.block();
+				Ok(MsgResult::Continue)
+			},
+			ControlMessage::UnblockWrites => {
+				self.tx_mode = self.tx_mode.unblock();
+				if self.tx_mode.may() {
+					if let Some(buf) = self.tx_buf.take() {
+						self.proc_write_buffer(buf.freeze()).await?;
+					}
+				}
+				Ok(MsgResult::Continue)
+			},
 		}
 	}
 
@@ -755,24 +765,17 @@ impl ConnectionWorker {
 						Err(()) => return,
 					},
 					Err(e) => {
-						warn!("read error: {}", e);
-						// TODO: report this to lua, I guess
+						let _ = self.global_tx.send(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
 						return
 					},
 				},
 				msg = self.rx.recv() => match msg {
 					Some(msg) => match self.proc_msg(msg).await {
-						MsgResult::Exit => return,
-						MsgResult::Continue => (),
-						MsgResult::WriteClosed => {
-							self.tx_mode = DirectionMode::Closed;
-						},
-						MsgResult::Reset => {
-							self.tx_mode = self.tx_mode.unblock();
-							self.rx_mode = self.tx_mode.unblock();
-						},
-						MsgResult::ReadBlocked => {
-							self.rx_mode = self.rx_mode.block();
+						Ok(MsgResult::Exit) => return,
+						Ok(MsgResult::Continue) => (),
+						Err(e) => {
+							let _ = self.global_tx.send(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
+							return
 						},
 					},
 					None => return,
@@ -840,6 +843,7 @@ impl ConnectWorker {
 			buf: None,
 			tx_mode: DirectionMode::Open,
 			rx_mode: DirectionMode::Open,
+			tx_buf: None,
 			handle: self.handle,
 		}.run().await;
 	}
