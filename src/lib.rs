@@ -13,6 +13,7 @@ mod tls;
 mod signal;
 mod fd;
 mod verify;
+mod cert;
 
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {

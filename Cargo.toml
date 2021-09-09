@@ -24,3 +24,4 @@ nix = { version = "^0.22" }
 # bounded by rustls
 webpki = { version = "^0.21.0" }
 socket2 = { version = "^0.4" }
+x509-parser = { version = "^0.11" }

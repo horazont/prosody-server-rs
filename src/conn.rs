@@ -5,6 +5,7 @@ Sockets for stream connections are generally TCP sockets.
 */
 use mlua::prelude::*;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -31,6 +32,7 @@ use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
 use crate::tls;
 use crate::conversion;
 use crate::verify;
+use crate::cert;
 
 /**
 Describe which TLS actions are currently possible on a socket.
@@ -183,9 +185,18 @@ impl LuaUserData for ConnectionHandle {
 			Ok(())
 		});
 
-		methods.add_method("ssl_peercertificate", |_, _this: &Self, _: ()| -> LuaResult<()> {
-			// TODO: return something useful here
-			Ok(())
+		methods.add_method("ssl_peercertificate", |_, this, _: ()| -> LuaResult<Option<cert::ParsedCertificate>> {
+			match &this.tls_state {
+				CachedTlsState::Established{verify, ..} => match verify {
+					verify::VerificationRecord::Unverified | verify::VerificationRecord::Failed{..} => {
+						Ok(None)
+					},
+					verify::VerificationRecord::Passed{cert: certificate} => {
+						Ok(cert::ParsedCertificate::from_der(Cow::Borrowed(&certificate.0)).ok())
+					},
+				},
+				_ => Ok(None)
+			}
 		});
 
 		methods.add_method("ssl_peerverification", |lua, this: &Self, _: ()| -> LuaResult<(bool, LuaTable)> {
