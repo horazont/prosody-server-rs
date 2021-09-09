@@ -30,6 +30,7 @@ use crate::{with_runtime_lua, strerror_ok};
 use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
 use crate::tls;
 use crate::conversion;
+use crate::verify;
 
 /**
 Describe which TLS actions are currently possible on a socket.
@@ -44,24 +45,26 @@ enum CachedTlsState {
 	#[allow(dead_code)]
 	MayAccept(Arc<rustls::ServerConfig>),
 	#[allow(dead_code)]
-	MayConnect(webpki::DNSName, Arc<rustls::ClientConfig>),
+	MayConnect(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>),
 	/* AcceptInProgress(Arc<rustls::ServerConfig>),
 	ConnectInProgress(webpki::DNSName, Arc<rustls::ClientConfig>), */
 	InProgress,
-	Established,
+	Established{
+		verify: verify::VerificationRecord,
+	},
 }
 
 impl CachedTlsState {
 	fn transition(&mut self, given_config: Option<&tls::TlsConfig>, given_servername: Option<webpki::DNSNameRef>) -> Result<ControlMessage, String> {
 		match self {
 			Self::InProgress => Err("TLS operation already in progress".into()),
-			Self::Established => Err("TLS already established".into()),
+			Self::Established{..} => Err("TLS already established".into()),
 			Self::NoConfig => match given_config {
 				// We can only *accept* connections based on the given config, as we lack a target hostname
-				Some(tls::TlsConfig::Client{cfg}) => match given_servername {
+				Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
 					Some(v) => {
 						*self = Self::InProgress;
-						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone()))
+						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()))
 					},
 					None => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
 				},
@@ -73,10 +76,10 @@ impl CachedTlsState {
 			},
 			Self::MayAccept(cfg) => match given_config {
 				// We can only *accept* connections based on the given config, as we lack a target hostname
-				Some(tls::TlsConfig::Client{cfg}) => match given_servername {
+				Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
 					Some(v) => {
 						*self = Self::InProgress;
-						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone()))
+						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()))
 					},
 					None => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
 				},
@@ -91,15 +94,15 @@ impl CachedTlsState {
 					Ok(msg)
 				},
 			},
-			Self::MayConnect(name, cfg) => {
+			Self::MayConnect(name, cfg, recorder) => {
 				let name = match given_servername {
 					Some(name) => name.to_owned(),
 					None => name.clone(),
 				};
 				match given_config {
 					// We can only *accept* connections based on the given config, as we lack a target hostname
-					Some(tls::TlsConfig::Client{cfg}) => {
-						let msg = ControlMessage::ConnectTls(name, cfg.clone());
+					Some(tls::TlsConfig::Client{cfg, recorder}) => {
+						let msg = ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone());
 						*self = Self::InProgress;
 						Ok(msg)
 					},
@@ -109,7 +112,7 @@ impl CachedTlsState {
 						Ok(msg)
 					},
 					None => {
-						let msg = ControlMessage::ConnectTls(name, cfg.clone());
+						let msg = ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone());
 						*self = Self::InProgress;
 						Ok(msg)
 					},
@@ -138,7 +141,7 @@ enum ControlMessage {
 	Write(Bytes),
 	SetOption(SocketOption),
 	AcceptTls(Arc<rustls::ServerConfig>),
-	ConnectTls(webpki::DNSName, Arc<rustls::ClientConfig>),
+	ConnectTls(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>),
 }
 
 pub(crate) struct ConnectionHandle {
@@ -170,7 +173,7 @@ impl LuaUserData for ConnectionHandle {
 
 		methods.add_method("ssl", |_, this: &Self, _: ()| -> LuaResult<bool> {
 			Ok(match this.tls_state {
-				CachedTlsState::Established => true,
+				CachedTlsState::Established{..} => true,
 				_ => false,
 			})
 		});
@@ -185,9 +188,24 @@ impl LuaUserData for ConnectionHandle {
 			Ok(())
 		});
 
-		methods.add_method("ssl_peerverification", |lua, _this: &Self, _: ()| -> LuaResult<(bool, LuaTable)> {
-			// TODO: return something useful here
-			Ok((false, lua.create_table()?))
+		methods.add_method("ssl_peerverification", |lua, this: &Self, _: ()| -> LuaResult<(bool, LuaTable)> {
+			let reasons = lua.create_table()?;
+			match &this.tls_state {
+				CachedTlsState::Established{verify, ..} => match verify {
+					verify::VerificationRecord::Unverified => {
+						reasons.raw_set(1, "verification disabled or did not complete")?;
+						Ok((false, reasons))
+					},
+					verify::VerificationRecord::Passed{..} => {
+						Ok((true, reasons))
+					},
+					verify::VerificationRecord::Failed{err} => {
+						reasons.raw_set(1, format!("{}", err))?;
+						Ok((true, reasons))
+					},
+				},
+				_ => Ok((false, reasons))
+			}
 		});
 
 		methods.add_method("block_reads", |_, this: &Self, _: ()| -> LuaResult<()> {
@@ -315,16 +333,16 @@ impl ConnectionHandle {
 		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, addr, CachedTlsState::NoConfig)
 	}
 
-	pub(crate) fn wrap_tls_server<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
+	pub(crate) fn wrap_tls_server<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>, verify: verify::VerificationRecord) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = match addr {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, addr, CachedTlsState::Established)
+		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, addr, CachedTlsState::Established{verify})
 	}
 
-	pub(crate) fn confirm_starttls(&mut self) {
-		self.tls_state = CachedTlsState::Established;
+	pub(crate) fn confirm_starttls(&mut self, verify: verify::VerificationRecord) {
+		self.tls_state = CachedTlsState::Established{verify};
 	}
 }
 
@@ -395,13 +413,16 @@ impl ConnectionState {
 		}
 	}
 
-	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector) -> io::Result<()> {
-		match connector.connect(name, sock).await {
+	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier) -> io::Result<verify::VerificationRecord> {
+		let (verify, sock) = recorder.scope(async move {
+			connector.connect(name, sock).await
+		}).await;
+		match sock {
 			Ok(sock) => {
 				*self = Self::TlsClient{
 					sock,
 				};
-				Ok(())
+				Ok(verify)
 			},
 			Err(e) => {
 				// kaboom, break the thing
@@ -413,7 +434,7 @@ impl ConnectionState {
 		}
 	}
 
-	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>) -> io::Result<()> {
+	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>, recorder: &verify::RecordingVerifier) -> io::Result<verify::VerificationRecord> {
 		let mut tmp = ConnectionState::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -423,7 +444,9 @@ impl ConnectionState {
 				result
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::Plain{sock} => self.starttls_client(sock, name, ctx.into()).await,
+			Self::Plain{sock} => {
+				self.starttls_client(sock, name, ctx.into(), recorder).await
+			},
 		}
 	}
 
@@ -658,7 +681,7 @@ impl ConnectionWorker {
 			ControlMessage::AcceptTls(ctx) => {
 				match self.conn.starttls_accept(ctx).await {
 					Ok(_) => {
-						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone()}).await {
+						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify: verify::VerificationRecord::Unverified}).await {
 							Ok(_) => MsgResult::Reset,
 							Err(_) => MsgResult::Exit,
 						}
@@ -671,10 +694,10 @@ impl ConnectionWorker {
 					},
 				}
 			},
-			ControlMessage::ConnectTls(name, ctx) => {
-				match self.conn.starttls_connect(name.as_ref(), ctx).await {
-					Ok(_) => {
-						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone()}).await {
+			ControlMessage::ConnectTls(name, ctx, recorder) => {
+				match self.conn.starttls_connect(name.as_ref(), ctx, &*recorder).await {
+					Ok(verify) => {
+						match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
 							Ok(_) => MsgResult::Reset,
 							Err(_) => MsgResult::Exit,
 						}
@@ -829,7 +852,7 @@ pub(crate) fn addclient<'l>(
 	let tls_ctx = match tls_ctx {
 		None => None,
 		Some(tls_ctx) => match &*tls_ctx.0 {
-			tls::TlsConfig::Client{cfg} => Some(cfg.clone()),
+			tls::TlsConfig::Client{cfg, ..} => Some(cfg.clone()),
 			_ => return Ok(Err(format!("non-client TLS config passed to client socket"))),
 		}
 	};

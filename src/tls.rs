@@ -15,6 +15,7 @@ use rustls_pemfile;
 
 use crate::strerror_ok;
 use crate::conversion;
+use crate::verify;
 
 
 pub(crate) struct DefaultingSNIResolver {
@@ -75,7 +76,8 @@ pub(crate) enum TlsConfig {
 		resolver: Arc<DefaultingSNIResolver>,
 	},
 	Client{
-		cfg: Arc<rustls::ClientConfig>
+		cfg: Arc<rustls::ClientConfig>,
+		recorder: Arc<verify::RecordingVerifier>,
 	},
 }
 
@@ -228,22 +230,12 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	})))?))
 }
 
-struct NullVerifier();
-
-impl rustls::ServerCertVerifier for NullVerifier {
-	fn verify_server_cert(
-			&self,
-			_roots: &rustls::RootCertStore,
-			_presented_certs: &[rustls::Certificate],
-			_dns_name: webpki::DNSNameRef<'_>,
-			_ocsp_response: &[u8]) -> Result<rustls::ServerCertVerified, rustls::TLSError>
-	{
-		Ok(rustls::ServerCertVerified::assertion())
-	}
-}
-
 fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let mut cfg = rustls::ClientConfig::new();
+	let mut recorder = verify::RecordingVerifier::new(
+		Arc::new(rustls::WebPKIVerifier::new()),
+		true,
+	);
 	for kv in config.pairs::<LuaString, LuaValue>() {
 		let (k, v) = match kv {
 			Ok(kv) => kv,
@@ -285,24 +277,29 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 				};
 				for v in vs {
 					match v.as_str() {
-						"none" => cfg.dangerous().set_certificate_verifier(
-							Arc::new(NullVerifier())
-						),
-						"peer" => cfg.dangerous().set_certificate_verifier(
-							Arc::new(rustls::WebPKIVerifier::new())
-						),
+						"none" => {
+							recorder.strict = false;
+						},
+						"peer" => {
+							recorder.strict = true;
+						},
+						"client_once" => continue,
 						// no idea what this one is supposed to do?!
-						"client_once" => (),
 						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v)))
-					}
+					};
 				}
 			},
 			// ignore unknown keys(?)
 			&_ => continue,
 		}
 	}
+
+	let recorder = Arc::new(recorder);
+	cfg.dangerous().set_certificate_verifier(recorder.clone());
+
 	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Client{
 		cfg: Arc::new(cfg),
+		recorder,
 	})))?))
 }
 

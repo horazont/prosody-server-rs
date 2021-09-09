@@ -16,6 +16,7 @@ use super::core::{
 };
 
 use super::conn;
+use crate::verify;
 
 
 lazy_static! {
@@ -59,7 +60,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::TlsAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
-			let handle = conn::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr))?;
+			let handle = conn::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified)?;
 			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
 				Some(func) => {
 					func.call::<_, ()>((handle, LuaValue::Nil))?;
@@ -67,11 +68,11 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				None => (),
 			};
 		},
-		Message::TlsStarted{handle} => {
+		Message::TlsStarted{handle, verify} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			{
 				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
-				handle.confirm_starttls();
+				handle.confirm_starttls(verify);
 			}
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			// TODO: this is actually called at the start of TLS negotiation...

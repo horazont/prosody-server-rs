@@ -20,6 +20,8 @@ use tokio::sync::oneshot;
 
 use tokio_rustls::server::{TlsStream as ServerTlsStream};
 
+use crate::verify;
+
 /**
 # Message / Method Call into Lua
 
@@ -65,6 +67,8 @@ pub(crate) enum Message {
 	TlsStarted{
 		/// The registry key of the connection handle
 		handle: LuaRegistryHandle,
+		/// Verification status
+		verify: verify::VerificationRecord,
 	},
 
 	Incoming{
