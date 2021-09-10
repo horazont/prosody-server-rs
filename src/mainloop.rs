@@ -38,7 +38,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		},
 		Message::Connect{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = handle.get_user_value::<LuaTable>()?;
+			let listeners = conn::get_listeners(&handle)?;
 			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
 				Some(func) => {
 					func.call::<_, ()>(handle)?;
@@ -74,7 +74,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
 				handle.confirm_starttls(verify);
 			}
-			let listeners = handle.get_user_value::<LuaTable>()?;
+			let listeners = conn::get_listeners(&handle)?;
 			// TODO: this is actually called at the start of TLS negotiation...
 			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
 				Some(func) => {
@@ -91,7 +91,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		},
 		Message::Incoming{handle, data} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = handle.get_user_value::<LuaTable>()?;
+			let listeners = conn::get_listeners(&handle)?;
 			match listeners.get::<&'static str, Option<LuaFunction>>("onincoming")? {
 				Some(func) => {
 					func.call::<_, ()>((handle, lua.create_string(&data)?))?;
@@ -101,7 +101,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		},
 		Message::ReadClosed{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = handle.get_user_value::<LuaTable>()?;
+			let listeners = conn::get_listeners(&handle)?;
 			match listeners.get::<&'static str, Option<LuaFunction>>("ondisconnect")? {
 				Some(func) => {
 					func.call::<_, ()>(handle)?;
@@ -111,7 +111,7 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		},
 		Message::Disconnect{handle, error} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = handle.get_user_value::<LuaTable>()?;
+			let listeners = conn::get_listeners(&handle)?;
 			let error = error.map(|x| { format!("{}", x)});
 			match listeners.get::<&'static str, Option<LuaFunction>>("ondisconnect")? {
 				Some(func) => {

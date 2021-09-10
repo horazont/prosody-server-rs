@@ -283,12 +283,22 @@ impl LuaUserData for ConnectionHandle {
 				Some(func) => func.call::<_, ()>(this.clone())?,
 				None => (),
 			};
-			this.set_user_value(listeners.clone())?;
+			set_listeners(&this, listeners.clone())?;
 			match listeners.get::<_, Option<LuaFunction>>("onattach")? {
 				Some(func) => func.call::<_, ()>((this.clone(), data))?,
 				None => (),
 			};
 			Ok(())
+		});
+
+		methods.add_meta_function(LuaMetaMethod::Index, |_, (this, key): (LuaAnyUserData, LuaString)| -> LuaResult<LuaValue> {
+			let data = this.get_user_value::<LuaTable>()?;
+			data.raw_get::<_, LuaValue>(key)
+		});
+
+		methods.add_meta_function(LuaMetaMethod::NewIndex, |_, (this, key, value): (LuaAnyUserData, LuaString, LuaValue)| -> LuaResult<()> {
+			let data = this.get_user_value::<LuaTable>()?;
+			data.raw_set(key, value)
 		});
 	}
 }
@@ -303,7 +313,9 @@ impl ConnectionHandle {
 			sockaddr: format!("{}", addr.ip()),
 			sockport: addr.port(),
 		})?;
-		v.set_user_value(listeners)?;
+		let data = lua.create_table_with_capacity(0, 1)?;
+		v.set_user_value(data)?;
+		set_listeners(&v, listeners)?;
 		let handle = lua.create_registry_value(v.clone())?.into();
 
 		let global_tx = MAIN_CHANNEL.clone_tx();
@@ -332,7 +344,9 @@ impl ConnectionHandle {
 			sockaddr: format!("{}", addr.ip()),
 			sockport: addr.port(),
 		})?;
-		v.set_user_value(listeners)?;
+		let data = lua.create_table_with_capacity(0, 1)?;
+		v.set_user_value(data)?;
+		set_listeners(&v, listeners)?;
 		let handle = lua.create_registry_value(v.clone())?.into();
 
 		let global_tx = MAIN_CHANNEL.clone_tx();
@@ -790,6 +804,16 @@ impl Spawn for ConnectionWorker {
 	fn spawn(self) {
 		tokio::spawn(async move { self.run().await });
 	}
+}
+
+pub(crate) fn set_listeners<'l>(ud: &LuaAnyUserData<'l>, listeners: LuaTable<'l>) -> LuaResult<()> {
+	let tbl = ud.get_user_value::<LuaTable>()?;
+	tbl.set(0, listeners)
+}
+
+pub(crate) fn get_listeners<'l>(ud: &LuaAnyUserData<'l>) -> LuaResult<LuaTable<'l>> {
+	let tbl = ud.get_user_value::<LuaTable>()?;
+	tbl.get::<_, LuaTable>(0)
 }
 
 struct ConnectWorker {
