@@ -249,6 +249,7 @@ fn mk_listen_socket(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 		let _ = sock.set_only_v6(true);
 	}
 	sock.set_nonblocking(true)?;
+	sock.set_reuse_address(true)?;
 	sock.bind(&addr.into())?;
 	sock.listen(0)?;
 	Ok(sock.into())
