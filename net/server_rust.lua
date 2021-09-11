@@ -11,6 +11,23 @@ local function add_task(timeout, cb, params)
 	end)
 end
 
+local function convert_read_size(read_size)
+	if read_size == "*a" then
+		-- TODO: make configurable
+		return 8192
+	elseif type(read_size) == "string" then
+		error("read_size "..read_size.." not supported by this backend, sorry")
+	end
+	return read_size
+end
+
+local function sock_to_fd(sock)
+	if type(sock) == "number" then
+		return sock
+	end
+	return sock:getfd()
+end
+
 return {
 	-- TIMER FUNCTIONS
 	add_task = add_task;
@@ -28,15 +45,12 @@ return {
 	listen = server_impl.listen;
 
 	-- CLIENT FUNCTIONS
-	addclient = function(addr, port, listeners, socket_read_size, tls_ctx, typ, extra)
-		local read_size = socket_read_size;
-		if read_size == "*a" then
-			-- TODO: make configurable
-			read_size = 8192
-		elseif type(read_size) == "string" then
-			error("read_size "..read_size.." not supported by this backend, sorry")
-		end
-		return server_impl.addclient(addr, port, listeners, read_size, tls_ctx, typ, extra);
+	addclient = function(addr, port, listeners, read_size, tls_ctx, typ, extra)
+		return server_impl.addclient(addr, port, listeners, convert_read_size(read_size), tls_ctx, typ, extra);
+	end;
+	wrapclient = function(sock, addr, port, listeners, read_size, tls_ctx, extra)
+		local fd = sock_to_fd(sock);
+		return server_impl.wrapclient(fd, addr, port, listeners, convert_read_size(read_size), tls_ctx, extra);
 	end;
 
 	-- TLS FUNCTIONS

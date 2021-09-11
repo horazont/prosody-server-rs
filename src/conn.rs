@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd, FromRawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -24,6 +24,11 @@ use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector, server, client};
 
 use pin_project_lite::pin_project;
+
+use nix::{
+	fcntl::FcntlArg,
+	fcntl::fcntl,
+};
 
 use crate::{with_runtime_lua, strerror_ok};
 use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
@@ -304,14 +309,14 @@ impl LuaUserData for ConnectionHandle {
 }
 
 impl ConnectionHandle {
-	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: SocketAddr, tls_state: CachedTlsState) -> LuaResult<LuaAnyUserData<'l>> {
+	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: (String, u16), tls_state: CachedTlsState) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
 			tx,
 			tls_state,
-			sockaddr: format!("{}", addr.ip()),
-			sockport: addr.port(),
+			sockaddr: addr.0,
+			sockport: addr.1,
 		})?;
 		let data = lua.create_table_with_capacity(0, 1)?;
 		v.set_user_value(data)?;
@@ -366,7 +371,7 @@ impl ConnectionHandle {
 			Some(addr) => addr,
 			None => conn.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, addr, CachedTlsState::NoConfig)
+		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), CachedTlsState::NoConfig)
 	}
 
 	pub(crate) fn wrap_tls_server<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>, verify: verify::VerificationRecord) -> LuaResult<LuaAnyUserData<'l>> {
@@ -374,7 +379,7 @@ impl ConnectionHandle {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, addr, CachedTlsState::Established{verify})
+		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), CachedTlsState::Established{verify})
 	}
 
 	pub(crate) fn confirm_starttls(&mut self, verify: verify::VerificationRecord) {
@@ -878,6 +883,58 @@ impl Spawn for ConnectWorker {
 		tokio::spawn(async move { self.run().await });
 	}
 }
+
+pub(crate) fn wrapclient<'l>(
+		lua: &'l Lua,
+		(fd, addr, port, listeners, _read_size, tls_ctx, extra): (RawFd, String, u16, LuaTable, usize, Option<tls::TlsConfigHandle>, Option<LuaTable>)
+		) -> LuaResult<Result<LuaAnyUserData<'l>, String>>
+{
+	let fd = strerror_ok!(fcntl(
+		fd,
+		FcntlArg::F_DUPFD_CLOEXEC(0),
+	));
+	// this is probably the worst one could do... let's hope the syscalls will quickly let this fail
+	let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
+	strerror_ok!(sock.set_nonblocking(true));
+	let sock: std::net::TcpStream = sock.into();
+
+	// extra is required, we MUST have the server name...
+	let servername = match extra.as_ref() {
+		Some(extra) => match extra.get::<_, Option<LuaString>>("servername") {
+			Ok(Some(v)) => match webpki::DNSNameRef::try_from_ascii(v.as_bytes()) {
+				Ok(v) => Some(v.to_owned()),
+				Err(e) => return Ok(Err(format!("servername is not a DNSName: {}", e))),
+			},
+			Ok(None) => None,
+			Err(e) => return Ok(Err(format!("invalid option servername (required for TLS, and TLS context is given): {}", e))),
+		},
+		None => None,
+	};
+
+	let tls_ctx_arc = tls_ctx.map(|x| { x.0 });
+	let tls_ctx_ref = tls_ctx_arc.as_ref().map(|x| { &**x });
+
+	let tls_state = match (tls_ctx_ref, servername) {
+		(Some(tls::TlsConfig::Client{cfg, recorder}), Some(name)) => {
+			CachedTlsState::MayConnect(name, cfg.clone(), recorder.clone())
+		},
+		(Some(tls::TlsConfig::Client{..}), None) => {
+			return Ok(Err(format!("client-side TLS context given, but no target server name")))
+		},
+		(Some(tls::TlsConfig::Server{cfg, ..}), _) => {
+			CachedTlsState::MayAccept(cfg.clone())
+		},
+		(None, _) => {
+			CachedTlsState::NoConfig
+		},
+	};
+
+	with_runtime_lua!{
+		let sock = TcpStream::from_std(sock)?;
+		Ok(Ok(ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners, (addr, port), tls_state)?))
+	}
+}
+
 
 pub(crate) fn addclient<'l>(
 		lua: &'l Lua,
