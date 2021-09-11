@@ -82,9 +82,9 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 				},
 				None => (),
 			};
-			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
+			match listeners.get::<&'static str, Option<LuaFunction>>("onstatus")? {
 				Some(func) => {
-					func.call::<_, ()>(handle)?;
+					func.call::<_, ()>((handle, "ssl-handshake-complete"))?;
 				},
 				None => (),
 			};
