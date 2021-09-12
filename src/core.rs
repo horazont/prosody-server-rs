@@ -1,5 +1,6 @@
 use mlua::prelude::*;
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
@@ -106,6 +107,14 @@ pub(crate) enum Message {
 	Signal{
 		/// The registry key of the function to invoke
 		handle: LuaRegistryHandle,
+	},
+
+	/// Error which is unrelated to a specific connection, e.g. during an accept()
+	#[cfg(feature = "prosody-log")]
+	Log{
+		level: &'static str,
+		message: Cow<'static, str>,
+		error: Option<Box<dyn Error + Send + 'static>>,
 	},
 }
 
@@ -308,4 +317,25 @@ macro_rules! with_runtime_lua {
 			$($b)*
 		}
 	}
+}
+
+#[macro_export]
+macro_rules! send_log {
+	($level:expr, $msg:literal, $error:expr) => {
+		{
+			#[cfg(feature = "prosody-log")]
+			{
+				crate::core::MAIN_CHANNEL.fire_and_forget(crate::core::Message::Log{
+					level: $level,
+					message: std::borrow::Cow::Borrowed($msg),
+					error: $error.map(|x| { Box::new(x) as Box::<dyn std::error::Error + Send + 'static> }),
+				}).await;
+			}
+			#[cfg(not(feature = "prosody-log"))]
+			{
+				// silenced used value
+				let _ = ($level, $msg, $error);
+			}
+		}
+	};
 }

@@ -7,7 +7,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::oneshot;
 
-use crate::with_runtime_lua;
+use crate::{with_runtime_lua, send_log};
 use crate::core::{Message, LuaRegistryHandle, MAIN_CHANNEL, Spawn};
 
 
@@ -92,8 +92,8 @@ impl WatchWorker {
 						let _ = confirm_rx.await;
 						guard.clear_ready();
 					},
-					Err(_) => {
-						// TODO: report this to lua somehow
+					Err(e) => {
+						send_log!("warn", "watchfd broke while waiting for read", Some(e));
 						return
 					},
 				},
@@ -111,8 +111,8 @@ impl WatchWorker {
 						let _ = confirm_rx.await;
 						guard.clear_ready();
 					},
-					Err(_) => {
-						// TODO: report this to lua somehow
+					Err(e) => {
+						send_log!("warn", "watchfd broke while waiting for write", Some(e));
 						return
 					},
 				},

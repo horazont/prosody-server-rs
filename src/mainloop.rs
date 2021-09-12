@@ -95,7 +95,7 @@ fn call_disconnect<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>, 
 	may_call_listener(listeners, "ondisconnect", (handle, err))
 }
 
-fn proc_message<'l>(lua: &'l Lua, _log_fn: Option<&'l LuaFunction>, msg: Message) -> LuaResult<()> {
+fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message) -> LuaResult<()> {
 	match msg {
 		Message::TimerElapsed{handle, timestamp, reply} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
@@ -191,6 +191,13 @@ fn proc_message<'l>(lua: &'l Lua, _log_fn: Option<&'l LuaFunction>, msg: Message
 			may_call_listener(&listeners, "onwritable", handle)?;
 			// we can just let confirm drop, that's good enough
 			drop(confirm);
+		},
+		#[cfg(feature = "prosody-log")]
+		Message::Log{level, message, error} => {
+			match error {
+				Some(error) => prosody_log!(log_fn, level, "%s (caused by %s)", message, error.to_string()),
+				None => prosody_log!(log_fn, level, "%s", message),
+			}
 		},
 	};
 	Ok(())

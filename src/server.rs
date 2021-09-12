@@ -11,15 +11,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{warn, error};
-
 use tokio::select;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use tokio_rustls::TlsAcceptor;
 
-use crate::{with_runtime_lua, strerror_ok};
+use crate::{with_runtime_lua, strerror_ok, send_log};
 use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
 use crate::conversion;
 use crate::tls;
@@ -155,7 +153,7 @@ impl ListenerWorker {
 						let msg = match self.tls_mode.accept(&self.handle, conn, addr, self.stream_cfg.ssl_handshake_timeout).await {
 							Ok(msg) => msg,
 							Err(e) => {
-								warn!("failed to fully accept connection: {}", e);
+								send_log!("debug", "failed to handshake with peer", Some(e));
 								continue;
 							},
 						};
@@ -163,8 +161,7 @@ impl ListenerWorker {
 						MAIN_CHANNEL.fire_and_forget(msg).await;
 					},
 					Err(e) => {
-						// TODO: proper logging!
-						error!("failed to accept socket: {}. backing off", e);
+						send_log!("error", "failed to accept socket from listener! backing off!", Some(e));
 						tokio::time::sleep(self.cfg.accept_retry_interval).await;
 					},
 				},
