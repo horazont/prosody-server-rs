@@ -12,4 +12,9 @@ if impl.hook_signal then
 		end));
 	end
 end
+if backend_name == "rust" then
+  require "librserver".server.set_log_function(function(level, message, ...)
+    print("LOG", level, message, ...)
+  end)
+end
 return impl;

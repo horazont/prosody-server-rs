@@ -1,6 +1,6 @@
 use mlua::prelude::*;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, Instant};
 
@@ -23,8 +23,42 @@ use crate::verify;
 
 lazy_static! {
 	static ref SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+	// we do not use a handle here
+	static ref LOG_FUNCTION: RwLock<Option<LuaRegistryKey>> = RwLock::new(None);
 }
 
+macro_rules! prosody_log {
+	($log_fn:expr, $level:expr, $($argv:expr),+) => {
+		{
+			let args = ($level, $($argv),+);
+			#[cfg(feature = "prosody-log")]
+			{
+				match $log_fn {
+					Some(ref log) => {
+						log.call::<_, ()>(args)?
+					},
+					None => (),
+				}
+			}
+			#[cfg(not(feature = "prosody-log"))]
+			{
+				// to avoid "unused value" warnings
+				let _ = args;
+				let _ = $log_fn;
+			}
+		}
+	}
+}
+
+#[allow(unused_macros)]
+macro_rules! if_log {
+	($log_fn:expr => $block:block) => {
+		#[cfg(feature = "prosody-log")]
+		{
+			if $log_fn.is_some() $block
+		}
+	}
+}
 
 #[must_use]
 #[inline]
@@ -61,7 +95,7 @@ fn call_disconnect<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>, 
 	may_call_listener(listeners, "ondisconnect", (handle, err))
 }
 
-fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
+fn proc_message<'l>(lua: &'l Lua, _log_fn: Option<&'l LuaFunction>, msg: Message) -> LuaResult<()> {
 	match msg {
 		Message::TimerElapsed{handle, timestamp, reply} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
@@ -167,6 +201,26 @@ pub(crate) fn shutdown<'l>(_lua: &'l Lua, _: ()) -> LuaResult<()> {
 	Ok(())
 }
 
+pub(crate) fn set_log_function<'l>(lua: &'l Lua, f: Option<LuaFunction>) -> LuaResult<()> {
+	#[cfg(feature = "prosody-log")]
+	{
+		let mut log_function = LOG_FUNCTION.write().unwrap();
+		match log_function.take() {
+			None => (),
+			Some(_) => GC_FLAG.store(true, Ordering::Relaxed),
+		}
+		*log_function = Some(lua.create_registry_value(f)?);
+	}
+	#[cfg(not(feature = "prosody-log"))]
+	{
+		let _ = lua;
+		if let Some(f) = f {
+			f.call::<_, ()>(("warn", "Logging requested, but disabled at compile time. No further log messages will be emitted from the network backend!"))?;
+		}
+	}
+	Ok(())
+}
+
 pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 	/* what is the overall strategy here?
 
@@ -209,14 +263,20 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 	let mut rx = MAIN_CHANNEL.lock_rx_lua()?;
 	let _guard = r.enter();
 	r.block_on(async move {
+		let log_fn = {
+			let log_fn = LOG_FUNCTION.read().unwrap();
+			match &*log_fn {
+				Some(v) => Some(lua.registry_value::<LuaFunction>(v)?),
+				None => None,
+			}
+		};
+		prosody_log!(log_fn, "debug", "entered rust event loop");
 		loop {
 			select! {
 				msg = rx.recv() => match msg {
-					Some(msg) => match proc_message(lua, msg) {
+					Some(msg) => match proc_message(lua, log_fn.as_ref(), msg) {
 						Ok(()) => (),
-						Err(e) => {
-							eprintln!("failed to process event loop message: {}", e)
-						},
+						Err(e) => prosody_log!(log_fn, "error", "failed to process event loop message: %s", e.to_string()),
 					},
 					// this is impossible because one tx of the main channel is held in some arc at global scope
 					None => unreachable!(),
