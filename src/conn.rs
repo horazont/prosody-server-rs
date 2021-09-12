@@ -433,7 +433,7 @@ impl ConnectionHandle {
 		Ok(v)
 	}
 
-	fn connect<'l>(lua: &'l Lua, addr: SocketAddr, listeners: LuaTable, read_size: usize, tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>)>) -> LuaResult<LuaAnyUserData<'l>> {
+	fn connect<'l>(lua: &'l Lua, addr: SocketAddr, listeners: LuaTable, read_size: usize, tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
@@ -916,7 +916,7 @@ struct ConnectWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	addr: SocketAddr,
 	read_size: usize,
-	tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>)>,
+	tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
 	handle: LuaRegistryHandle,
 }
 
@@ -933,9 +933,12 @@ impl ConnectWorker {
 			},
 		};
 		let conn = match self.tls_config {
-			Some((name, config)) => {
+			Some((name, config, recorder)) => {
 				let connector: TlsConnector = config.into();
-				let sock = match connector.connect(name.as_ref(), sock).await {
+				let (verify, result) = recorder.scope(async move {
+					connector.connect(name.as_ref(), sock).await
+				}).await;
+				let sock = match result {
 					Ok(sock) => sock,
 					Err(e) => {
 						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
@@ -945,14 +948,21 @@ impl ConnectWorker {
 						return;
 					},
 				};
+				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
+					Ok(_) => (),
+					// can only happen during shutdown, drop it.
+					Err(_) => return,
+				};
 				ConnectionState::TlsClient{sock}
 			},
-			None => ConnectionState::Plain{sock},
-		};
-		match MAIN_CHANNEL.send(Message::Connect{handle: self.handle.clone()}).await {
-			Ok(_) => (),
-			// can only happen during shutdown, drop it.
-			Err(_) => return,
+			None => {
+				match MAIN_CHANNEL.send(Message::Connect{handle: self.handle.clone()}).await {
+					Ok(_) => (),
+					// can only happen during shutdown, drop it.
+					Err(_) => return,
+				};
+				ConnectionState::Plain{sock}
+			}
 		};
 		return ConnectionWorker{
 			rx: self.rx,
@@ -1036,14 +1046,14 @@ pub(crate) fn addclient<'l>(
 	let tls_ctx = match tls_ctx {
 		None => None,
 		Some(tls_ctx) => match &*tls_ctx.0 {
-			tls::TlsConfig::Client{cfg, ..} => Some(cfg.clone()),
+			tls::TlsConfig::Client{cfg, recorder} => Some((cfg.clone(), recorder.clone())),
 			_ => return Ok(Err(format!("non-client TLS config passed to client socket"))),
 		}
 	};
 
 	// extra is required, we MUST have the server name...
 	let tls_config = match (tls_ctx, extra.as_ref()) {
-		(Some(tls_ctx), Some(extra)) => {
+		(Some((cfg, recorder)), Some(extra)) => {
 			let servername = match extra.get::<_, Option<LuaString>>("servername") {
 				Ok(Some(v)) => v,
 				Ok(None) => return Ok(Err(format!("missing option servername (required for TLS, and TLS context is given)"))),
@@ -1053,7 +1063,7 @@ pub(crate) fn addclient<'l>(
 				Ok(v) => v,
 				Err(e) => return Ok(Err(format!("servername is not a DNSName: {}", e))),
 			};
-			Some((servername.to_owned(), tls_ctx))
+			Some((servername.to_owned(), cfg, recorder))
 		},
 		(Some(_), None) => {
 			return Ok(Err(format!("cannot connect via TLS without a servername")))
