@@ -23,7 +23,7 @@ use crate::conversion;
 use crate::tls;
 use crate::config;
 use crate::config::CONFIG;
-use crate::ioutil::flattened_timeout;
+use crate::ioutil::iotimeout;
 
 /**
 Control if and how TLS is accepted on listener sockets.
@@ -90,7 +90,7 @@ impl TlsMode {
 				})
 			},
 			Self::DirectTls{tls_config} => {
-				let conn = flattened_timeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
+				let conn = iotimeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
 				Ok(Message::TlsAccept{
 					handle: handle.clone(),
 					stream: conn,
@@ -102,7 +102,7 @@ impl TlsMode {
 				match conn.peek(&mut buf).await? {
 					// first byte of the TLS handshake
 					1 if buf[0] == 0x16 => {
-						let conn = flattened_timeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
+						let conn = iotimeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
 						Ok(Message::TlsAccept{
 							handle: handle.clone(),
 							stream: conn,

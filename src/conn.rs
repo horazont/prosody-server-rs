@@ -45,7 +45,7 @@ use crate::verify;
 use crate::cert;
 use crate::config;
 use crate::config::CONFIG;
-use crate::ioutil::flattened_timeout;
+use crate::ioutil::iotimeout;
 
 
 #[derive(Clone)]
@@ -563,7 +563,7 @@ impl ConnectionState {
 	}
 
 	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, handshake_timeout: Duration) -> io::Result<()> {
-		match flattened_timeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await {
+		match iotimeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await {
 			Ok(sock) => {
 				*self = Self::TlsServer{
 					sock,
@@ -582,7 +582,7 @@ impl ConnectionState {
 
 	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
 		let (verify, sock) = recorder.scope(async move {
-			flattened_timeout(handshake_timeout, connector.connect(name, sock), "STARTTLS handshake timed out").await
+			iotimeout(handshake_timeout, connector.connect(name, sock), "STARTTLS handshake timed out").await
 		}).await;
 		match sock {
 			Ok(sock) => {
@@ -956,7 +956,7 @@ struct ConnectWorker {
 
 impl ConnectWorker {
 	async fn run(self) {
-		let sock = match flattened_timeout(self.connect_cfg.connect_timeout, TcpStream::connect(self.addr), "connection timed out").await {
+		let sock = match iotimeout(self.connect_cfg.connect_timeout, TcpStream::connect(self.addr), "connection timed out").await {
 			Ok(sock) => sock,
 			Err(e) => {
 				MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
@@ -971,7 +971,7 @@ impl ConnectWorker {
 				let connector: TlsConnector = config.into();
 				let handshake_timeout = self.stream_cfg.ssl_handshake_timeout;
 				let (verify, result) = recorder.scope(async move {
-					flattened_timeout(handshake_timeout, connector.connect(name.as_ref(), sock), "timeout during TLS handshake").await
+					iotimeout(handshake_timeout, connector.connect(name.as_ref(), sock), "timeout during TLS handshake").await
 				}).await;
 				let sock = match result {
 					Ok(sock) => sock,
