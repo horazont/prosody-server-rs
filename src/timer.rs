@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, Duration, Instant};
 
 use tokio::select;
-use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
@@ -78,9 +77,7 @@ impl TimerHandle {
 		let handle = lua.create_registry_value(v.clone())?.into();
 
 		// The timer worker will infrom the main (Lua) loop about expired timers via the global event channel. If the channel is full, the timer event will be delivered late, however.
-		let global_tx = MAIN_CHANNEL.clone_tx();
 		TimerWorker{
-			global_tx,
 			self_schedule: schedule_tx,
 			schedule: schedule_rx,
 			close: close_rx,
@@ -94,7 +91,6 @@ impl TimerHandle {
 Tokio-side implementation of of a timer.
 */
 struct TimerWorker {
-	global_tx: mpsc::Sender<Message>,
 	self_schedule: Arc<watch::Sender<Instant>>,
 	schedule: watch::Receiver<Instant>,
 	close: oneshot::Receiver<()>,
@@ -109,7 +105,7 @@ impl TimerWorker {
 	async fn elapsed(&mut self) -> Option<Instant> {
 		let (reply_tx, reply_rx) = oneshot::channel();
 		let timestamp = SystemTime::now();
-		match self.global_tx.send(Message::TimerElapsed{
+		match MAIN_CHANNEL.send(Message::TimerElapsed{
 			handle: self.handle.clone(),
 			timestamp,
 			reply: reply_tx

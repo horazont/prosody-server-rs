@@ -5,7 +5,6 @@ use std::os::unix::io::RawFd;
 use tokio::select;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::with_runtime_lua;
@@ -29,7 +28,6 @@ impl WatchHandle {
 		let handle: LuaRegistryHandle = lua.create_registry_value(v.clone())?.into();
 
 		WatchWorker{
-			global_tx: MAIN_CHANNEL.clone_tx(),
 			guard: guard_rx,
 			fd: AsyncFd::new(fd)?,
 			interest,
@@ -68,7 +66,6 @@ impl LuaUserData for WatchHandle {
 }
 
 struct WatchWorker {
-	global_tx: mpsc::Sender<Message>,
 	guard: oneshot::Receiver<()>,
 	fd: AsyncFd<RawFd>,
 	interest: Interest,
@@ -79,12 +76,12 @@ impl WatchWorker {
 	async fn run(mut self) {
 		loop {
 			select! {
-				_ = self.global_tx.closed() => return,
+				_ = MAIN_CHANNEL.closed() => return,
 				_ = &mut self.guard => return,
 				guard = self.fd.readable(), if self.interest.is_readable() => match guard {
 					Ok(mut guard) => {
 						let (confirm_tx, confirm_rx) = oneshot::channel();
-						match self.global_tx.send(Message::Readable{
+						match MAIN_CHANNEL.send(Message::Readable{
 							handle: self.handle.clone(),
 							confirm: confirm_tx,
 						}).await {
@@ -103,7 +100,7 @@ impl WatchWorker {
 				guard = self.fd.writable(), if self.interest.is_writable() => match guard {
 					Ok(mut guard) => {
 						let (confirm_tx, confirm_rx) = oneshot::channel();
-						match self.global_tx.send(Message::Writable{
+						match MAIN_CHANNEL.send(Message::Writable{
 							handle: self.handle.clone(),
 							confirm: confirm_tx,
 						}).await {

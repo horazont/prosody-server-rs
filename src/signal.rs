@@ -2,14 +2,12 @@ use mlua::prelude::*;
 
 use tokio::select;
 use tokio::signal::unix::{signal, Signal, SignalKind};
-use tokio::sync::mpsc;
 
 use crate::with_runtime_lua;
 use crate::core::{Message, LuaRegistryHandle, Spawn, MAIN_CHANNEL};
 
 
 struct SignalWorker {
-	global_tx: mpsc::Sender<Message>,
 	signal: Signal,
 	handle: LuaRegistryHandle,
 }
@@ -18,10 +16,10 @@ impl SignalWorker {
 	async fn run(mut self) {
 		loop {
 			select! {
-				_ = self.global_tx.closed() => return,
+				_ = MAIN_CHANNEL.closed() => return,
 				sig = self.signal.recv() => match sig {
 					Some(_) => {
-						match self.global_tx.send(Message::Signal{handle: self.handle.clone()}).await {
+						match MAIN_CHANNEL.send(Message::Signal{handle: self.handle.clone()}).await {
 							Ok(_) => (),
 							Err(_) => return,
 						}
@@ -60,7 +58,6 @@ pub(crate) fn hook_signal<'l>(lua: &'l Lua, (kind, callback): (LuaString, LuaFun
 	with_runtime_lua! {
 		let stream = signal(kind)?;
 		SignalWorker{
-			global_tx: MAIN_CHANNEL.clone_tx(),
 			handle,
 			signal: stream,
 		}.spawn();

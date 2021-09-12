@@ -415,9 +415,7 @@ impl ConnectionHandle {
 		set_listeners(&v, listeners)?;
 		let handle = lua.create_registry_value(v.clone())?.into();
 
-		let global_tx = MAIN_CHANNEL.clone_tx();
 		ConnectionWorker{
-			global_tx,
 			rx,
 			conn,
 			read_size: 8192,
@@ -446,9 +444,7 @@ impl ConnectionHandle {
 		set_listeners(&v, listeners)?;
 		let handle = lua.create_registry_value(v.clone())?.into();
 
-		let global_tx = MAIN_CHANNEL.clone_tx();
 		ConnectWorker{
-			global_tx,
 			rx,
 			addr,
 			tls_config,
@@ -715,7 +711,6 @@ impl DirectionMode {
 }
 
 struct ConnectionWorker {
-	global_tx: mpsc::Sender<Message>,
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	conn: ConnectionState,
 	read_size: usize,
@@ -753,7 +748,7 @@ impl ConnectionWorker {
 	async fn proc_read_buffer(&mut self, buf: Option<Bytes>) -> Result<ReadResult, ()> {
 		if let Some(buf) = buf {
 			if buf.len() > 0 {
-				let result = match self.global_tx.send(Message::Incoming{
+				let result = match MAIN_CHANNEL.send(Message::Incoming{
 					handle: self.handle.clone(),
 					data: buf,
 				}).await {
@@ -766,7 +761,7 @@ impl ConnectionWorker {
 		}
 
 		// end of file
-		match self.global_tx.send(Message::ReadClosed{handle: self.handle.clone()}).await {
+		match MAIN_CHANNEL.send(Message::ReadClosed{handle: self.handle.clone()}).await {
 			Ok(_) => Ok(ReadResult::Closed),
 			Err(_) => Err(()),
 		}
@@ -791,9 +786,8 @@ impl ConnectionWorker {
 	async fn proc_msg(&mut self, msg: ControlMessage) -> io::Result<MsgResult> {
 		match msg {
 			ControlMessage::Close => {
-				// TODO: send a disconnect event
 				self.conn.shutdown().await?;
-				let _ = self.global_tx.send(Message::Disconnect{handle: self.handle.clone(), error: None}).await;
+				MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: None}).await;
 				Ok(MsgResult::Exit)
 			},
 			ControlMessage::SetOption(option) => {
@@ -804,7 +798,7 @@ impl ConnectionWorker {
 			},
 			ControlMessage::AcceptTls(ctx) => {
 				self.conn.starttls_accept(ctx).await?;
-				match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify: verify::VerificationRecord::Unverified}).await {
+				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify: verify::VerificationRecord::Unverified}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();
 						self.tx_mode = self.tx_mode.unblock();
@@ -815,7 +809,7 @@ impl ConnectionWorker {
 			},
 			ControlMessage::ConnectTls(name, ctx, recorder) => {
 				let verify = self.conn.starttls_connect(name.as_ref(), ctx, &*recorder).await?;
-				match self.global_tx.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
+				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();
 						self.tx_mode = self.tx_mode.unblock();
@@ -862,7 +856,7 @@ impl ConnectionWorker {
 				self.buf = None;
 				select! {
 					_ = self.conn.shutdown() => return,
-					_ = self.global_tx.closed() => return,
+					_ = MAIN_CHANNEL.closed() => return,
 				}
 			}
 
@@ -876,7 +870,7 @@ impl ConnectionWorker {
 						Err(()) => return,
 					},
 					Err(e) => {
-						let _ = self.global_tx.send(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
+						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
 						return
 					},
 				},
@@ -885,13 +879,13 @@ impl ConnectionWorker {
 						Ok(MsgResult::Exit) => return,
 						Ok(MsgResult::Continue) => (),
 						Err(e) => {
-							let _ = self.global_tx.send(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
+							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
 							return
 						},
 					},
 					None => return,
 				},
-				_ = self.global_tx.closed() => return,
+				_ = MAIN_CHANNEL.closed() => return,
 			}
 		}
 	}
@@ -914,7 +908,6 @@ pub(crate) fn get_listeners<'l>(ud: &LuaAnyUserData<'l>) -> LuaResult<LuaTable<'
 }
 
 struct ConnectWorker {
-	global_tx: mpsc::Sender<Message>,
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	addr: SocketAddr,
 	read_size: usize,
@@ -927,7 +920,7 @@ impl ConnectWorker {
 		let sock = match TcpStream::connect(self.addr).await {
 			Ok(sock) => sock,
 			Err(e) => {
-				let _ = self.global_tx.send(Message::Disconnect{
+				MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
 					handle: self.handle,
 					error: Some(Box::new(e)),
 				}).await;
@@ -940,7 +933,7 @@ impl ConnectWorker {
 				let sock = match connector.connect(name.as_ref(), sock).await {
 					Ok(sock) => sock,
 					Err(e) => {
-						let _ = self.global_tx.send(Message::Disconnect{
+						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
 							handle: self.handle,
 							error: Some(Box::new(e)),
 						}).await;
@@ -951,13 +944,12 @@ impl ConnectWorker {
 			},
 			None => ConnectionState::Plain{sock},
 		};
-		match self.global_tx.send(Message::Connect{handle: self.handle.clone()}).await {
+		match MAIN_CHANNEL.send(Message::Connect{handle: self.handle.clone()}).await {
 			Ok(_) => (),
 			// can only happen during shutdown, drop it.
 			Err(_) => return,
 		};
 		return ConnectionWorker{
-			global_tx: self.global_tx,
 			rx: self.rx,
 			read_size: self.read_size,
 			conn,

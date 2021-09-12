@@ -132,8 +132,20 @@ impl<T> MpscChannel<T> {
 		}
 	}
 
-	pub(crate) fn clone_tx(&self) -> mpsc::Sender<T> {
-		self.tx.clone()
+	#[inline]
+	pub(crate) async fn fire_and_forget(&self, msg: T) {
+		let _ = self.tx.send(msg).await;
+	}
+
+	#[inline]
+	#[must_use]
+	pub(crate) async fn send(&self, msg: T) -> Result<(), mpsc::error::SendError<T>> {
+		self.tx.send(msg).await
+	}
+
+	#[inline]
+	pub(crate) async fn closed(&self) -> () {
+		self.tx.closed().await
 	}
 }
 

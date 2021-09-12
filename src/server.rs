@@ -132,7 +132,6 @@ enum ControlMessage {
 
 struct ListenerWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
-	global_tx: mpsc::Sender<Message>,
 	tls_mode: TlsMode,
 	sock: TcpListener,
 	handle: LuaRegistryHandle,
@@ -156,7 +155,7 @@ impl ListenerWorker {
 							},
 						};
 						// we don't care about failure here; this can only fail during shutdown when nobody else cares anymore either.
-						let _ = self.global_tx.send(msg).await;
+						MAIN_CHANNEL.fire_and_forget(msg).await;
 					},
 					Err(e) => {
 						// TODO: proper logging!
@@ -165,7 +164,7 @@ impl ListenerWorker {
 					},
 				},
 				// when the global tx queue is gone, we don't need to accept anything anymore and can just go to rest
-				_ = self.global_tx.closed() => return,
+				_ = MAIN_CHANNEL.closed() => return,
 			}
 		}
 	}
@@ -229,10 +228,8 @@ impl ListenerHandle {
 		v.set_user_value(listeners)?;
 		let handle = lua.create_registry_value(v.clone())?.into();
 
-		let global_tx = MAIN_CHANNEL.clone_tx();
 		ListenerWorker{
 			rx,
-			global_tx,
 			sock,
 			tls_mode,
 			handle,
