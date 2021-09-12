@@ -237,6 +237,55 @@ impl fmt::Debug for LuaRegistryHandle {
 	}
 }
 
+#[derive(Debug)]
+pub(crate) enum ListenerError<'s> {
+	LuaError(LuaError),
+	NotFound(&'s str),
+}
+
+impl<'s> ListenerError<'s> {
+	pub(crate) fn lua_error(self) -> LuaResult<()> {
+		match self {
+			Self::LuaError(e) => Err(e),
+			_ => Ok(()),
+		}
+	}
+}
+
+impl<'s> From<LuaError> for ListenerError<'s> {
+	fn from(other: LuaError) -> Self {
+		Self::LuaError(other)
+	}
+}
+
+impl<'s> fmt::Display for ListenerError<'s> {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::LuaError(e) => fmt::Display::fmt(e, f),
+			Self::NotFound(s) => write!(f, "listener {:?} not set", s),
+		}
+	}
+}
+
+impl<'s> std::error::Error for ListenerError<'s> {}
+
+#[must_use]
+pub(crate) fn call_listener<'l, 'n, P: ToLuaMulti<'l>, R: FromLuaMulti<'l>>(listeners: &'l LuaTable<'l>, listener: &'n str, p: P) -> Result<R, ListenerError<'n>> {
+	let func = match listeners.get::<_, Option<LuaFunction>>(listener)? {
+		Some(func) => func,
+		None => return Err(ListenerError::NotFound(listener)),
+	};
+	Ok(func.call::<_, R>(p)?)
+}
+
+#[must_use]
+pub(crate) fn may_call_listener<'l, 'n, P: ToLuaMulti<'l>>(listeners: &'l LuaTable<'l>, listener: &'n str, p: P) -> LuaResult<()> {
+	match call_listener::<P, ()>(listeners, listener, p) {
+		Ok(()) => Ok(()),
+		Err(e) => e.lua_error(),
+	}
+}
+
 #[macro_export]
 macro_rules! with_runtime_lua {
 	($($b:stmt);*) => {

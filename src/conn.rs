@@ -31,7 +31,13 @@ use nix::{
 };
 
 use crate::{with_runtime_lua, strerror_ok};
-use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
+use crate::core::{
+	MAIN_CHANNEL,
+	Message,
+	Spawn,
+	LuaRegistryHandle,
+	may_call_listener,
+};
 use crate::tls;
 use crate::conversion;
 use crate::verify;
@@ -932,12 +938,7 @@ pub(crate) fn wrapclient<'l>(
 	with_runtime_lua!{
 		let sock = TcpStream::from_std(sock)?;
 		let handle = ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), tls_state)?;
-		match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
-			Some(func) => {
-				func.call::<_, ()>(handle.clone())?;
-			},
-			None => (),
-		};
+		may_call_listener(&listeners, "onconnect", handle.clone())?;
 		Ok(Ok(handle))
 	}
 }

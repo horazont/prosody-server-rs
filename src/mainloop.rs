@@ -13,6 +13,7 @@ use super::core::{
 	MAIN_CHANNEL,
 	GC_FLAG,
 	WAKEUP,
+	may_call_listener,
 };
 
 use super::conn;
@@ -39,23 +40,13 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::Connect{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
-				Some(func) => {
-					func.call::<_, ()>(handle)?;
-				},
-				None => (),
-			};
+			may_call_listener(&listeners, "onconnect", handle)?;
 		},
 		Message::TcpAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let handle = conn::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr))?;
-			match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
-				Some(func) => {
-					func.call::<_, ()>(handle)?;
-				},
-				None => (),
-			};
+			may_call_listener(&listeners, "onconnect", handle)?;
 		},
 		Message::TlsAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
@@ -76,49 +67,24 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 			}
 			let listeners = conn::get_listeners(&handle)?;
 			// TODO: this is actually called at the start of TLS negotiation...
-			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
-				Some(func) => {
-					func.call::<_, ()>((handle.clone(), LuaValue::Nil))?;
-				},
-				None => (),
-			};
-			match listeners.get::<&'static str, Option<LuaFunction>>("onstatus")? {
-				Some(func) => {
-					func.call::<_, ()>((handle, "ssl-handshake-complete"))?;
-				},
-				None => (),
-			};
+			may_call_listener(&listeners, "onstarttls", (handle.clone(), LuaValue::Nil))?;
+			may_call_listener(&listeners, "onstatus", (handle.clone(), "ssl-handshake-complete"))?;
 		},
 		Message::Incoming{handle, data} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			match listeners.get::<&'static str, Option<LuaFunction>>("onincoming")? {
-				Some(func) => {
-					func.call::<_, ()>((handle, lua.create_string(&data)?))?;
-				},
-				None => (),
-			};
+			may_call_listener(&listeners, "onincoming", (handle, lua.create_string(&data)?))?;
 		},
 		Message::ReadClosed{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			match listeners.get::<&'static str, Option<LuaFunction>>("ondisconnect")? {
-				Some(func) => {
-					func.call::<_, ()>(handle)?;
-				},
-				None => (),
-			};
+			may_call_listener(&listeners, "ondisconnect", handle)?;
 		},
 		Message::Disconnect{handle, error} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			let error = error.map(|x| { format!("{}", x)});
-			match listeners.get::<&'static str, Option<LuaFunction>>("ondisconnect")? {
-				Some(func) => {
-					func.call::<_, ()>((handle, error))?;
-				},
-				None => (),
-			};
+			let error = error.map(|x| { x.to_string() });
+			may_call_listener(&listeners, "ondisconnect", (handle, error))?;
 		},
 		Message::Signal{handle} => {
 			let func = lua.registry_value::<LuaFunction>(&*handle)?;
@@ -127,16 +93,14 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::Readable{handle, confirm} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
-			let func = listeners.get::<&'static str, LuaFunction>("onreadable")?;
-			func.call::<_, ()>(handle)?;
+			may_call_listener(&listeners, "onreadable", handle)?;
 			// we can just let confirm drop, that's good enough
 			drop(confirm);
 		},
 		Message::Writable{handle, confirm} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
-			let func = listeners.get::<&'static str, LuaFunction>("onwritable")?;
-			func.call::<_, ()>(handle)?;
+			may_call_listener(&listeners, "onwritable", handle)?;
 			// we can just let confirm drop, that's good enough
 			drop(confirm);
 		},
