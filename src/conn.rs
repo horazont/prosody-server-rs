@@ -155,13 +155,18 @@ impl StreamState {
 		})
 	}
 
-	pub(crate) fn confirm_tls<'l>(&mut self, verify: verify::VerificationRecord) -> Result<(), StateTransitionError> {
+	pub(crate) fn confirm_tls<'l>(&mut self, verify: verify::VerificationRecord) -> Result<bool, StateTransitionError> {
 		self.transition_impl(|this| {
 			match this {
-				Self::TlsHandshaking => {
-					Ok((Self::Tls{verify}, ()))
+				Self::TlsHandshaking | Self::Plain(..) => {
+					Ok((Self::Tls{verify}, false))
 				},
-				_ => Err((this, StateTransitionError::TlsAlreadyConfirmed)),
+				Self::Connecting(..) => {
+					Ok((Self::Tls{verify}, true))
+				},
+				Self::Disconnected => Err((this, StateTransitionError::NotConnected)),
+				Self::Failed => Err((this, StateTransitionError::Failed)),
+				Self::Tls{..} => Err((this, StateTransitionError::TlsAlreadyConfirmed)),
 			}
 		})
 	}

@@ -101,11 +101,14 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::TlsStarted{handle, verify} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			{
+			let should_call_connect = {
 				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
 				check_transition(handle.state_mut().confirm_tls(verify))?
 			};
 			call_tls_confirm(&listeners, handle.clone())?;
+			if should_call_connect {
+				call_connect(&listeners, handle.clone())?;
+			}
 		},
 		Message::Incoming{handle, data} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
