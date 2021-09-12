@@ -14,6 +14,7 @@ mod signal;
 mod fd;
 mod verify;
 mod cert;
+mod config;
 
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
@@ -30,6 +31,7 @@ fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
 	server.set("watchfd", lua.create_function(fd::watchfd)?)?;
 	server.set("new_tls_config", lua.create_function(tls::new_tls_config)?)?;
 	server.set("hook_signal", lua.create_function(signal::hook_signal)?)?;
+	server.set("reconfigure", lua.create_function(config::reconfigure)?)?;
 	exports.set("server", server)?;
 
 	exports.set("version", VERSION)?;

@@ -76,4 +76,12 @@ return {
 	-- MAIN LOOP FUNCTIONS
 	loop = server_impl.loop;
 	shutdown = server_impl.shutdown;
+
+	-- CONFIG FUNCTIONS
+	set_config = function(new_config)
+		local ok, err = server_impl.reconfigure(new_config);
+		if not ok then
+			module:log("error", "failed to configure network backend: %s", err)
+		end
+	end;
 }
