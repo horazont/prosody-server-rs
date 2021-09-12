@@ -23,6 +23,9 @@ use crate::{with_runtime_lua, strerror_ok};
 use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
 use crate::conversion;
 use crate::tls;
+use crate::config;
+use crate::config::CONFIG;
+use crate::ioutil::flattened_timeout;
 
 /**
 Control if and how TLS is accepted on listener sockets.
@@ -79,7 +82,7 @@ impl fmt::Debug for TlsMode {
 }
 
 impl TlsMode {
-	async fn accept(&self, handle: &'_ LuaRegistryHandle, conn: TcpStream, addr: SocketAddr) -> io::Result<Message> {
+	async fn accept(&self, handle: &'_ LuaRegistryHandle, conn: TcpStream, addr: SocketAddr, ssl_handshake_timeout: Duration) -> io::Result<Message> {
 		match self {
 			Self::Plain{..} => {
 				Ok(Message::TcpAccept{
@@ -89,7 +92,7 @@ impl TlsMode {
 				})
 			},
 			Self::DirectTls{tls_config} => {
-				let conn = tls_config.accept(conn).await?;
+				let conn = flattened_timeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
 				Ok(Message::TlsAccept{
 					handle: handle.clone(),
 					stream: conn,
@@ -101,7 +104,7 @@ impl TlsMode {
 				match conn.peek(&mut buf).await? {
 					// first byte of the TLS handshake
 					1 if buf[0] == 0x16 => {
-						let conn = tls_config.accept(conn).await?;
+						let conn = flattened_timeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
 						Ok(Message::TlsAccept{
 							handle: handle.clone(),
 							stream: conn,
@@ -133,6 +136,8 @@ enum ControlMessage {
 struct ListenerWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	tls_mode: TlsMode,
+	cfg: config::ServerConfig,
+	stream_cfg: config::StreamConfig,
 	sock: TcpListener,
 	handle: LuaRegistryHandle,
 }
@@ -147,7 +152,7 @@ impl ListenerWorker {
 				},
 				conn = self.sock.accept() => match conn {
 					Ok((conn, addr)) => {
-						let msg = match self.tls_mode.accept(&self.handle, conn, addr).await {
+						let msg = match self.tls_mode.accept(&self.handle, conn, addr, self.stream_cfg.ssl_handshake_timeout).await {
 							Ok(msg) => msg,
 							Err(e) => {
 								warn!("failed to fully accept connection: {}", e);
@@ -159,8 +164,8 @@ impl ListenerWorker {
 					},
 					Err(e) => {
 						// TODO: proper logging!
-						error!("failed to accept socket: {}. backing off for 5s", e);
-						tokio::time::sleep(Duration::new(5, 0)).await;
+						error!("failed to accept socket: {}. backing off", e);
+						tokio::time::sleep(self.cfg.accept_retry_interval).await;
 					},
 				},
 				// when the global tx queue is gone, we don't need to accept anything anymore and can just go to rest
@@ -215,7 +220,15 @@ impl LuaUserData for ListenerHandle {
 }
 
 impl ListenerHandle {
-	fn new_lua<'l>(lua: &'l Lua, sock: TcpListener, listeners: LuaTable, tls_config: Option<Arc<tls::TlsConfig>>, tls_mode: TlsMode) -> LuaResult<LuaAnyUserData<'l>> {
+	fn new_lua<'l>(
+			lua: &'l Lua,
+			sock: TcpListener,
+			listeners: LuaTable,
+			tls_config: Option<Arc<tls::TlsConfig>>,
+			tls_mode: TlsMode,
+			server_cfg: config::ServerConfig,
+			stream_cfg: config::StreamConfig,
+	) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = sock.local_addr()?;
 		let (tx, rx) = mpsc::unbounded_channel();
 
@@ -233,6 +246,8 @@ impl ListenerHandle {
 			sock,
 			tls_mode,
 			handle,
+			cfg: server_cfg,
+			stream_cfg,
 		}.spawn();
 		Ok(v)
 	}
@@ -287,8 +302,13 @@ pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValu
 		},
 	};
 
+	let (server_cfg, stream_cfg) = {
+		let config = CONFIG.read().unwrap();
+		(config.server, config.stream)
+	};
+
 	with_runtime_lua! {
 		let sock = TcpListener::from_std(sock)?;
-		Ok(Ok(ListenerHandle::new_lua(lua, sock, listeners, tls_config, tls_mode)?))
+		Ok(Ok(ListenerHandle::new_lua(lua, sock, listeners, tls_config, tls_mode, server_cfg, stream_cfg)?))
 	}
 }

@@ -13,6 +13,7 @@ use std::os::unix::io::{AsRawFd, RawFd, FromRawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut, BufMut, buf::Limit};
 
@@ -44,6 +45,7 @@ use crate::verify;
 use crate::cert;
 use crate::config;
 use crate::config::CONFIG;
+use crate::ioutil::flattened_timeout;
 
 
 #[derive(Clone)]
@@ -448,6 +450,7 @@ impl ConnectionHandle {
 			addr: SocketAddr,
 			listeners: LuaTable,
 			tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
+			connect_cfg: config::ClientConfig,
 			stream_cfg: config::StreamConfig,
 	) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
@@ -469,6 +472,7 @@ impl ConnectionHandle {
 			rx,
 			addr,
 			tls_config,
+			connect_cfg,
 			stream_cfg,
 			handle,
 		}.spawn();
@@ -558,8 +562,8 @@ impl ConnectionState {
 		}
 	}
 
-	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor) -> io::Result<()> {
-		match acceptor.accept(sock).await {
+	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, handshake_timeout: Duration) -> io::Result<()> {
+		match flattened_timeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await {
 			Ok(sock) => {
 				*self = Self::TlsServer{
 					sock,
@@ -576,9 +580,9 @@ impl ConnectionState {
 		}
 	}
 
-	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier) -> io::Result<verify::VerificationRecord> {
+	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
 		let (verify, sock) = recorder.scope(async move {
-			connector.connect(name, sock).await
+			flattened_timeout(handshake_timeout, connector.connect(name, sock), "STARTTLS handshake timed out").await
 		}).await;
 		match sock {
 			Ok(sock) => {
@@ -597,7 +601,7 @@ impl ConnectionState {
 		}
 	}
 
-	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>, recorder: &verify::RecordingVerifier) -> io::Result<verify::VerificationRecord> {
+	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
 		let mut tmp = ConnectionState::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -608,12 +612,12 @@ impl ConnectionState {
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
 			Self::Plain{sock} => {
-				self.starttls_client(sock, name, ctx.into(), recorder).await
+				self.starttls_client(sock, name, ctx.into(), recorder, handshake_timeout).await
 			},
 		}
 	}
 
-	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>) -> io::Result<()> {
+	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>, handshake_timeout: Duration) -> io::Result<()> {
 		let mut tmp = ConnectionState::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -623,7 +627,7 @@ impl ConnectionState {
 				result
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::Plain{sock} => self.starttls_server(sock, ctx.into()).await,
+			Self::Plain{sock} => self.starttls_server(sock, ctx.into(), handshake_timeout).await,
 		}
 	}
 }
@@ -831,7 +835,7 @@ impl ConnectionWorker {
 				Ok(MsgResult::Continue)
 			},
 			ControlMessage::AcceptTls(ctx) => {
-				self.conn.starttls_accept(ctx).await?;
+				self.conn.starttls_accept(ctx, self.cfg.ssl_handshake_timeout).await?;
 				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify: verify::VerificationRecord::Unverified}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();
@@ -842,7 +846,7 @@ impl ConnectionWorker {
 				}
 			},
 			ControlMessage::ConnectTls(name, ctx, recorder) => {
-				let verify = self.conn.starttls_connect(name.as_ref(), ctx, &*recorder).await?;
+				let verify = self.conn.starttls_connect(name.as_ref(), ctx, &*recorder, self.cfg.ssl_handshake_timeout).await?;
 				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();
@@ -944,6 +948,7 @@ pub(crate) fn get_listeners<'l>(ud: &LuaAnyUserData<'l>) -> LuaResult<LuaTable<'
 struct ConnectWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	addr: SocketAddr,
+	connect_cfg: config::ClientConfig,
 	stream_cfg: config::StreamConfig,
 	tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
 	handle: LuaRegistryHandle,
@@ -951,7 +956,7 @@ struct ConnectWorker {
 
 impl ConnectWorker {
 	async fn run(self) {
-		let sock = match TcpStream::connect(self.addr).await {
+		let sock = match flattened_timeout(self.connect_cfg.connect_timeout, TcpStream::connect(self.addr), "connection timed out").await {
 			Ok(sock) => sock,
 			Err(e) => {
 				MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
@@ -964,8 +969,9 @@ impl ConnectWorker {
 		let conn = match self.tls_config {
 			Some((name, config, recorder)) => {
 				let connector: TlsConnector = config.into();
+				let handshake_timeout = self.stream_cfg.ssl_handshake_timeout;
 				let (verify, result) = recorder.scope(async move {
-					connector.connect(name.as_ref(), sock).await
+					flattened_timeout(handshake_timeout, connector.connect(name.as_ref(), sock), "timeout during TLS handshake").await
 				}).await;
 				let sock = match result {
 					Ok(sock) => sock,
@@ -1103,10 +1109,13 @@ pub(crate) fn addclient<'l>(
 		(None, None) | (None, Some(_)) => None,
 	};
 
-	let mut stream_cfg = CONFIG.read().unwrap().stream;
+	let (connect_cfg, mut stream_cfg) = {
+		let config = CONFIG.read().unwrap();
+		(config.client, config.stream)
+	};
 	stream_cfg.read_size = read_size;
 
 	with_runtime_lua!{
-		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, tls_config, stream_cfg)?))
+		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, tls_config, connect_cfg, stream_cfg)?))
 	}
 }

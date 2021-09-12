@@ -15,6 +15,7 @@ mod fd;
 mod verify;
 mod cert;
 mod config;
+mod ioutil;
 
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
