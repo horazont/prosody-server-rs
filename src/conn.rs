@@ -931,10 +931,16 @@ pub(crate) fn wrapclient<'l>(
 
 	with_runtime_lua!{
 		let sock = TcpStream::from_std(sock)?;
-		Ok(Ok(ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners, (addr, port), tls_state)?))
+		let handle = ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), tls_state)?;
+		match listeners.get::<&'static str, Option<LuaFunction>>("onconnect")? {
+			Some(func) => {
+				func.call::<_, ()>(handle.clone())?;
+			},
+			None => (),
+		};
+		Ok(Ok(handle))
 	}
 }
-
 
 pub(crate) fn addclient<'l>(
 		lua: &'l Lua,
