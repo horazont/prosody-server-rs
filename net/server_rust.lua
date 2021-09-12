@@ -2,9 +2,11 @@ local type = type;
 local server_impl = require "librserver".server;
 local add_task_impl = server_impl._add_task;
 local sslconfig = require"util.sslconfig";
-local logger = require "util.logger";
-local log = logger.init("server_rust");
-server_impl.set_log_function(log);
+local has_log, logger = pcall(require, "util.logger");
+if has_log then
+	local log = logger.init("server_rust");
+	server_impl.set_log_function(log);
+end
 
 local _ENV = nil;
 
