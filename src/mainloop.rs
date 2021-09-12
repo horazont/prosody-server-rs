@@ -1,5 +1,6 @@
 use mlua::prelude::*;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, Instant};
 
@@ -25,6 +26,41 @@ lazy_static! {
 }
 
 
+#[must_use]
+#[inline]
+fn check_transition<T>(r: Result<T, conn::StateTransitionError>) -> LuaResult<T> {
+	match r {
+		Ok(v) => Ok(v),
+		Err(e) => Err(LuaError::ExternalError(Arc::new(e))),
+	}
+}
+
+#[must_use]
+#[inline]
+fn call_connect<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>) -> LuaResult<()> {
+	may_call_listener(listeners, "onconnect", handle)
+}
+
+#[must_use]
+#[inline]
+fn call_tls_confirm<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>) -> LuaResult<()> {
+	may_call_listener(listeners, "onstatus", (handle, "ssl-handshake-complete"))
+}
+
+#[must_use]
+#[inline]
+fn call_starttls<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>) -> LuaResult<()> {
+	// TODO: proper context
+	may_call_listener(listeners, "onstarttls", (handle, LuaValue::Nil))
+}
+
+#[must_use]
+#[inline]
+fn call_disconnect<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>, err: Option<String>) -> LuaResult<()> {
+	let err = err.unwrap_or_else(|| { "closed".into() });
+	may_call_listener(listeners, "ondisconnect", (handle, err))
+}
+
 fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 	match msg {
 		Message::TimerElapsed{handle, timestamp, reply} => {
@@ -40,35 +76,36 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::Connect{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			may_call_listener(&listeners, "onconnect", handle)?;
+			let should_call = {
+				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				check_transition(handle.state_mut().connect())?
+			};
+			if should_call {
+				call_connect(&listeners, handle)?;
+			}
 		},
 		Message::TcpAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let handle = conn::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr))?;
-			may_call_listener(&listeners, "onconnect", handle)?;
+			call_connect(&listeners, handle)?;
 		},
 		Message::TlsAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let handle = conn::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified)?;
-			match listeners.get::<&'static str, Option<LuaFunction>>("onstarttls")? {
-				Some(func) => {
-					func.call::<_, ()>((handle, LuaValue::Nil))?;
-				},
-				None => (),
-			};
+			call_starttls(&listeners, handle.clone())?;
+			call_tls_confirm(&listeners, handle.clone())?;
+			call_connect(&listeners, handle.clone())?;
 		},
 		Message::TlsStarted{handle, verify} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = conn::get_listeners(&handle)?;
 			{
 				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
-				handle.confirm_starttls(verify);
-			}
-			let listeners = conn::get_listeners(&handle)?;
-			// TODO: this is actually called at the start of TLS negotiation...
-			may_call_listener(&listeners, "onstarttls", (handle.clone(), LuaValue::Nil))?;
-			may_call_listener(&listeners, "onstatus", (handle.clone(), "ssl-handshake-complete"))?;
+				check_transition(handle.state_mut().confirm_tls(verify))?
+			};
+			call_tls_confirm(&listeners, handle.clone())?;
 		},
 		Message::Incoming{handle, data} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
@@ -78,13 +115,25 @@ fn proc_message<'l>(lua: &'l Lua, msg: Message) -> LuaResult<()> {
 		Message::ReadClosed{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			may_call_listener(&listeners, "ondisconnect", handle)?;
+			let should_call = {
+				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				check_transition(handle.state_mut().disconnect())?
+			};
+			if should_call {
+				call_disconnect(&listeners, handle, None)?;
+			}
 		},
 		Message::Disconnect{handle, error} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = conn::get_listeners(&handle)?;
-			let error = error.map(|x| { x.to_string() });
-			may_call_listener(&listeners, "ondisconnect", (handle, error))?;
+			let should_call = {
+				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				check_transition(handle.state_mut().disconnect())?
+			};
+			if should_call {
+				let error = error.map(|x| { x.to_string() });
+				call_disconnect(&listeners, handle, error)?;
+			}
 		},
 		Message::Signal{handle} => {
 			let func = lua.registry_value::<LuaFunction>(&*handle)?;

@@ -43,93 +43,183 @@ use crate::conversion;
 use crate::verify;
 use crate::cert;
 
-/**
-Describe which TLS actions are currently possible on a socket.
-
-This enum is used and cached on the lua side to know which operations are possible without having to call into the worker thread for details.
-*/
 #[derive(Clone)]
-enum CachedTlsState {
-	/// No context has been set on the socket, so a starttls operation is required to pass a context.
-	NoConfig,
-	// these are currently never constructed because we don't pass TLS config info from the listener to the conn. could be done trivially if needed.
-	#[allow(dead_code)]
-	MayAccept(Arc<rustls::ServerConfig>),
-	#[allow(dead_code)]
-	MayConnect(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>),
-	/* AcceptInProgress(Arc<rustls::ServerConfig>),
-	ConnectInProgress(webpki::DNSName, Arc<rustls::ClientConfig>), */
-	InProgress,
-	Established{
-		verify: verify::VerificationRecord,
-	},
+pub(crate) enum PreTlsConfig {
+	None,
+	ClientSide(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>),
+	ServerSide(Arc<rustls::ServerConfig>),
 }
 
-impl CachedTlsState {
-	fn transition(&mut self, given_config: Option<&tls::TlsConfig>, given_servername: Option<webpki::DNSNameRef>) -> Result<ControlMessage, String> {
+impl fmt::Debug for PreTlsConfig {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
-			Self::InProgress => Err("TLS operation already in progress".into()),
-			Self::Established{..} => Err("TLS already established".into()),
-			Self::NoConfig => match given_config {
-				// We can only *accept* connections based on the given config, as we lack a target hostname
-				Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
-					Some(v) => {
-						*self = Self::InProgress;
-						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()))
-					},
-					None => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
-				},
-				Some(tls::TlsConfig::Server{cfg, ..}) => {
-					*self = Self::InProgress;
-					Ok(ControlMessage::AcceptTls(cfg.clone()))
-				},
-				None => Err("cannot start TLS connection without context".into()),
-			},
-			Self::MayAccept(cfg) => match given_config {
-				// We can only *accept* connections based on the given config, as we lack a target hostname
-				Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
-					Some(v) => {
-						*self = Self::InProgress;
-						Ok(ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()))
-					},
-					None => Err("cannoct initiate TLS connection without target server name (i.e. on a server socket)".into()),
-				},
-				Some(tls::TlsConfig::Server{cfg, ..}) => {
-					let msg = ControlMessage::AcceptTls(cfg.clone());
-					*self = Self::InProgress;
-					Ok(msg)
-				},
-				None => {
-					let msg = ControlMessage::AcceptTls(cfg.clone());
-					*self = Self::InProgress;
-					Ok(msg)
-				},
-			},
-			Self::MayConnect(name, cfg, recorder) => {
-				let name = match given_servername {
-					Some(name) => name.to_owned(),
-					None => name.clone(),
-				};
-				match given_config {
-					// We can only *accept* connections based on the given config, as we lack a target hostname
-					Some(tls::TlsConfig::Client{cfg, recorder}) => {
-						let msg = ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone());
-						*self = Self::InProgress;
-						Ok(msg)
-					},
-					Some(tls::TlsConfig::Server{cfg, ..}) => {
-						let msg = ControlMessage::AcceptTls(cfg.clone());
-						*self = Self::InProgress;
-						Ok(msg)
-					},
-					None => {
-						let msg = ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone());
-						*self = Self::InProgress;
-						Ok(msg)
-					},
-				}
-			},
+			Self::None => write!(f, "PreTlsConfig::None"),
+			Self::ClientSide(name, _, _) => write!(f, "PreTlsConfig::ClientSide({:?})", name),
+			Self::ServerSide(_) => write!(f, "PreTlsConfig::ServerSide(..)"),
 		}
+	}
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StateTransitionError {
+	TlsAlreadyConfirmed,
+	TlsInProgress,
+	TlsEstablished,
+	ContextRequired,
+	PeerNameRequired,
+	NotConnected,
+	Failed,
+}
+
+impl fmt::Display for StateTransitionError {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::TlsAlreadyConfirmed => f.write_str("invalid operation: TLS already confirmed"),
+			Self::TlsInProgress => f.write_str("invalid operation: TLS handshake in progress"),
+			Self::TlsEstablished => f.write_str("invalid operation: TLS already established"),
+			Self::ContextRequired => f.write_str("incomplete config: cannot start TLS without a context"),
+			Self::PeerNameRequired => f.write_str("incomplete config: peer name required to initiate TLS"),
+			Self::NotConnected => f.write_str("invalid state: not connected"),
+			Self::Failed => f.write_str("connection handle poisoned"),
+		}
+	}
+}
+
+impl std::error::Error for StateTransitionError {}
+
+impl From<StateTransitionError> for LuaError {
+	fn from(other: StateTransitionError) -> Self {
+		LuaError::ExternalError(Arc::new(other))
+	}
+}
+
+/**
+Describes the stream state.
+
+This is used for orchestrating the Lua callbacks on state transitions and to figure out which actions are currently allowed.
+*/
+#[derive(Debug, Clone)]
+pub(crate) enum StreamState {
+	/// The connection is not established yet.
+	///
+	/// Only for sockets created through addclient.
+	Connecting(PreTlsConfig),
+
+	/// The connection is established, no TLS has been negotiated yet.
+	///
+	/// Future TLS negotiation is possible based on a call to starttls and possible available state.
+	Plain(PreTlsConfig),
+
+	/// The TLS handshake has been started through starttls() or while establishing the connection.
+	TlsHandshaking,
+
+	/// The TLS handshake has completed.
+	Tls{
+		verify: verify::VerificationRecord,
+	},
+
+	/// The connection has been closed either locally or remotely.
+	Disconnected,
+
+	/// The connection broke internally during a state change.
+	Failed,
+}
+
+impl StreamState {
+	#[inline]
+	fn transition_impl<T, F: FnOnce(Self) -> Result<(Self, T), (Self, StateTransitionError)>>(&mut self, f: F) -> Result<T, StateTransitionError> {
+		let mut tmp = Self::Failed;
+		std::mem::swap(&mut tmp, self);
+		let result = match f(tmp) {
+			Ok((new, v)) => {
+				tmp = new;
+				Ok(v)
+			},
+			Err((new, err)) => {
+				tmp = new;
+				Err(err)
+			},
+		};
+		std::mem::swap(&mut tmp, self);
+		result
+	}
+
+	pub(crate) fn connect<'l>(&mut self) -> Result<bool, StateTransitionError> {
+		self.transition_impl(|this| {
+			match this {
+				Self::Connecting(tls) => {
+					Ok((Self::Plain(tls), true))
+				},
+				_ => Ok((this, false)),
+			}
+		})
+	}
+
+	pub(crate) fn confirm_tls<'l>(&mut self, verify: verify::VerificationRecord) -> Result<(), StateTransitionError> {
+		self.transition_impl(|this| {
+			match this {
+				Self::TlsHandshaking => {
+					Ok((Self::Tls{verify}, ()))
+				},
+				_ => Err((this, StateTransitionError::TlsAlreadyConfirmed)),
+			}
+		})
+	}
+
+	pub(crate) fn disconnect<'l>(&mut self) -> Result<bool, StateTransitionError> {
+		self.transition_impl(|this| {
+			match this {
+				Self::Disconnected => Ok((this, false)),
+				_ => Ok((Self::Disconnected, true)),
+			}
+		})
+	}
+
+	fn start_tls(&mut self, given_config: Option<&tls::TlsConfig>, given_servername: Option<webpki::DNSNameRef>) -> Result<ControlMessage, StateTransitionError> {
+		self.transition_impl(|this| {
+			let tls_config = match this {
+				Self::TlsHandshaking => return Err((this, StateTransitionError::TlsInProgress)),
+				Self::Tls{..} => return Err((this, StateTransitionError::TlsEstablished)),
+				Self::Failed => return Err((this, StateTransitionError::Failed)),
+				Self::Connecting(_) | Self::Disconnected => return Err((this, StateTransitionError::NotConnected)),
+				Self::Plain(ref tls) => tls,
+			};
+
+			let msg = match tls_config {
+				PreTlsConfig::None => match given_config {
+					// We can only *accept* connections based on the given config, as we lack a target hostname
+					Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
+						Some(v) => ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()),
+						None => return Err((this, StateTransitionError::PeerNameRequired)),
+					},
+					Some(tls::TlsConfig::Server{cfg, ..}) => ControlMessage::AcceptTls(cfg.clone()),
+					None => return Err((this, StateTransitionError::ContextRequired)),
+				},
+				PreTlsConfig::ServerSide(cfg) => match given_config {
+					// We can only *accept* connections based on the given config, as we lack a target hostname
+					Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
+						Some(v) => ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()),
+						None => return Err((this, StateTransitionError::PeerNameRequired)),
+					},
+					Some(tls::TlsConfig::Server{cfg, ..}) => ControlMessage::AcceptTls(cfg.clone()),
+					None => ControlMessage::AcceptTls(cfg.clone()),
+				},
+				PreTlsConfig::ClientSide(name, cfg, recorder) => {
+					let name = match given_servername {
+						Some(name) => name.to_owned(),
+						None => name.clone(),
+					};
+					match given_config {
+						// We can only *accept* connections based on the given config, as we lack a target hostname
+						Some(tls::TlsConfig::Client{cfg, recorder}) => ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone()),
+						Some(tls::TlsConfig::Server{cfg, ..}) => ControlMessage::AcceptTls(cfg.clone()),
+						None => ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone()),
+					}
+				},
+			};
+
+			Ok((StreamState::TlsHandshaking, msg))
+		})
 	}
 }
 
@@ -159,7 +249,7 @@ enum ControlMessage {
 
 pub(crate) struct ConnectionHandle {
 	tx: mpsc::UnboundedSender<ControlMessage>,
-	tls_state: CachedTlsState,
+	state: StreamState,
 	sockaddr: String,
 	sockport: u16,
 }
@@ -185,8 +275,8 @@ impl LuaUserData for ConnectionHandle {
 		});
 
 		methods.add_method("ssl", |_, this: &Self, _: ()| -> LuaResult<bool> {
-			Ok(match this.tls_state {
-				CachedTlsState::Established{..} => true,
+			Ok(match this.state {
+				StreamState::Tls{..} => true,
 				_ => false,
 			})
 		});
@@ -197,8 +287,8 @@ impl LuaUserData for ConnectionHandle {
 		});
 
 		methods.add_method("ssl_peercertificate", |_, this, _: ()| -> LuaResult<Option<cert::ParsedCertificate>> {
-			match &this.tls_state {
-				CachedTlsState::Established{verify, ..} => match verify {
+			match &this.state {
+				StreamState::Tls{verify, ..} => match verify {
 					verify::VerificationRecord::Unverified | verify::VerificationRecord::Failed{..} => {
 						Ok(None)
 					},
@@ -212,8 +302,8 @@ impl LuaUserData for ConnectionHandle {
 
 		methods.add_method("ssl_peerverification", |lua, this: &Self, _: ()| -> LuaResult<(bool, LuaTable)> {
 			let reasons = lua.create_table()?;
-			match &this.tls_state {
-				CachedTlsState::Established{verify, ..} => match verify {
+			match &this.state {
+				StreamState::Tls{verify, ..} => match verify {
 					verify::VerificationRecord::Unverified => {
 						reasons.raw_set(1, "verification disabled or did not complete")?;
 						Ok((false, reasons))
@@ -262,14 +352,10 @@ impl LuaUserData for ConnectionHandle {
 				Some(Err(e)) => return Err(LuaError::RuntimeError(format!("passed server name {:?} is invalid: {}", servername.unwrap().to_string_lossy(), e))),
 				None => None,
 			};
-			match this.tls_state.transition(ctx_ref, servername_ref) {
-				Ok(msg) => {
-					match this.tx.send(msg) {
-						Ok(()) => Ok(()),
-						Err(_) => return Err(LuaError::RuntimeError("channel gone!".to_string())),
-					}
-				},
-				Err(e) => return Err(LuaError::RuntimeError(format!("{}", e))),
+			let msg = this.state.start_tls(ctx_ref, servername_ref)?;
+			match this.tx.send(msg) {
+				Ok(()) => Ok(()),
+				Err(_) => return Err(LuaError::RuntimeError("channel gone!".to_string())),
 			}
 		});
 
@@ -315,12 +401,12 @@ impl LuaUserData for ConnectionHandle {
 }
 
 impl ConnectionHandle {
-	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: (String, u16), tls_state: CachedTlsState) -> LuaResult<LuaAnyUserData<'l>> {
+	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: (String, u16), state: StreamState) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
 			tx,
-			tls_state,
+			state,
 			sockaddr: addr.0,
 			sockport: addr.1,
 		})?;
@@ -350,7 +436,7 @@ impl ConnectionHandle {
 		let v = lua.create_userdata(Self{
 			tx,
 			// we might establish TLS right away, in that case it doesn't matter
-			tls_state: CachedTlsState::NoConfig,
+			state: StreamState::Connecting(PreTlsConfig::None),
 			// this is actually correct because ip() is supposed to return the remote IP for clients
 			sockaddr: format!("{}", addr.ip()),
 			sockport: addr.port(),
@@ -377,7 +463,7 @@ impl ConnectionHandle {
 			Some(addr) => addr,
 			None => conn.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), CachedTlsState::NoConfig)
+		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Plain(PreTlsConfig::None))
 	}
 
 	pub(crate) fn wrap_tls_server<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>, verify: verify::VerificationRecord) -> LuaResult<LuaAnyUserData<'l>> {
@@ -385,11 +471,11 @@ impl ConnectionHandle {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), CachedTlsState::Established{verify})
+		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{verify})
 	}
 
-	pub(crate) fn confirm_starttls(&mut self, verify: verify::VerificationRecord) {
-		self.tls_state = CachedTlsState::Established{verify};
+	pub(crate) fn state_mut(&mut self) -> &mut StreamState {
+		&mut self.state
 	}
 }
 
@@ -922,22 +1008,20 @@ pub(crate) fn wrapclient<'l>(
 
 	let tls_state = match (tls_ctx_ref, servername) {
 		(Some(tls::TlsConfig::Client{cfg, recorder}), Some(name)) => {
-			CachedTlsState::MayConnect(name, cfg.clone(), recorder.clone())
+			PreTlsConfig::ClientSide(name, cfg.clone(), recorder.clone())
 		},
 		(Some(tls::TlsConfig::Client{..}), None) => {
 			return Ok(Err(format!("client-side TLS context given, but no target server name")))
 		},
 		(Some(tls::TlsConfig::Server{cfg, ..}), _) => {
-			CachedTlsState::MayAccept(cfg.clone())
+			PreTlsConfig::ServerSide(cfg.clone())
 		},
-		(None, _) => {
-			CachedTlsState::NoConfig
-		},
+		(None, _) => PreTlsConfig::None,
 	};
 
 	with_runtime_lua!{
 		let sock = TcpStream::from_std(sock)?;
-		let handle = ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), tls_state)?;
+		let handle = ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), StreamState::Plain(tls_state))?;
 		may_call_listener(&listeners, "onconnect", handle.clone())?;
 		Ok(Ok(handle))
 	}
