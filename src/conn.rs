@@ -42,6 +42,9 @@ use crate::tls;
 use crate::conversion;
 use crate::verify;
 use crate::cert;
+use crate::config;
+use crate::config::CONFIG;
+
 
 #[derive(Clone)]
 pub(crate) enum PreTlsConfig {
@@ -406,7 +409,14 @@ impl LuaUserData for ConnectionHandle {
 }
 
 impl ConnectionHandle {
-	fn wrap_state<'l>(lua: &'l Lua, conn: ConnectionState, listeners: LuaTable, addr: (String, u16), state: StreamState) -> LuaResult<LuaAnyUserData<'l>> {
+	fn wrap_state<'l>(
+			lua: &'l Lua,
+			conn: ConnectionState,
+			listeners: LuaTable,
+			addr: (String, u16),
+			state: StreamState,
+			cfg: config::StreamConfig,
+	) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
@@ -423,7 +433,7 @@ impl ConnectionHandle {
 		ConnectionWorker{
 			rx,
 			conn,
-			read_size: 8192,
+			cfg,
 			tx_mode: DirectionMode::Open,
 			rx_mode: DirectionMode::Open,
 			tx_buf: None,
@@ -433,7 +443,13 @@ impl ConnectionHandle {
 		Ok(v)
 	}
 
-	fn connect<'l>(lua: &'l Lua, addr: SocketAddr, listeners: LuaTable, read_size: usize, tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>) -> LuaResult<LuaAnyUserData<'l>> {
+	fn connect<'l>(
+			lua: &'l Lua,
+			addr: SocketAddr,
+			listeners: LuaTable,
+			tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
+			stream_cfg: config::StreamConfig,
+	) -> LuaResult<LuaAnyUserData<'l>> {
 		let (tx, rx) = mpsc::unbounded_channel();
 
 		let v = lua.create_userdata(Self{
@@ -453,26 +469,39 @@ impl ConnectionHandle {
 			rx,
 			addr,
 			tls_config,
-			read_size,
+			stream_cfg,
 			handle,
 		}.spawn();
 		Ok(v)
 	}
 
-	pub(crate) fn wrap_plain<'l>(lua: &'l Lua, conn: TcpStream, listeners: LuaTable, addr: Option<SocketAddr>) -> LuaResult<LuaAnyUserData<'l>> {
+	pub(crate) fn wrap_plain<'l>(
+			lua: &'l Lua,
+			conn: TcpStream,
+			listeners: LuaTable,
+			addr: Option<SocketAddr>,
+			cfg: config::StreamConfig,
+	) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = match addr {
 			Some(addr) => addr,
 			None => conn.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Plain(PreTlsConfig::None))
+		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Plain(PreTlsConfig::None), cfg)
 	}
 
-	pub(crate) fn wrap_tls_server<'l>(lua: &'l Lua, conn: server::TlsStream<TcpStream>, listeners: LuaTable, addr: Option<SocketAddr>, verify: verify::VerificationRecord) -> LuaResult<LuaAnyUserData<'l>> {
+	pub(crate) fn wrap_tls_server<'l>(
+			lua: &'l Lua,
+			conn: server::TlsStream<TcpStream>,
+			listeners: LuaTable,
+			addr: Option<SocketAddr>,
+			verify: verify::VerificationRecord,
+			cfg: config::StreamConfig,
+	) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = match addr {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{verify})
+		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{verify}, cfg)
 	}
 
 	pub(crate) fn state_mut(&mut self) -> &mut StreamState {
@@ -718,7 +747,7 @@ impl DirectionMode {
 struct ConnectionWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	conn: ConnectionState,
-	read_size: usize,
+	cfg: config::StreamConfig,
 	buf: Option<Limit<BytesMut>>,
 	rx_mode: DirectionMode,
 	tx_mode: DirectionMode,
@@ -866,7 +895,7 @@ impl ConnectionWorker {
 			}
 
 			select! {
-				result = read_with_buf(&mut self.conn, &mut self.buf, self.read_size), if self.rx_mode.may() => match result {
+				result = read_with_buf(&mut self.conn, &mut self.buf, self.cfg.read_size), if self.rx_mode.may() => match result {
 					Ok(buf) => match self.proc_read_buffer(buf).await {
 						Ok(ReadResult::Closed) => {
 							self.rx_mode = DirectionMode::Closed;
@@ -915,7 +944,7 @@ pub(crate) fn get_listeners<'l>(ud: &LuaAnyUserData<'l>) -> LuaResult<LuaTable<'
 struct ConnectWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	addr: SocketAddr,
-	read_size: usize,
+	stream_cfg: config::StreamConfig,
 	tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
 	handle: LuaRegistryHandle,
 }
@@ -966,7 +995,7 @@ impl ConnectWorker {
 		};
 		return ConnectionWorker{
 			rx: self.rx,
-			read_size: self.read_size,
+			cfg: self.stream_cfg,
 			conn,
 			buf: None,
 			tx_mode: DirectionMode::Open,
@@ -985,7 +1014,7 @@ impl Spawn for ConnectWorker {
 
 pub(crate) fn wrapclient<'l>(
 		lua: &'l Lua,
-		(fd, addr, port, listeners, _read_size, tls_ctx, extra): (RawFd, String, u16, LuaTable, usize, Option<tls::TlsConfigHandle>, Option<LuaTable>)
+		(fd, addr, port, listeners, read_size, tls_ctx, extra): (RawFd, String, u16, LuaTable, usize, Option<tls::TlsConfigHandle>, Option<LuaTable>)
 		) -> LuaResult<Result<LuaAnyUserData<'l>, String>>
 {
 	let fd = strerror_ok!(fcntl(
@@ -1026,9 +1055,12 @@ pub(crate) fn wrapclient<'l>(
 		(None, _) => PreTlsConfig::None,
 	};
 
+	let mut cfg = CONFIG.read().unwrap().stream;
+	cfg.read_size = read_size;
+
 	with_runtime_lua!{
 		let sock = TcpStream::from_std(sock)?;
-		let handle = ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), StreamState::Plain(tls_state))?;
+		let handle = ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), StreamState::Plain(tls_state), cfg)?;
 		may_call_listener(&listeners, "onconnect", handle.clone())?;
 		Ok(Ok(handle))
 	}
@@ -1071,7 +1103,10 @@ pub(crate) fn addclient<'l>(
 		(None, None) | (None, Some(_)) => None,
 	};
 
+	let mut stream_cfg = CONFIG.read().unwrap().stream;
+	stream_cfg.read_size = read_size;
+
 	with_runtime_lua!{
-		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, read_size, tls_config)?))
+		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, tls_config, stream_cfg)?))
 	}
 }

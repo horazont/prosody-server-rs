@@ -16,9 +16,9 @@ use super::core::{
 	WAKEUP,
 	may_call_listener,
 };
-
 use super::conn;
 use crate::verify;
+use crate::config::CONFIG;
 
 
 lazy_static! {
@@ -121,13 +121,15 @@ fn proc_message<'l>(lua: &'l Lua, _log_fn: Option<&'l LuaFunction>, msg: Message
 		Message::TcpAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
-			let handle = conn::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr))?;
+			let cfg = CONFIG.read().unwrap().stream;
+			let handle = conn::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr), cfg)?;
 			call_connect(&listeners, handle)?;
 		},
 		Message::TlsAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
-			let handle = conn::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified)?;
+			let cfg = CONFIG.read().unwrap().stream;
+			let handle = conn::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified, cfg)?;
 			call_starttls(&listeners, handle.clone())?;
 			call_tls_confirm(&listeners, handle.clone())?;
 			call_connect(&listeners, handle.clone())?;
