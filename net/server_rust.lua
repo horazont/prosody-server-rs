@@ -50,7 +50,7 @@ return {
 	end;
 	wrapclient = function(sock, addr, port, listeners, read_size, tls_ctx, extra)
 		local fd = sock_to_fd(sock);
-		return server_impl.wrapclient(fd, addr, port, listeners, convert_read_size(read_size), tls_ctx, extra);
+		return server_impl.wrapclient(fd, addr or "<unknown>", port or 0, listeners, convert_read_size(read_size), tls_ctx, extra);
 	end;
 
 	-- TLS FUNCTIONS
