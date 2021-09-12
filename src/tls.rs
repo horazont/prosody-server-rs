@@ -68,7 +68,6 @@ impl rustls::ResolvesServerCert for DefaultingSNIResolver {
 	}
 }
 
-
 #[derive(Clone)]
 pub(crate) enum TlsConfig {
 	Server{
@@ -90,8 +89,17 @@ impl TlsConfig {
 					Ok(v) => v,
 					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid hostname ({})", e))),
 				};
-				let keypair = read_keypair(cert, key)?;
-				resolver.set_keypair(hostname, keypair);
+				let (certs, key) = read_keypair(cert, key)?;
+				let key = match rustls::sign::RSASigningKey::new(&key) {
+					Ok(v) => v,
+					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RSA key encountered")),
+				};
+				resolver.set_keypair(hostname, rustls::sign::CertifiedKey{
+					cert: certs,
+					key: Arc::new(Box::new(key)),
+					ocsp: None,
+					sct_list: None,
+				});
 				Ok(())
 			},
 			Self::Client{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot add SNI host to client context")),
@@ -148,22 +156,13 @@ fn read_first_key<P: AsRef<Path>>(fname: P) -> io::Result<rustls::PrivateKey> {
 	Ok(keys.remove(0))
 }
 
-fn read_keypair<C: AsRef<Path>, K: AsRef<Path>>(cert: C, key: K) -> io::Result<rustls::sign::CertifiedKey> {
+fn read_keypair<C: AsRef<Path>, K: AsRef<Path>>(cert: C, key: K) -> io::Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
 	let certs = read_certs(cert)?;
 	let key = read_first_key(key)?;
-	let key = match rustls::sign::RSASigningKey::new(&key) {
-		Ok(v) => v,
-		Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RSA key encountered")),
-	};
-	Ok(rustls::sign::CertifiedKey{
-		cert: certs,
-		key: Arc::new(Box::new(key)),
-		ocsp: None,
-		sct_list: None,
-	})
+	Ok((certs, key))
 }
 
-fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::sign::CertifiedKey>> {
+fn keypair_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<(Vec<rustls::Certificate>, rustls::PrivateKey)>> {
 	let cert_file = tbl.get::<_, Option<LuaString>>("certificate")?;
 	let key_file = tbl.get::<_, Option<LuaString>>("key")?;
 	if cert_file.is_none() && key_file.is_none() {
@@ -176,15 +175,30 @@ fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::si
 
 	let cert_file = cert_file.unwrap();
 	let key_file = key_file.unwrap();
-	let keypair = match read_keypair(
+	match read_keypair(
 			OsStr::from_bytes(cert_file.as_bytes()),
 			OsStr::from_bytes(key_file.as_bytes())
 	) {
-		Ok(keypair) => keypair,
-		Err(e) => return Err(LuaError::RuntimeError(format!("failed to load keypair from {} and {}: {}", cert_file.to_string_lossy(), key_file.to_string_lossy(), e))),
-	};
+		Ok(keypair) => Ok(Some(keypair)),
+		Err(e) => Err(LuaError::RuntimeError(format!("failed to load keypair from {} and {}: {}", cert_file.to_string_lossy(), key_file.to_string_lossy(), e))),
+	}
+}
 
-	Ok(Some(keypair))
+fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::sign::CertifiedKey>> {
+	let (certs, key) = match keypair_from_lua(tbl)? {
+		Some(v) => v,
+		None => return Ok(None)
+	};
+	let key = match rustls::sign::RSASigningKey::new(&key) {
+		Ok(v) => v,
+		Err(_) => return Err(LuaError::RuntimeError("invalid RSA key encountered".to_string())),
+	};
+	Ok(Some(rustls::sign::CertifiedKey{
+		cert: certs,
+		key: Arc::new(Box::new(key)),
+		ocsp: None,
+		sct_list: None,
+	}))
 }
 
 fn borrow_named_str<'l>(name: &str, v: &'l LuaValue<'l>) -> Result<&'l str, String> {
@@ -232,6 +246,10 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 
 fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let mut cfg = rustls::ClientConfig::new();
+	match keypair_from_lua(&config)? {
+		Some((certs, key)) => strerror_ok!(cfg.set_single_client_cert(certs, key)),
+		None => (),
+	};
 	let mut recorder = verify::RecordingVerifier::new(
 		Arc::new(rustls::WebPKIVerifier::new()),
 		true,
