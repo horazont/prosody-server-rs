@@ -16,7 +16,7 @@ use super::core::{
 	WAKEUP,
 	may_call_listener,
 };
-use super::conn;
+use crate::stream;
 use crate::verify;
 use crate::config::CONFIG;
 
@@ -62,7 +62,7 @@ macro_rules! if_log {
 
 #[must_use]
 #[inline]
-fn check_transition<T>(r: Result<T, conn::StateTransitionError>) -> LuaResult<T> {
+fn check_transition<T>(r: Result<T, stream::StateTransitionError>) -> LuaResult<T> {
 	match r {
 		Ok(v) => Ok(v),
 		Err(e) => Err(LuaError::ExternalError(Arc::new(e))),
@@ -109,9 +109,9 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 		},
 		Message::Connect{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = conn::get_listeners(&handle)?;
+			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
-				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
 				check_transition(handle.state_mut().connect())?
 			};
 			if should_call {
@@ -122,23 +122,23 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = conn::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr), cfg)?;
+			let handle = stream::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr), cfg)?;
 			call_connect(&listeners, handle)?;
 		},
 		Message::TlsAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = conn::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified, cfg)?;
+			let handle = stream::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified, cfg)?;
 			call_starttls(&listeners, handle.clone())?;
 			call_tls_confirm(&listeners, handle.clone())?;
 			call_connect(&listeners, handle.clone())?;
 		},
 		Message::TlsStarted{handle, verify} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = conn::get_listeners(&handle)?;
+			let listeners = stream::get_listeners(&handle)?;
 			let should_call_connect = {
-				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
 				check_transition(handle.state_mut().confirm_tls(verify))?
 			};
 			call_tls_confirm(&listeners, handle.clone())?;
@@ -148,14 +148,14 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 		},
 		Message::Incoming{handle, data} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = conn::get_listeners(&handle)?;
+			let listeners = stream::get_listeners(&handle)?;
 			may_call_listener(&listeners, "onincoming", (handle, lua.create_string(&data)?))?;
 		},
 		Message::ReadClosed{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = conn::get_listeners(&handle)?;
+			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
-				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
 				check_transition(handle.state_mut().disconnect())?
 			};
 			if should_call {
@@ -164,9 +164,9 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 		},
 		Message::Disconnect{handle, error} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = conn::get_listeners(&handle)?;
+			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
-				let mut handle = handle.borrow_mut::<conn::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
 				check_transition(handle.state_mut().disconnect())?
 			};
 			if should_call {
