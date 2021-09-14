@@ -1,8 +1,46 @@
 use mlua::prelude::*;
 
 use std::convert::TryInto;
+use std::error;
+use std::fmt;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
+
+
+#[derive(Debug, Clone)]
+pub(crate) struct OpaqueError(String);
+
+#[inline]
+pub(crate) fn opaque<T: Into<String>>(other: T) -> OpaqueError {
+	other.into().into()
+}
+
+impl fmt::Display for OpaqueError {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+impl error::Error for OpaqueError {}
+
+impl From<String> for OpaqueError {
+	fn from(other: String) -> Self {
+		Self(other)
+	}
+}
+
+impl From<&str> for OpaqueError {
+	fn from(other: &str) -> Self {
+		Self(other.to_string())
+	}
+}
+
+impl From<OpaqueError> for LuaError {
+	fn from(other: OpaqueError) -> Self {
+		LuaError::ExternalError(Arc::new(other))
+	}
+}
 
 
 #[macro_export]

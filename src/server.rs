@@ -20,6 +20,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::{with_runtime_lua, strerror_ok, send_log};
 use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
 use crate::conversion;
+use crate::conversion::opaque;
 use crate::tls;
 use crate::config;
 use crate::config::CONFIG;
@@ -282,7 +283,7 @@ pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValu
 
 			let tls_config = match outer_tls_config.as_ref().map(|x| { x.as_ref() }) {
 				Some(tls::TlsConfig::Server{ref cfg, ..}) => Some(cfg.clone()),
-				Some(_) => return Err(LuaError::RuntimeError(format!("attempt to use non-server config with server socket"))),
+				Some(_) => return Err(opaque("attempt to use non-server config with server socket").into()),
 				None => None,
 			};
 

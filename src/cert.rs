@@ -12,6 +12,8 @@ use x509_parser::{
 	traits::FromDer,
 };
 
+use crate::conversion::opaque;
+
 #[derive(Clone)]
 pub(crate) struct ParsedCertificate{
 	lifetime_bound: Arc<Vec<u8>>,
@@ -49,7 +51,7 @@ impl LuaUserData for ParsedCertificate {
 			if arg.as_bytes() == b"utf8" {
 				Ok(())
 			} else {
-				Err(LuaError::RuntimeError(format!("unsupported certificate encoding: {:?}", arg)))
+				Err(opaque(format!("unsupported certificate encoding: {:?}", arg)).into())
 			}
 		});
 
@@ -63,7 +65,7 @@ impl LuaUserData for ParsedCertificate {
 			let ncns = if cns.len() <= i32::MAX as usize {
 				cns.len() as i32
 			} else {
-				return Err(LuaError::RuntimeError(format!("integer overflow while building subject table")))
+				return Err(opaque("integer overflow while building subject table").into())
 			};
 			let result = lua.create_table_with_capacity(ncns, 0)?;
 			for (i, cn) in cns.drain(..).enumerate() {
@@ -158,7 +160,7 @@ impl LuaUserData for SANHandle {
 			let nnames = if names.len() <= i32::MAX as usize {
 				names.len() as i32
 			} else {
-				return Err(LuaError::RuntimeError(format!("integer overflow while building name table")))
+				return Err(opaque("integer overflow while building name table").into())
 			};
 			let tbl = lua.create_table_with_capacity(nnames, 0)?;
 			for (i, name) in names.drain(..).enumerate() {

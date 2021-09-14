@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 
 use tokio_rustls::server::{TlsStream as ServerTlsStream};
 
+use crate::conversion::opaque;
 use crate::verify;
 
 /**
@@ -137,7 +138,7 @@ impl<T> MpscChannel<T> {
 	pub(crate) fn lock_rx_lua(&self) -> LuaResult<MutexGuard<'_, mpsc::Receiver<T>>> {
 		match self.rx.lock() {
 			Ok(l) => Ok(l),
-			Err(_) => Err(LuaError::RuntimeError("something has paniced before and accessing the global receiver is unsafe now".into())),
+			Err(_) => Err(opaque("something has paniced before and accessing the global receiver is unsafe now").into()),
 		}
 	}
 
@@ -173,7 +174,7 @@ lazy_static! {
 pub(crate) fn get_runtime<'x>(guard: &'x RwLockReadGuard<'x, Option<Runtime>>) -> LuaResult<&'x Runtime> {
 	match guard.as_ref() {
 		Some(v) => Ok(v),
-		None => Err(LuaError::RuntimeError("server backend runtime has exited".into())),
+		None => Err(opaque("server backend runtime has exited").into()),
 	}
 }
 

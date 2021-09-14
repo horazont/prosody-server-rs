@@ -41,6 +41,7 @@ use crate::core::{
 };
 use crate::tls;
 use crate::conversion;
+use crate::conversion::opaque;
 use crate::verify;
 use crate::cert;
 use crate::config;
@@ -359,13 +360,13 @@ impl LuaUserData for ConnectionHandle {
 			let ctx_ref = ctx_arc.as_ref().map(|x| { &**x });
 			let servername_ref = match servername.as_ref().map(|x| { webpki::DNSNameRef::try_from_ascii(x.as_bytes()) }) {
 				Some(Ok(v)) => Some(v),
-				Some(Err(e)) => return Err(LuaError::RuntimeError(format!("passed server name {:?} is invalid: {}", servername.unwrap().to_string_lossy(), e))),
+				Some(Err(e)) => return Err(opaque(format!("passed server name {:?} is invalid: {}", servername.unwrap().to_string_lossy(), e)).into()),
 				None => None,
 			};
 			let msg = this.state.start_tls(ctx_ref, servername_ref)?;
 			match this.tx.send(msg) {
 				Ok(()) => Ok(()),
-				Err(_) => return Err(LuaError::RuntimeError("channel gone!".to_string())),
+				Err(_) => return Err(opaque("socket already closed").into()),
 			}
 		});
 

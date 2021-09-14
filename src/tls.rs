@@ -15,6 +15,7 @@ use rustls_pemfile;
 
 use crate::strerror_ok;
 use crate::conversion;
+use crate::conversion::opaque;
 use crate::verify;
 
 
@@ -170,7 +171,7 @@ fn keypair_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<(Vec<rustls::Cert
 	}
 
 	if cert_file.is_none() != key_file.is_none() {
-		return Err(LuaError::RuntimeError(format!("either both certificate and key must be set, or both must be absent. make up your mind!")))
+		return Err(opaque("either both certificate and key must be set, or both must be absent. make up your mind!").into())
 	}
 
 	let cert_file = cert_file.unwrap();
@@ -180,7 +181,7 @@ fn keypair_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<(Vec<rustls::Cert
 			OsStr::from_bytes(key_file.as_bytes())
 	) {
 		Ok(keypair) => Ok(Some(keypair)),
-		Err(e) => Err(LuaError::RuntimeError(format!("failed to load keypair from {} and {}: {}", cert_file.to_string_lossy(), key_file.to_string_lossy(), e))),
+		Err(e) => Err(opaque(format!("failed to load keypair from {} and {}: {}", cert_file.to_string_lossy(), key_file.to_string_lossy(), e)).into()),
 	}
 }
 
@@ -191,7 +192,7 @@ fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::si
 	};
 	let key = match rustls::sign::RSASigningKey::new(&key) {
 		Ok(v) => v,
-		Err(_) => return Err(LuaError::RuntimeError("invalid RSA key encountered".to_string())),
+		Err(_) => return Err(opaque("invalid RSA key encountered").into()),
 	};
 	Ok(Some(rustls::sign::CertifiedKey{
 		cert: certs,
