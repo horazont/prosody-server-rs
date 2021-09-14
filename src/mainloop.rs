@@ -111,7 +111,7 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
-				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::StreamHandle>()?;
 				check_transition(handle.state_mut().connect())?
 			};
 			if should_call {
@@ -122,14 +122,14 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = stream::ConnectionHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr), cfg)?;
+			let handle = stream::StreamHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr), cfg)?;
 			call_connect(&listeners, handle)?;
 		},
 		Message::TlsAccept{handle, stream, addr} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = stream::ConnectionHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified, cfg)?;
+			let handle = stream::StreamHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified, cfg)?;
 			call_starttls(&listeners, handle.clone())?;
 			call_tls_confirm(&listeners, handle.clone())?;
 			call_connect(&listeners, handle.clone())?;
@@ -138,7 +138,7 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			let should_call_connect = {
-				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::StreamHandle>()?;
 				check_transition(handle.state_mut().confirm_tls(verify))?
 			};
 			call_tls_confirm(&listeners, handle.clone())?;
@@ -155,7 +155,7 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
-				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::StreamHandle>()?;
 				check_transition(handle.state_mut().disconnect())?
 			};
 			if should_call {
@@ -166,7 +166,7 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
-				let mut handle = handle.borrow_mut::<stream::ConnectionHandle>()?;
+				let mut handle = handle.borrow_mut::<stream::StreamHandle>()?;
 				check_transition(handle.state_mut().disconnect())?
 			};
 			if should_call {

@@ -36,20 +36,20 @@ use super::connect::{
 use super::lua::set_listeners;
 
 
-pub(crate) struct ConnectionHandle {
+pub(crate) struct StreamHandle {
 	tx: mpsc::UnboundedSender<ControlMessage>,
 	state: StreamState,
 	sockaddr: String,
 	sockport: u16,
 }
 
-impl ConnectionHandle {
+impl StreamHandle {
 	fn send_set_option(&self, option: SocketOption) {
 		let _ = self.tx.send(ControlMessage::SetOption(option));
 	}
 }
 
-impl LuaUserData for ConnectionHandle {
+impl LuaUserData for StreamHandle {
 	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
 		methods.add_method("ip", |_, this: &Self, _: ()| -> LuaResult<String> {
 			Ok(this.sockaddr.clone())
@@ -189,7 +189,7 @@ impl LuaUserData for ConnectionHandle {
 	}
 }
 
-impl ConnectionHandle {
+impl StreamHandle {
 	pub(super) fn wrap_state<'l>(
 			lua: &'l Lua,
 			conn: ConnectionState,

@@ -34,7 +34,7 @@ use super::msg::{
 	SocketOption,
 };
 use super::handle::{
-	ConnectionHandle,
+	StreamHandle,
 };
 
 
@@ -113,7 +113,7 @@ pub(crate) fn wrapclient<'l>(
 
 	with_runtime_lua!{
 		let sock = TcpStream::from_std(sock)?;
-		let handle = ConnectionHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), StreamState::Plain(tls_state), cfg)?;
+		let handle = StreamHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), StreamState::Plain(tls_state), cfg)?;
 		may_call_listener(&listeners, "onconnect", handle.clone())?;
 		Ok(Ok(handle))
 	}
@@ -163,6 +163,6 @@ pub(crate) fn addclient<'l>(
 	stream_cfg.read_size = read_size;
 
 	with_runtime_lua!{
-		Ok(Ok(ConnectionHandle::connect(lua, addr, listeners, tls_config, connect_cfg, stream_cfg)?))
+		Ok(Ok(StreamHandle::connect(lua, addr, listeners, tls_config, connect_cfg, stream_cfg)?))
 	}
 }

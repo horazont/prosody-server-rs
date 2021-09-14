@@ -25,7 +25,7 @@ pub(crate) use state::{
 };
 
 pub(crate) use handle::{
-	ConnectionHandle,
+	StreamHandle,
 };
 
 pub(crate) use lua::{
