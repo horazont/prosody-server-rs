@@ -27,7 +27,7 @@ use super::msg::{
 	SocketOption,
 };
 use super::worker::{
-	ConnectionWorker,
+	StreamWorker,
 	ConnectionState,
 };
 use super::connect::{
@@ -211,7 +211,7 @@ impl ConnectionHandle {
 		set_listeners(&v, listeners)?;
 		let handle = lua.create_registry_value(v.clone())?.into();
 
-		ConnectionWorker::new(
+		StreamWorker::new(
 			rx,
 			conn,
 			cfg,

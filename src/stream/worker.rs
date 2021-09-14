@@ -265,7 +265,7 @@ impl DirectionMode {
 	}
 }
 
-pub(super) struct ConnectionWorker {
+pub(super) struct StreamWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
 	conn: ConnectionState,
 	cfg: config::StreamConfig,
@@ -298,7 +298,7 @@ async fn read_with_buf(conn: &mut ConnectionState, buf: &mut Option<Limit<BytesM
 	}
 }
 
-impl ConnectionWorker {
+impl StreamWorker {
 	pub(super) fn new(
 			rx: mpsc::UnboundedReceiver<ControlMessage>,
 			conn: ConnectionState,
@@ -464,7 +464,7 @@ impl ConnectionWorker {
 	}
 }
 
-impl Spawn for ConnectionWorker {
+impl Spawn for StreamWorker {
 	fn spawn(self) {
 		tokio::spawn(async move { self.run().await });
 	}

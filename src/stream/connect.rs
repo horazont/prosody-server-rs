@@ -21,7 +21,7 @@ use super::msg::{
 };
 use super::worker::{
 	ConnectionState,
-	ConnectionWorker,
+	StreamWorker,
 };
 
 
@@ -97,7 +97,7 @@ impl ConnectWorker {
 				ConnectionState::Plain{sock}
 			}
 		};
-		ConnectionWorker::new(
+		StreamWorker::new(
 			self.rx,
 			conn,
 			self.stream_cfg,
