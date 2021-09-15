@@ -19,6 +19,19 @@ mod ioutil;
 
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
+	// Nothing expects the ~spanish inquisition~ SIGPIPE, so we mask it here.
+	// Normally, rust masks SIGPIPE on its own:
+	// https://github.com/rust-lang/rust/issues/62569
+	// But as its part of the startup code, it doesn't get executed when
+	// loading as a library. So we do it here.
+
+	// We don't care about the result, only that it's successful, so the
+	// safety concerns do not apply to us.
+	unsafe { nix::sys::signal::signal(
+		nix::sys::signal::Signal::SIGPIPE,
+		nix::sys::signal::SigHandler::SigIgn,
+	).unwrap() };
+
 	let exports = lua.create_table()?;
 
 	let server = lua.create_table()?;
