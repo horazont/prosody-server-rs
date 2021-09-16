@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut, BufMut, buf::Limit};
+use bytes::{Bytes, BytesMut, BufMut, Buf, buf::Limit};
 
 use tokio::select;
 use tokio::io::{
@@ -43,6 +43,8 @@ use crate::core::{
 };
 use crate::ioutil::{
 	iotimeout,
+	duplex,
+	DuplexError,
 };
 use crate::verify;
 
@@ -199,15 +201,6 @@ impl Stream {
 				let sock = rx.reunite(tx).unwrap();
 				self.starttls_server(sock, ctx.into(), handshake_timeout).await
 			},
-		}
-	}
-
-	fn split(&mut self) -> (Box<&mut (dyn AsyncRead + Send + Unpin)>, Box<&mut (dyn AsyncWrite + Send + Unpin)>) {
-		match self {
-			Stream::Broken{..} => panic!("attempt to split broken stream"),
-			Stream::Plain{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
-			Stream::TlsServer{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
-			Stream::TlsClient{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
 		}
 	}
 }
@@ -400,12 +393,54 @@ fn mkbuffer(buf: &mut Option<Limit<BytesMut>>, size: usize) -> &mut Limit<BytesM
 }
 
 #[inline]
-async fn read_with_buf<T: AsyncRead + Unpin>(conn: &mut T, buf: &mut Option<Limit<BytesMut>>, size: usize) -> io::Result<Option<Bytes>> {
-	conn.read_buf(mkbuffer(buf, size)).await?;
-	if buf.as_ref().unwrap().get_ref().len() == 0 {
-		Ok(None)
-	} else {
-		Ok(Some(buf.take().unwrap().into_inner().freeze()))
+async fn may_duplex(
+		conn: &mut Stream,
+		rxbuf: Option<&mut Option<Limit<BytesMut>>>,
+		size: usize,
+		txbuf: Option<&mut Bytes>,
+) -> Result<Option<Option<Bytes>>, DuplexError> {
+	match (rxbuf, txbuf) {
+		(Some(rxbuf), Some(txbuf)) => {
+			match duplex(conn, mkbuffer(rxbuf, size), txbuf).await?.nread() {
+				// at eof
+				Some(0) => Ok(Some(None)),
+				// anything
+				Some(n) => {
+					debug_assert!(rxbuf.as_ref().unwrap().get_ref().len() == n);
+					Ok(Some(Some(rxbuf.take().unwrap().into_inner().freeze())))
+				},
+				// nothing, but no read completed, so not at eof
+				None => Ok(None)
+			}
+		},
+		(Some(rxbuf), None) => {
+			// recv only
+			match conn.read_buf(mkbuffer(rxbuf, size)).await {
+				Ok(0) => Ok(Some(None)),
+				Ok(_) => Ok(Some(Some(rxbuf.take().unwrap().into_inner().freeze()))),
+				Err(e) => Err(DuplexError::Read(e)),
+			}
+		},
+		(None, Some(txbuf)) => {
+			// send only
+			match conn.write_all_buf(txbuf).await {
+				Ok(()) => (),
+				Err(e) => return Err(DuplexError::Write(e)),
+			}
+			Ok(None)
+		},
+		(None, None) => {
+			// nothing to do?!
+			#[cfg(debug_assertions)]
+			{
+				panic!("may_duplex called with both buffers None")
+			}
+			#[cfg(not(debug_assertions))]
+			{
+				tokio::time::sleep(Duration::new(60, 0)).await;
+				Ok(None)
+			}
+		}
 	}
 }
 
@@ -534,31 +569,43 @@ impl StreamWorker {
 				}
 			}
 
+			let rxbuf = if self.rx_mode.may() {
+				Some(&mut self.buf)
+			} else {
+				None
+			};
+
 			let txbuf = if self.tx_mode.may() {
 				self.txq.front_mut()
 			} else {
 				None
 			};
 
-			let (mut rx, tx) = self.conn.split();
-
 			select! {
-				result = read_with_buf(&mut rx, &mut self.buf, self.cfg.read_size), if self.rx_mode.may() => match result {
-					Ok(buf) => match self.proc_read_buffer(buf).await {
-						Ok(ReadResult::Closed) => {
-							self.rx_mode = DirectionMode::Closed;
-						},
-						Ok(ReadResult::Continue) => (),
-						Err(()) => return,
-					},
-					Err(e) => {
-						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
-						return
-					},
-				},
-				result = Self::option_write(tx, txbuf), if self.tx_mode.may() && txbuf.is_some() => match result {
-					Ok(()) => {
-						self.txq.pop_front();
+				result = may_duplex(
+						&mut self.conn,
+						rxbuf,
+						self.cfg.read_size,
+						txbuf,
+				), if rxbuf.is_some() || txbuf.is_some() => match result {
+					Ok(may_rxbuf) => {
+						// ensure that we advance the queue if we depleted the send buffer
+						if let Some(txfront) = self.txq.front() {
+							if !txfront.has_remaining() {
+								drop(txfront);
+								self.txq.pop_front();
+							}
+						}
+						if let Some(rxbuf) = may_rxbuf {
+							// and also process the read buffer if any
+							match self.proc_read_buffer(rxbuf).await {
+								Ok(ReadResult::Closed) => {
+									self.rx_mode = DirectionMode::Closed;
+								},
+								Ok(ReadResult::Continue) => (),
+								Err(()) => return,
+							}
+						}
 					},
 					Err(e) => {
 						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
