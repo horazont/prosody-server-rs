@@ -28,7 +28,7 @@ use super::msg::{
 };
 use super::worker::{
 	StreamWorker,
-	ConnectionState,
+	FdStream,
 };
 use super::connect::{
 	ConnectWorker,
@@ -192,7 +192,7 @@ impl LuaUserData for StreamHandle {
 impl StreamHandle {
 	pub(super) fn wrap_state<'l>(
 			lua: &'l Lua,
-			conn: ConnectionState,
+			conn: FdStream,
 			listeners: LuaTable,
 			addr: (String, u16),
 			state: StreamState,
@@ -265,7 +265,7 @@ impl StreamHandle {
 			Some(addr) => addr,
 			None => conn.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::Plain{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Plain(PreTlsConfig::None), cfg)
+		Self::wrap_state(lua, conn.into(), listeners, (addr.ip().to_string(), addr.port()), StreamState::Plain(PreTlsConfig::None), cfg)
 	}
 
 	pub(crate) fn wrap_tls_server<'l>(
@@ -280,7 +280,7 @@ impl StreamHandle {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
 		};
-		Self::wrap_state(lua, ConnectionState::TlsServer{sock: conn}, listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{verify}, cfg)
+		Self::wrap_state(lua, conn.into(), listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{verify}, cfg)
 	}
 
 	pub(crate) fn state_mut(&mut self) -> &mut StreamState {

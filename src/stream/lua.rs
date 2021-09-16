@@ -27,9 +27,6 @@ use super::state::{
 	StateTransitionError,
 	StreamState,
 };
-use super::worker::{
-	ConnectionState,
-};
 use super::msg::{
 	SocketOption,
 };
@@ -113,7 +110,7 @@ pub(crate) fn wrapclient<'l>(
 
 	with_runtime_lua!{
 		let sock = TcpStream::from_std(sock)?;
-		let handle = StreamHandle::wrap_state(lua, ConnectionState::Plain{sock}, listeners.clone(), (addr, port), StreamState::Plain(tls_state), cfg)?;
+		let handle = StreamHandle::wrap_state(lua, sock.into(), listeners.clone(), (addr, port), StreamState::Plain(tls_state), cfg)?;
 		may_call_listener(&listeners, "onconnect", handle.clone())?;
 		Ok(Ok(handle))
 	}

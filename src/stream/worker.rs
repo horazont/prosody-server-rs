@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,8 +11,17 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut, BufMut, buf::Limit};
 
 use tokio::select;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{
+	AsyncRead,
+	AsyncReadExt,
+	AsyncWrite,
+	AsyncWriteExt,
+	ReadBuf,
+	ReadHalf,
+	WriteHalf,
+};
 use tokio::net::TcpStream;
+use tokio::net::tcp;
 use tokio::sync::mpsc;
 
 use tokio_rustls::{
@@ -42,36 +53,72 @@ use super::msg::{
 
 
 pin_project! {
-	#[project = ConnectionStateProj]
-	pub(super) enum ConnectionState {
+	#[project = StreamProj]
+	pub(super) enum Stream {
 		Broken{e: Option<Box<dyn std::error::Error + Send + 'static>>},
 		Plain{
 			#[pin]
-			sock: TcpStream,
+			rx: tcp::OwnedReadHalf,
+			#[pin]
+			tx: tcp::OwnedWriteHalf,
 		},
 		TlsServer{
 			#[pin]
-			sock: server::TlsStream<TcpStream>,
+			rx: ReadHalf<server::TlsStream<TcpStream>>,
+			#[pin]
+			tx: WriteHalf<server::TlsStream<TcpStream>>,
 		},
 		TlsClient{
 			#[pin]
-			sock: client::TlsStream<TcpStream>,
+			rx: ReadHalf<client::TlsStream<TcpStream>>,
+			#[pin]
+			tx: WriteHalf<client::TlsStream<TcpStream>>,
 		},
 	}
 }
 
-impl fmt::Debug for ConnectionState {
-	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
-		match self {
-			Self::Broken{e} => f.debug_struct("ConnectionState::Broken").field("e", &e).finish(),
-			Self::Plain{..} => f.debug_struct("ConnectionState::Plain").finish_non_exhaustive(),
-			Self::TlsServer{..} => f.debug_struct("ConnectionState::TlsServer").finish_non_exhaustive(),
-			Self::TlsClient{..} => f.debug_struct("ConnectionState::TlsClient").finish_non_exhaustive(),
+impl From<TcpStream> for Stream {
+	fn from(other: TcpStream) -> Self {
+		let (rx, tx) = other.into_split();
+		Self::Plain{
+			rx,
+			tx,
 		}
 	}
 }
 
-impl ConnectionState {
+impl From<server::TlsStream<TcpStream>> for Stream {
+	fn from(other: server::TlsStream<TcpStream>) -> Self {
+		let (rx, tx) = tokio::io::split(other);
+		Self::TlsServer{
+			rx,
+			tx,
+		}
+	}
+}
+
+impl From<client::TlsStream<TcpStream>> for Stream {
+	fn from(other: client::TlsStream<TcpStream>) -> Self {
+		let (rx, tx) = tokio::io::split(other);
+		Self::TlsClient{
+			rx,
+			tx,
+		}
+	}
+}
+
+impl fmt::Debug for Stream {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::Broken{e} => f.debug_struct("Stream::Broken").field("e", &e).finish(),
+			Self::Plain{..} => f.debug_struct("Stream::Plain").finish_non_exhaustive(),
+			Self::TlsServer{..} => f.debug_struct("Stream::TlsServer").finish_non_exhaustive(),
+			Self::TlsClient{..} => f.debug_struct("Stream::TlsClient").finish_non_exhaustive(),
+		}
+	}
+}
+
+impl Stream {
 	fn broken_err(e: &Option<Box<dyn std::error::Error + Send + 'static>>) -> io::Error {
 		match e {
 			Some(e) => io::Error::new(io::ErrorKind::ConnectionReset, format!("connection invalidated because of a previous failed operation: {}", e)),
@@ -79,12 +126,17 @@ impl ConnectionState {
 		}
 	}
 
+	fn is_valid(&self) -> bool {
+		match self {
+			Self::Broken{..} => false,
+			_ => true,
+		}
+	}
+
 	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, handshake_timeout: Duration) -> io::Result<()> {
 		match iotimeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await {
 			Ok(sock) => {
-				*self = Self::TlsServer{
-					sock,
-				};
+				*self = sock.into();
 				Ok(())
 			},
 			Err(e) => {
@@ -103,9 +155,7 @@ impl ConnectionState {
 		}).await;
 		match sock {
 			Ok(sock) => {
-				*self = Self::TlsClient{
-					sock,
-				};
+				*self = sock.into();
 				Ok(verify)
 			},
 			Err(e) => {
@@ -119,7 +169,7 @@ impl ConnectionState {
 	}
 
 	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
-		let mut tmp = ConnectionState::Broken{e: None};
+		let mut tmp = Stream::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
 			Self::Broken{ref e} => {
@@ -128,14 +178,15 @@ impl ConnectionState {
 				result
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::Plain{sock} => {
+			Self::Plain{rx, tx} => {
+				let sock = rx.reunite(tx).unwrap();
 				self.starttls_client(sock, name, ctx.into(), recorder, handshake_timeout).await
 			},
 		}
 	}
 
 	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>, handshake_timeout: Duration) -> io::Result<()> {
-		let mut tmp = ConnectionState::Broken{e: None};
+		let mut tmp = Stream::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
 			Self::Broken{ref e} => {
@@ -144,82 +195,142 @@ impl ConnectionState {
 				result
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::Plain{sock} => self.starttls_server(sock, ctx.into(), handshake_timeout).await,
+			Self::Plain{rx, tx} => {
+				let sock = rx.reunite(tx).unwrap();
+				self.starttls_server(sock, ctx.into(), handshake_timeout).await
+			},
+		}
+	}
+
+	fn split(&mut self) -> (Box<&mut (dyn AsyncRead + Send + Unpin)>, Box<&mut (dyn AsyncWrite + Send + Unpin)>) {
+		match self {
+			Stream::Broken{..} => panic!("attempt to split broken stream"),
+			Stream::Plain{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
+			Stream::TlsServer{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
+			Stream::TlsClient{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
 		}
 	}
 }
 
-impl AsRawFd for ConnectionState {
+impl AsyncRead for Stream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.project();
+        match this {
+            StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
+            StreamProj::Plain{rx, ..} => rx.poll_read(cx, buf),
+            StreamProj::TlsServer{rx, ..} => rx.poll_read(cx, buf),
+            StreamProj::TlsClient{rx, ..} => rx.poll_read(cx, buf),
+		}
+	}
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.project();
+        match this {
+            StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
+            StreamProj::Plain{tx, ..} => tx.poll_write(cx, buf),
+            StreamProj::TlsServer{tx, ..} => tx.poll_write(cx, buf),
+            StreamProj::TlsClient{tx, ..} => tx.poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        let this = self.project();
+        match this {
+            StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
+            StreamProj::Plain{tx, ..} => tx.poll_write_vectored(cx, bufs),
+            StreamProj::TlsServer{tx, ..} => tx.poll_write_vectored(cx, bufs),
+            StreamProj::TlsClient{tx, ..} => tx.poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.project();
+        match this {
+            StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
+            StreamProj::Plain{tx, ..} => tx.poll_flush(cx),
+            StreamProj::TlsServer{tx, ..} => tx.poll_flush(cx),
+            StreamProj::TlsClient{tx, ..} => tx.poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.project();
+        match this {
+            StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
+            StreamProj::Plain{tx, ..} => tx.poll_shutdown(cx),
+            StreamProj::TlsServer{tx, ..} => tx.poll_shutdown(cx),
+            StreamProj::TlsClient{tx, ..} => tx.poll_shutdown(cx),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Broken{..} => false,
+            Self::Plain{tx, ..} => tx.is_write_vectored(),
+            Self::TlsServer{tx, ..} => tx.is_write_vectored(),
+            Self::TlsClient{tx, ..} => tx.is_write_vectored(),
+        }
+    }
+}
+
+pin_project! {
+	#[derive(Debug)]
+	pub(super) struct FdStream {
+		fd: RawFd,
+		#[pin]
+		inner: Stream,
+	}
+}
+
+impl AsRawFd for FdStream {
 	fn as_raw_fd(&self) -> RawFd {
-		match self {
-			Self::Broken{e} => panic!("attempt to get fd from broken connection ({:?})", e),
-			Self::Plain{sock, ..} => sock.as_raw_fd(),
-			Self::TlsServer{sock} => sock.get_ref().0.as_raw_fd(),
-			Self::TlsClient{sock} => sock.get_ref().0.as_raw_fd(),
+		if !self.inner.is_valid() {
+			panic!("attempt to get FD from broken stream")
+		}
+		self.fd
+	}
+}
+
+impl From<TcpStream> for FdStream {
+	fn from(other: TcpStream) -> Self {
+		Self{
+			fd: other.as_raw_fd(),
+			inner: other.into(),
 		}
 	}
 }
 
-impl AsyncRead for ConnectionState {
-	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-		let this = self.project();
-		match this {
-			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::Plain{sock, ..} => sock.poll_read(cx, buf),
-			ConnectionStateProj::TlsServer{sock} => sock.poll_read(cx, buf),
-			ConnectionStateProj::TlsClient{sock} => sock.poll_read(cx, buf),
+impl From<server::TlsStream<TcpStream>> for FdStream {
+	fn from(other: server::TlsStream<TcpStream>) -> Self {
+		Self{
+			fd: other.get_ref().0.as_raw_fd(),
+			inner: other.into(),
 		}
 	}
 }
 
-impl AsyncWrite for ConnectionState {
-	fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-		let this = self.project();
-		match this {
-			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::Plain{sock, ..} => sock.poll_write(cx, buf),
-			ConnectionStateProj::TlsServer{sock} => sock.poll_write(cx, buf),
-			ConnectionStateProj::TlsClient{sock} => sock.poll_write(cx, buf),
+impl From<client::TlsStream<TcpStream>> for FdStream {
+	fn from(other: client::TlsStream<TcpStream>) -> Self {
+		Self{
+			fd: other.get_ref().0.as_raw_fd(),
+			inner: other.into(),
 		}
 	}
+}
 
-	fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
-		let this = self.project();
-		match this {
-			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::Plain{sock, ..} => sock.poll_write_vectored(cx, bufs),
-			ConnectionStateProj::TlsServer{sock} => sock.poll_write_vectored(cx, bufs),
-			ConnectionStateProj::TlsClient{sock} => sock.poll_write_vectored(cx, bufs),
-		}
+impl Deref for FdStream {
+	type Target = Stream;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
 	}
+}
 
-	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-		let this = self.project();
-		match this {
-			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::Plain{sock, ..} => sock.poll_flush(cx),
-			ConnectionStateProj::TlsServer{sock} => sock.poll_flush(cx),
-			ConnectionStateProj::TlsClient{sock} => sock.poll_flush(cx),
-		}
-	}
-
-	fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-		let this = self.project();
-		match this {
-			ConnectionStateProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-			ConnectionStateProj::Plain{sock, ..} => sock.poll_shutdown(cx),
-			ConnectionStateProj::TlsServer{sock} => sock.poll_shutdown(cx),
-			ConnectionStateProj::TlsClient{sock} => sock.poll_shutdown(cx),
-		}
-	}
-
-	fn is_write_vectored(&self) -> bool {
-		match self {
-			Self::Broken{..} => false,
-			Self::Plain{sock, ..} => sock.is_write_vectored(),
-			Self::TlsServer{sock, ..} => sock.is_write_vectored(),
-			Self::TlsClient{sock, ..} => sock.is_write_vectored(),
-		}
+impl DerefMut for FdStream {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.inner
 	}
 }
 
@@ -267,12 +378,12 @@ impl DirectionMode {
 
 pub(super) struct StreamWorker {
 	rx: mpsc::UnboundedReceiver<ControlMessage>,
-	conn: ConnectionState,
+	conn: FdStream,
 	cfg: config::StreamConfig,
 	buf: Option<Limit<BytesMut>>,
 	rx_mode: DirectionMode,
 	tx_mode: DirectionMode,
-	tx_buf: Option<BytesMut>,
+	txq: VecDeque<Bytes>,
 	handle: LuaRegistryHandle,
 }
 
@@ -289,7 +400,7 @@ fn mkbuffer(buf: &mut Option<Limit<BytesMut>>, size: usize) -> &mut Limit<BytesM
 }
 
 #[inline]
-async fn read_with_buf(conn: &mut ConnectionState, buf: &mut Option<Limit<BytesMut>>, size: usize) -> io::Result<Option<Bytes>> {
+async fn read_with_buf<T: AsyncRead + Unpin>(conn: &mut T, buf: &mut Option<Limit<BytesMut>>, size: usize) -> io::Result<Option<Bytes>> {
 	conn.read_buf(mkbuffer(buf, size)).await?;
 	if buf.as_ref().unwrap().get_ref().len() == 0 {
 		Ok(None)
@@ -301,7 +412,7 @@ async fn read_with_buf(conn: &mut ConnectionState, buf: &mut Option<Limit<BytesM
 impl StreamWorker {
 	pub(super) fn new(
 			rx: mpsc::UnboundedReceiver<ControlMessage>,
-			conn: ConnectionState,
+			conn: FdStream,
 			cfg: config::StreamConfig,
 			handle: LuaRegistryHandle
 	) -> Self {
@@ -312,7 +423,7 @@ impl StreamWorker {
 			handle,
 			tx_mode: DirectionMode::Open,
 			rx_mode: DirectionMode::Open,
-			tx_buf: None,
+			txq: VecDeque::new(),
 			buf: None,
 		}
 	}
@@ -338,12 +449,6 @@ impl StreamWorker {
 			Ok(_) => Ok(ReadResult::Closed),
 			Err(_) => Err(()),
 		}
-	}
-
-	#[inline]
-	async fn proc_write_buffer(&mut self, buf: Bytes) -> io::Result<()> {
-		// TODO: asynchronize this in some way?
-		self.conn.write_all(&buf).await
 	}
 
 	fn set_keepalive(&self, enabled: bool) -> Result<(), io::Error> {
@@ -391,12 +496,8 @@ impl StreamWorker {
 					Err(_) => Ok(MsgResult::Exit),
 				}
 			},
-			ControlMessage::Write(buf) => if self.tx_mode.may() {
-				self.proc_write_buffer(buf).await?;
-				Ok(MsgResult::Continue)
-			} else if self.tx_mode.may_ever() {
-				let tx_buf = self.tx_buf.get_or_insert_with(|| { BytesMut::new() });
-				tx_buf.extend_from_slice(&buf);
+			ControlMessage::Write(buf) => if self.tx_mode.may_ever() {
+				self.txq.push_back(buf);
 				Ok(MsgResult::Continue)
 			} else {
 				// should this instead be a write error or something?!
@@ -412,14 +513,14 @@ impl StreamWorker {
 			},
 			ControlMessage::UnblockWrites => {
 				self.tx_mode = self.tx_mode.unblock();
-				if self.tx_mode.may() {
-					if let Some(buf) = self.tx_buf.take() {
-						self.proc_write_buffer(buf.freeze()).await?;
-					}
-				}
 				Ok(MsgResult::Continue)
 			},
 		}
+	}
+
+	async fn option_write<T: AsyncWrite + Unpin>(mut tx: T, buf: Option<&mut Bytes>) -> io::Result<()> {
+		let buf = buf.unwrap();
+		tx.write_all_buf(buf).await
 	}
 
 	async fn run(mut self) {
@@ -433,14 +534,31 @@ impl StreamWorker {
 				}
 			}
 
+			let txbuf = if self.tx_mode.may() {
+				self.txq.front_mut()
+			} else {
+				None
+			};
+
+			let (mut rx, tx) = self.conn.split();
+
 			select! {
-				result = read_with_buf(&mut self.conn, &mut self.buf, self.cfg.read_size), if self.rx_mode.may() => match result {
+				result = read_with_buf(&mut rx, &mut self.buf, self.cfg.read_size), if self.rx_mode.may() => match result {
 					Ok(buf) => match self.proc_read_buffer(buf).await {
 						Ok(ReadResult::Closed) => {
 							self.rx_mode = DirectionMode::Closed;
 						},
 						Ok(ReadResult::Continue) => (),
 						Err(()) => return,
+					},
+					Err(e) => {
+						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
+						return
+					},
+				},
+				result = Self::option_write(tx, txbuf), if self.tx_mode.may() && txbuf.is_some() => match result {
+					Ok(()) => {
+						self.txq.pop_front();
 					},
 					Err(e) => {
 						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;

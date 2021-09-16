@@ -20,7 +20,6 @@ use super::msg::{
 	ControlMessage,
 };
 use super::worker::{
-	ConnectionState,
 	StreamWorker,
 };
 
@@ -86,7 +85,7 @@ impl ConnectWorker {
 					// can only happen during shutdown, drop it.
 					Err(_) => return,
 				};
-				ConnectionState::TlsClient{sock}
+				sock.into()
 			},
 			None => {
 				match MAIN_CHANNEL.send(Message::Connect{handle: self.handle.clone()}).await {
@@ -94,7 +93,7 @@ impl ConnectWorker {
 					// can only happen during shutdown, drop it.
 					Err(_) => return,
 				};
-				ConnectionState::Plain{sock}
+				sock.into()
 			}
 		};
 		StreamWorker::new(
