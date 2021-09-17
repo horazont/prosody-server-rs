@@ -61,15 +61,11 @@ impl Default for ClientConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LoopConfig {
-	pub fatal_errors: bool,
 }
 
 impl Default for LoopConfig {
 	fn default() -> Self {
-		// these defaults are based on today's server_epoll
-		Self{
-			fatal_errors: false,
-		}
+		Self{}
 	}
 }
 
@@ -96,7 +92,6 @@ impl Config {
 				b"ssl_handshake_timeout" => self.stream.ssl_handshake_timeout = strerror_ok!(to_duration(v)),
 				b"accept_retry_interval" => self.server.accept_retry_interval = strerror_ok!(to_duration(v)),
 				b"connect_timeout" => self.client.connect_timeout = strerror_ok!(to_duration(v)),
-				b"fatal_errors" => self.mainloop.fatal_errors = strerror_ok!(bool::from_lua(v, lua)),
 				_ => (),
 			}
 		}
