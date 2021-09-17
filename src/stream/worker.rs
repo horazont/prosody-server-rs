@@ -378,26 +378,28 @@ async fn may_duplex(
 		rxbuf: Option<&mut Option<Limit<BytesMut>>>,
 		size: usize,
 		txbuf: Option<&mut Bytes>,
-) -> Result<Option<Option<Bytes>>, DuplexError> {
+) -> Result<(Option<Option<Bytes>>, bool), DuplexError> {
 	match (rxbuf, txbuf) {
 		(Some(rxbuf), Some(txbuf)) => {
-			match duplex(conn, mkbuffer(rxbuf, size), txbuf).await?.nread() {
+			let duplex_result = duplex(conn, mkbuffer(rxbuf, size), txbuf).await?;
+			let tx_eof = duplex_result.nwritten().map(|x| { x == 0 }).unwrap_or(false);
+			match duplex_result.nread() {
 				// at eof
-				Some(0) => Ok(Some(None)),
+				Some(0) => Ok((Some(None), tx_eof)),
 				// anything
 				Some(n) => {
 					debug_assert!(rxbuf.as_ref().unwrap().get_ref().len() == n);
-					Ok(Some(Some(rxbuf.take().unwrap().into_inner().freeze())))
+					Ok((Some(Some(rxbuf.take().unwrap().into_inner().freeze())), tx_eof))
 				},
 				// nothing, but no read completed, so not at eof
-				None => Ok(None)
+				None => Ok((None, tx_eof))
 			}
 		},
 		(Some(rxbuf), None) => {
 			// recv only
 			match conn.read_buf(mkbuffer(rxbuf, size)).await {
-				Ok(0) => Ok(Some(None)),
-				Ok(_) => Ok(Some(Some(rxbuf.take().unwrap().into_inner().freeze()))),
+				Ok(0) => Ok((Some(None), false)),
+				Ok(_) => Ok((Some(Some(rxbuf.take().unwrap().into_inner().freeze())), false)),
 				Err(e) => Err(DuplexError::Read(e)),
 			}
 		},
@@ -407,7 +409,7 @@ async fn may_duplex(
 				Ok(()) => (),
 				Err(e) => return Err(DuplexError::Write(e)),
 			}
-			Ok(None)
+			Ok((None, false))
 		},
 		(None, None) => {
 			// nothing to do?!
@@ -418,7 +420,7 @@ async fn may_duplex(
 			#[cfg(not(debug_assertions))]
 			{
 				tokio::time::sleep(Duration::new(60, 0)).await;
-				Ok(None)
+				Ok((None, false))
 			}
 		}
 	}
@@ -568,7 +570,7 @@ impl StreamWorker {
 						self.cfg.read_size,
 						txbuf,
 				), if rxbuf.is_some() || txbuf.is_some() => match result {
-					Ok(may_rxbuf) => {
+					Ok((may_rxbuf, tx_eof)) => {
 						// ensure that we advance the queue if we depleted the send buffer
 						if let Some(txfront) = self.txq.front() {
 							if !txfront.has_remaining() {
@@ -576,15 +578,24 @@ impl StreamWorker {
 								self.txq.pop_front();
 							}
 						}
+						let mut send_closed = false;
+						if tx_eof {
+							self.tx_mode = DirectionMode::Closed;
+							send_closed = true;
+						}
 						if let Some(rxbuf) = may_rxbuf {
 							// and also process the read buffer if any
 							match self.proc_read_buffer(rxbuf).await {
 								Ok(ReadResult::Closed) => {
 									self.rx_mode = DirectionMode::Closed;
+									send_closed = true;
 								},
 								Ok(ReadResult::Continue) => (),
 								Err(()) => return,
 							}
+						}
+						if send_closed {
+							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: None}).await;
 						}
 					},
 					Err(e) => {
