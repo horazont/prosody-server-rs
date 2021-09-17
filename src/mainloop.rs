@@ -23,7 +23,7 @@ use crate::config::CONFIG;
 lazy_static! {
 	static ref SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 	// we do not use a handle here
-	static ref LOG_FUNCTION: RwLock<Option<LuaRegistryKey>> = RwLock::new(None);
+	pub(crate) static ref LOG_FUNCTION: RwLock<Option<LuaRegistryKey>> = RwLock::new(None);
 }
 
 macro_rules! prosody_log {
@@ -44,6 +44,26 @@ macro_rules! prosody_log {
 				// to avoid "unused value" warnings
 				let _ = args;
 				let _ = $log_fn;
+			}
+		}
+	}
+}
+
+#[macro_export]
+macro_rules! prosody_log_g {
+	($lua:expr, $level:expr, $($argv:expr),+) => {
+		{
+			#[cfg(feature = "prosody-log")]
+			{
+				let logfn = crate::mainloop::LOG_FUNCTION.read().unwrap();
+				if let Some(logfn) = logfn.as_ref() {
+					let logfn = $lua.registry_value::<mlua::Function>(logfn).unwrap();
+					logfn.call::<_, ()>(($level, $($argv),+)).unwrap();
+				}
+			}
+			#[cfg(not(feature = "prosody-log"))]
+			{
+				let _ = ($lua, $level, $($argv),+);
 			}
 		}
 	}
@@ -226,6 +246,7 @@ pub(crate) fn set_log_function<'l>(lua: &'l Lua, f: Option<LuaFunction>) -> LuaR
 			f.call::<_, ()>(("warn", "Logging requested, but disabled at compile time. No further log messages will be emitted from the network backend!"))?;
 		}
 	}
+	prosody_log_g!(lua, "debug", "Network backend logging enabled.");
 	Ok(())
 }
 
