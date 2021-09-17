@@ -78,6 +78,11 @@ return {
 	-- MAIN LOOP FUNCTIONS
 	loop = server_impl.loop;
 	shutdown = server_impl.shutdown;
+	setquitting = function(quit)
+		if quit then
+			server_impl.shutdown();
+		end
+	end,
 
 	-- CONFIG FUNCTIONS
 	set_config = function(new_config)
