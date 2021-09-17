@@ -477,6 +477,14 @@ impl StreamWorker {
 		Ok(())
 	}
 
+	async fn force_flush(&mut self) -> io::Result<()> {
+		for mut buf in self.txq.drain(..) {
+			self.conn.write_all_buf(&mut buf).await?;
+		}
+		self.conn.flush().await?;
+		Ok(())
+	}
+
 	#[inline]
 	async fn proc_msg(&mut self, msg: ControlMessage) -> io::Result<MsgResult> {
 		match msg {
@@ -492,6 +500,7 @@ impl StreamWorker {
 				Ok(MsgResult::Continue)
 			},
 			ControlMessage::AcceptTls(ctx, recorder) => {
+				self.force_flush().await?;
 				let verify = self.conn.starttls_accept(ctx, &recorder, self.cfg.ssl_handshake_timeout).await?;
 				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
 					Ok(_) => {
