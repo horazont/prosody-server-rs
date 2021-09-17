@@ -535,7 +535,7 @@ impl StreamWorker {
 			select! {
 				result = timeout_at(read_deadline.into(), rx.read_buf(rxbuf)), if self.rx_mode.may() => match result {
 					Ok(Ok(0)) => {
-						debug_assert!(rxbuf.get_ref().has_remaining());
+						debug_assert!(rxbuf.get_ref().has_remaining_mut());
 						// at eof
 						MAIN_CHANNEL.fire_and_forget(Message::ReadClosed{handle: self.handle.clone()}).await;
 						self.rx_mode = DirectionMode::Closed;
