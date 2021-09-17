@@ -1,5 +1,7 @@
 use mlua::prelude::*;
 
+use std::os::raw::c_int;
+
 use tokio::select;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
@@ -39,20 +41,16 @@ impl Spawn for SignalWorker {
 
 
 /// CAVEAT: The signal handling stuff used by tokio has the issue that it does keep the old installed signal handler and invokes it after its own signal handler. That means that we cannot overwrite the SIGINT handler installed by lua just like that. That needs fixing later on.
-pub(crate) fn hook_signal<'l>(lua: &'l Lua, (kind, callback): (LuaString, LuaFunction)) -> LuaResult<Result<bool, String>> {
-	let kind = match kind.as_bytes() {
-		b"SIGALRM" => SignalKind::alarm(),
-		b"SIGHUP" => SignalKind::hangup(),
-		b"SIGINT" => SignalKind::interrupt(),
-		b"SIGQUIT" => SignalKind::quit(),
-		b"SIGTERM" => SignalKind::terminate(),
-		b"SIGUSR1" => SignalKind::user_defined1(),
-		b"SIGUSR2" => SignalKind::user_defined2(),
-		b"SIGWINCH" => SignalKind::window_change(),
-		other => match std::str::from_utf8(other) {
-			Ok(s) => return Ok(Err(format!("unknown or unsupported signal: {}", s))),
-			Err(_) => return Ok(Err(format!("invalid signal name (must be valid UTF-8)"))),
-		},
+pub(crate) fn hook_signal<'l>(lua: &'l Lua, (kind_raw, callback): (c_int, LuaFunction)) -> LuaResult<Result<bool, String>> {
+	let kind = match kind_raw {
+		14 => SignalKind::alarm(),
+		1 => SignalKind::hangup(),
+		2 => SignalKind::interrupt(),
+		3 => SignalKind::quit(),
+		15 => SignalKind::terminate(),
+		10 => SignalKind::user_defined1(),
+		12 => SignalKind::user_defined2(),
+		other => return Ok(Err(format!("unknown or unsupported signal: {}", other))),
 	};
 	let handle = lua.create_registry_value(callback)?.into();
 	with_runtime_lua! {

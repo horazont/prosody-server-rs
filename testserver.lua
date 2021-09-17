@@ -5,7 +5,7 @@ if backend_name == "rust" then
 end
 local impl = require("net.server_" .. backend_name);
 if impl.hook_signal then
-	for _, sigkind in pairs({"SIGINT", "SIGTERM"}) do
+	for _, sigkind in pairs({15, 2}) do
 		assert(impl.hook_signal(sigkind, function()
 			print(sigkind.." delivered, shutting down")
 			impl.shutdown();
