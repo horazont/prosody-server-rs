@@ -17,8 +17,11 @@ use tokio::io::{
 	AsyncWrite,
 	AsyncWriteExt,
 	ReadBuf,
+	ReadHalf,
+	WriteHalf,
 };
 use tokio::net::TcpStream;
+use tokio::net::tcp;
 use tokio::sync::mpsc;
 
 use tokio_rustls::{
@@ -57,34 +60,52 @@ pin_project! {
 		Broken{e: Option<Box<dyn std::error::Error + Send + 'static>>},
 		Plain{
 			#[pin]
-			sock: TcpStream,
+			rx: tcp::OwnedReadHalf,
+			#[pin]
+			tx: tcp::OwnedWriteHalf,
 		},
 		TlsServer{
 			#[pin]
-			sock: server::TlsStream<TcpStream>,
+			rx: ReadHalf<server::TlsStream<TcpStream>>,
+			#[pin]
+			tx: WriteHalf<server::TlsStream<TcpStream>>,
 		},
 		TlsClient{
 			#[pin]
-			sock: client::TlsStream<TcpStream>,
+			rx: ReadHalf<client::TlsStream<TcpStream>>,
+			#[pin]
+			tx: WriteHalf<client::TlsStream<TcpStream>>,
 		},
 	}
 }
 
 impl From<TcpStream> for Stream {
 	fn from(other: TcpStream) -> Self {
-		Self::Plain{sock: other}
+		let (rx, tx) = other.into_split();
+		Self::Plain{
+			rx,
+			tx,
+		}
 	}
 }
 
 impl From<server::TlsStream<TcpStream>> for Stream {
 	fn from(other: server::TlsStream<TcpStream>) -> Self {
-		Self::TlsServer{sock: other}
+		let (rx, tx) = tokio::io::split(other);
+		Self::TlsServer{
+			rx,
+			tx,
+		}
 	}
 }
 
 impl From<client::TlsStream<TcpStream>> for Stream {
 	fn from(other: client::TlsStream<TcpStream>) -> Self {
-		Self::TlsClient{sock: other}
+		let (rx, tx) = tokio::io::split(other);
+		Self::TlsClient{
+			rx,
+			tx,
+		}
 	}
 }
 
@@ -162,7 +183,8 @@ impl Stream {
 				result
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::Plain{sock} => {
+			Self::Plain{rx, tx} => {
+				let sock = rx.reunite(tx).unwrap();
 				self.starttls_client(sock, name, ctx.into(), recorder, handshake_timeout).await
 			},
 		}
@@ -178,7 +200,8 @@ impl Stream {
 				result
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::Plain{sock} => {
+			Self::Plain{rx, tx} => {
+				let sock = rx.reunite(tx).unwrap();
 				self.starttls_server(sock, ctx.into(), recorder, handshake_timeout).await
 			},
 		}
@@ -190,9 +213,9 @@ impl AsyncRead for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::Plain{sock, ..} => sock.poll_read(cx, buf),
-            StreamProj::TlsServer{sock, ..} => sock.poll_read(cx, buf),
-            StreamProj::TlsClient{sock, ..} => sock.poll_read(cx, buf),
+            StreamProj::Plain{rx, ..} => rx.poll_read(cx, buf),
+            StreamProj::TlsServer{rx, ..} => rx.poll_read(cx, buf),
+            StreamProj::TlsClient{rx, ..} => rx.poll_read(cx, buf),
 		}
 	}
 }
@@ -202,9 +225,9 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::Plain{sock, ..} => sock.poll_write(cx, buf),
-            StreamProj::TlsServer{sock, ..} => sock.poll_write(cx, buf),
-            StreamProj::TlsClient{sock, ..} => sock.poll_write(cx, buf),
+            StreamProj::Plain{tx, ..} => tx.poll_write(cx, buf),
+            StreamProj::TlsServer{tx, ..} => tx.poll_write(cx, buf),
+            StreamProj::TlsClient{tx, ..} => tx.poll_write(cx, buf),
         }
     }
 
@@ -212,9 +235,9 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::Plain{sock, ..} => sock.poll_write_vectored(cx, bufs),
-            StreamProj::TlsServer{sock, ..} => sock.poll_write_vectored(cx, bufs),
-            StreamProj::TlsClient{sock, ..} => sock.poll_write_vectored(cx, bufs),
+            StreamProj::Plain{tx, ..} => tx.poll_write_vectored(cx, bufs),
+            StreamProj::TlsServer{tx, ..} => tx.poll_write_vectored(cx, bufs),
+            StreamProj::TlsClient{tx, ..} => tx.poll_write_vectored(cx, bufs),
         }
     }
 
@@ -222,9 +245,9 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::Plain{sock, ..} => sock.poll_flush(cx),
-            StreamProj::TlsServer{sock, ..} => sock.poll_flush(cx),
-            StreamProj::TlsClient{sock, ..} => sock.poll_flush(cx),
+            StreamProj::Plain{tx, ..} => tx.poll_flush(cx),
+            StreamProj::TlsServer{tx, ..} => tx.poll_flush(cx),
+            StreamProj::TlsClient{tx, ..} => tx.poll_flush(cx),
         }
     }
 
@@ -232,18 +255,18 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::Plain{sock, ..} => sock.poll_shutdown(cx),
-            StreamProj::TlsServer{sock, ..} => sock.poll_shutdown(cx),
-            StreamProj::TlsClient{sock, ..} => sock.poll_shutdown(cx),
+            StreamProj::Plain{tx, ..} => tx.poll_shutdown(cx),
+            StreamProj::TlsServer{tx, ..} => tx.poll_shutdown(cx),
+            StreamProj::TlsClient{tx, ..} => tx.poll_shutdown(cx),
         }
     }
 
     fn is_write_vectored(&self) -> bool {
         match self {
             Self::Broken{..} => false,
-            Self::Plain{sock, ..} => sock.is_write_vectored(),
-            Self::TlsServer{sock, ..} => sock.is_write_vectored(),
-            Self::TlsClient{sock, ..} => sock.is_write_vectored(),
+            Self::Plain{tx, ..} => tx.is_write_vectored(),
+            Self::TlsServer{tx, ..} => tx.is_write_vectored(),
+            Self::TlsClient{tx, ..} => tx.is_write_vectored(),
         }
     }
 }
