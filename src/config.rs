@@ -92,7 +92,7 @@ impl Config {
 				b"ssl_handshake_timeout" => self.stream.ssl_handshake_timeout = strerror_ok!(to_duration(v)),
 				b"accept_retry_interval" => self.server.accept_retry_interval = strerror_ok!(to_duration(v)),
 				b"connect_timeout" => self.client.connect_timeout = strerror_ok!(to_duration(v)),
-				_ => (),
+				_ => prosody_log_g!(lua, "warn", "ignoring unsupported network config option: %q", k),
 			}
 		}
 		Ok(Ok(true))
