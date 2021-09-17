@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use lazy_static::lazy_static;
 
-use crate::strerror_ok;
+use crate::{strerror_ok, prosody_log_g};
 use crate::conversion::{
 	to_duration,
 };
@@ -113,5 +113,6 @@ pub(crate) fn reconfigure<'l>(lua: &'l Lua, options: LuaTable) -> LuaResult<Resu
 	strerror_ok!(new_config.update(lua, options)?);
 	let mut active_config = CONFIG.write().unwrap();
 	*active_config = new_config;
+	prosody_log_g!(lua, "debug", "Reconfigured: %s", format!("{:?}", *active_config));
 	Ok(Ok(true))
 }
