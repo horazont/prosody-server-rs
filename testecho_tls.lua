@@ -11,7 +11,7 @@ server.listen("0.0.0.0", 1234, {
 		sock:write(data);
 	end,
 	ondisconnect = function(sock, err)
-		print("read side closed, draining", err)
+		print("ondisconnect", err)
 		sock:close();
 	end,
 }, {
