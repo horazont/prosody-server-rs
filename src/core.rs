@@ -84,6 +84,18 @@ pub(crate) enum Message {
 		handle: LuaRegistryHandle,
 	},
 
+	ReadTimeout{
+		handle: LuaRegistryHandle,
+
+		/// Reply channel to decide what to do with the socket
+		///
+		/// If the channel is dropped or false is sent, the socket is
+		/// disconnected (a Disconnect message is sent appropriately).
+		/// Otherwise, the read deadline is advanced and the connection is
+		/// given another chance.
+		keepalive: oneshot::Sender<bool>,
+	},
+
 	Connect{
 		/// The registry key of the connection handle
 		handle: LuaRegistryHandle,

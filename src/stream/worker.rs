@@ -6,7 +6,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut, BufMut, Buf, buf::Limit};
 
@@ -23,6 +23,8 @@ use tokio::io::{
 use tokio::net::TcpStream;
 use tokio::net::tcp;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::time::timeout_at;
 
 use tokio_rustls::{
 	TlsAcceptor,
@@ -43,6 +45,7 @@ use crate::core::{
 };
 use crate::ioutil::{
 	iotimeout,
+	iodeadline,
 };
 use crate::verify;
 
@@ -486,8 +489,11 @@ impl StreamWorker {
 	}
 
 	async fn run(mut self) {
+		let mut read_deadline = Instant::now() + self.cfg.read_timeout;
+		let mut write_deadline = Instant::now() + self.cfg.send_timeout;
 		let mut txdummy = Bytes::new();
 		let mut rxdummy = BytesMut::new().limit(0);
+		let mut has_pending_write = false;
 		loop {
 			if !self.rx_mode.may_ever() && !self.tx_mode.may_ever() {
 				// if the connection can neither read nor write ever again, we only shutdown and then bail out
@@ -506,22 +512,35 @@ impl StreamWorker {
 			};
 
 			let txbuf = if self.tx_mode.may() {
-				self.txq.front_mut()
+				match self.txq.front_mut() {
+					Some(buf) => {
+						if !has_pending_write {
+							// this is the first time we're seeing a buffer since the last successful write -> we can advance the write deadline
+							write_deadline = Instant::now() + self.cfg.send_timeout;
+						}
+						has_pending_write = true;
+						buf
+					},
+					None => {
+						has_pending_write = false;
+						&mut txdummy
+					}
+				}
 			} else {
-				None
-			}.unwrap_or(&mut txdummy);
+				&mut txdummy
+			};
 
 			let (mut rx, mut tx) = self.conn.as_parts_mut();
 
 			select! {
-				result = rx.read_buf(rxbuf), if self.rx_mode.may() => match result {
-					Ok(0) => {
+				result = timeout_at(read_deadline.into(), rx.read_buf(rxbuf)), if self.rx_mode.may() => match result {
+					Ok(Ok(0)) => {
 						debug_assert!(rxbuf.get_ref().has_remaining());
 						// at eof
 						MAIN_CHANNEL.fire_and_forget(Message::ReadClosed{handle: self.handle.clone()}).await;
 						self.rx_mode = DirectionMode::Closed;
 					},
-					Ok(n) => {
+					Ok(Ok(n)) => {
 						drop(rxbuf);
 						let buf = self.buf.take().unwrap().into_inner().freeze();
 						debug_assert!(buf.len() == n);
@@ -533,14 +552,54 @@ impl StreamWorker {
 							// again, only during shutdown
 							Err(_) => return,
 						};
+						// successful read? -> advance deadline
+						read_deadline = Instant::now() + self.cfg.read_timeout;
 					},
-					Err(e) => {
+					Ok(Err(e)) => {
 						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
 						return;
 					},
+					// read timeout
+					Err(_) => {
+						let (reply_tx, reply_rx) = oneshot::channel();
+						// if it does not really get sent, the reply_rx will
+						// complete immediately because the tx got dropped and
+						// thus the connection will be closed because of the
+						// read timeout. perfect.
+						MAIN_CHANNEL.fire_and_forget(Message::ReadTimeout{
+							handle: self.handle.clone(),
+							keepalive: reply_tx,
+						}).await;
+
+						match reply_rx.await {
+							Ok(true) => {
+								// XXX: this prohibits changing the read timeout from the callback... Might want to return a duration instead.
+								read_deadline = Instant::now() + self.cfg.read_timeout;
+							},
+							Ok(false) | Err(_) => {
+								MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
+									handle: self.handle,
+									error: Some(Box::new(io::Error::new(
+										io::ErrorKind::TimedOut,
+										"read timeout",
+									))),
+								}).await;
+								// it's dead jim.
+								return;
+							},
+						}
+					},
 				},
-				result = tx.write_all_buf(txbuf), if self.tx_mode.may() => match result {
+				result = iodeadline(write_deadline, tx.write_all_buf(txbuf), "write timed out"), if self.tx_mode.may() && txbuf.has_remaining() => match result {
 					Ok(()) => {
+						// set to false because we cleared the buffer. if this
+						// is false, the write deadline will be advanced on
+						// the next write.
+						// advancing the deadline now would be incorrect
+						// because this might be the last thing to write for a
+						// long time: it needs to be advanced when the next
+						// buffer is selected for writing.
+						has_pending_write = false;
 						self.txq.pop_front();
 					},
 					Err(e) => {

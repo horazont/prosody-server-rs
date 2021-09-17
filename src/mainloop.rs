@@ -14,6 +14,7 @@ use super::core::{
 	MAIN_CHANNEL,
 	GC_FLAG,
 	WAKEUP,
+	call_listener,
 	may_call_listener,
 };
 use crate::stream;
@@ -169,6 +170,18 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			may_call_listener(&listeners, "onincoming", (handle, lua.create_string(&data)?))?;
+		},
+		Message::ReadTimeout{handle, keepalive} => {
+			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
+			let listeners = stream::get_listeners(&handle)?;
+			match call_listener::<_, bool>(&listeners, "onreadtimeout", ()) {
+				Err(e) => e.lua_error()?,
+				// not using let _ = here to explicitly only ignore a
+				// Result<> type, not a Future
+				Ok(should_keepalive) => match keepalive.send(should_keepalive) {
+					Ok(_) | Err(_) => (),
+				},
+			}
 		},
 		Message::ReadClosed{handle} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;

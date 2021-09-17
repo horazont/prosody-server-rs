@@ -6,14 +6,14 @@ use std::io;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pin_project_lite::pin_project;
 
 use bytes::{Buf, BufMut};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 
 
 /// Attempt an I/O operation, returning a timeout if it does not complete
@@ -25,6 +25,22 @@ use tokio::time::timeout;
 #[inline]
 pub(crate) async fn iotimeout<T, F: std::future::Future<Output = io::Result<T>>>(t: Duration, f: F, msg: &'static str) -> io::Result<T> {
 	match timeout(t, f).await {
+		Ok(r) => r,
+		Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, msg)),
+	}
+}
+
+
+/// Attempt an I/O operation, returning a timeout if it does not complete
+/// until the given instant.
+///
+/// This is mere a shim wrapper around [`tokio::time::timeout_at`] which
+/// converts the [`tokio::time::error::Elapsed`] into a [`std::io::Error`] of
+/// kind [`std::io::ErrorKind::TimedOut`], with the given `msg` as error
+/// message.
+#[inline]
+pub(crate) async fn iodeadline<T, F: std::future::Future<Output = io::Result<T>>>(t: Instant, f: F, msg: &'static str) -> io::Result<T> {
+	match timeout_at(t.into(), f).await {
 		Ok(r) => r,
 		Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, msg)),
 	}
