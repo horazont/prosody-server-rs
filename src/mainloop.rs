@@ -250,7 +250,7 @@ pub(crate) fn set_log_function<'l>(lua: &'l Lua, f: Option<LuaFunction>) -> LuaR
 	Ok(())
 }
 
-pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
+pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<String> {
 	/* what is the overall strategy here?
 
 	- We want to make use of concurrency because rust gives us that safely without much cost
@@ -320,7 +320,7 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<()> {
 				lua.expire_registry_values();
 			}
 		};
-		Ok(())
+		Ok("quitting".into())
 	})
 }
 
