@@ -85,6 +85,14 @@ impl fmt::Debug for TlsMode {
 }
 
 impl TlsMode {
+	fn set_config(&mut self, cfg: TlsAcceptor, recorder: Arc<verify::RecordingClientVerifier>) {
+		match self {
+			Self::Plain{tls_config} => *tls_config = Some((cfg, recorder)),
+			Self::DirectTls{tls_config} => *tls_config = (cfg, recorder),
+			Self::Multiplex{tls_config} => *tls_config = (cfg, recorder),
+		}
+	}
+
 	async fn accept(&self, handle: &'_ LuaRegistryHandle, conn: TcpStream, addr: SocketAddr, ssl_handshake_timeout: Duration) -> io::Result<Message> {
 		match self {
 			Self::Plain{..} => {
@@ -140,6 +148,7 @@ Messages to control the behaviour of listener sockets.
 enum ControlMessage {
 	/// Close the listener socket, not accepting any further connections.
 	Close,
+	UpdateTlsConfig(TlsAcceptor, Arc<verify::RecordingClientVerifier>),
 }
 
 struct ListenerWorker {
@@ -157,6 +166,7 @@ impl ListenerWorker {
 			select! {
 				msg = self.rx.recv() => match msg {
 					Some(ControlMessage::Close) => return,
+					Some(ControlMessage::UpdateTlsConfig(acceptor, recorder)) => self.tls_mode.set_config(acceptor, recorder),
 					None => return,
 				},
 				conn = self.sock.accept() => match conn {
@@ -217,6 +227,19 @@ impl LuaUserData for ListenerHandle {
 
 		methods.add_method("sslctx", |_, this: &Self, _: ()| -> LuaResult<Option<tls::TlsConfigHandle>> {
 			Ok(this.tls_config.as_ref().map(|x| { tls::TlsConfigHandle(x.clone()) }))
+		});
+
+		methods.add_method_mut("set_sslctx", |_, this: &mut Self, cfg: tls::TlsConfigHandle| -> LuaResult<()> {
+			let (acceptor, recorder): (TlsAcceptor, _) = match cfg.as_ref() {
+				tls::TlsConfig::Server{cfg, recorder, ..} => (cfg.clone().into(), recorder.clone()),
+				tls::TlsConfig::Client{..} => return Err(opaque("attempt to set a client context for a server socket").into()),
+			};
+			match this.tx.send(ControlMessage::UpdateTlsConfig(acceptor, recorder)) {
+				Ok(()) => (),
+				Err(_) => return Err(opaque("attempt to change tls settings on closed socked").into())
+			};
+			this.tls_config = Some(cfg.0.clone());
+			Ok(())
 		});
 
 		methods.add_method("close", |_, this: &Self, _: ()| -> LuaResult<()> {
