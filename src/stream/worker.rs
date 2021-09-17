@@ -544,11 +544,6 @@ impl StreamWorker {
 		}
 	}
 
-	async fn option_write<T: AsyncWrite + Unpin>(mut tx: T, buf: Option<&mut Bytes>) -> io::Result<()> {
-		let buf = buf.unwrap();
-		tx.write_all_buf(buf).await
-	}
-
 	async fn run(mut self) {
 		loop {
 			if !self.rx_mode.may_ever() && !self.tx_mode.may_ever() {
