@@ -99,8 +99,8 @@ pub(crate) fn wrapclient<'l>(
 		(Some(tls::TlsConfig::Client{..}), None) => {
 			return Ok(Err(format!("client-side TLS context given, but no target server name")))
 		},
-		(Some(tls::TlsConfig::Server{cfg, ..}), _) => {
-			PreTlsConfig::ServerSide(cfg.clone())
+		(Some(tls::TlsConfig::Server{cfg, recorder, ..}), _) => {
+			PreTlsConfig::ServerSide(cfg.clone(), recorder.clone())
 		},
 		(None, _) => PreTlsConfig::None,
 	};

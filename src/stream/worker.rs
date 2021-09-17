@@ -114,11 +114,14 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, handshake_timeout: Duration) -> io::Result<()> {
-		match iotimeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await {
+	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
+		let (verify, sock) = recorder.scope(async move {
+			iotimeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await
+		}).await;
+		match sock {
 			Ok(sock) => {
 				*self = sock.into();
-				Ok(())
+				Ok(verify)
 			},
 			Err(e) => {
 				// kaboom, break the thing
@@ -165,7 +168,7 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>, handshake_timeout: Duration) -> io::Result<()> {
+	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
 		let mut tmp = Stream::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -176,7 +179,7 @@ impl Stream {
 			},
 			Self::TlsServer{..} | Self::TlsClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
 			Self::Plain{sock} => {
-				self.starttls_server(sock, ctx.into(), handshake_timeout).await
+				self.starttls_server(sock, ctx.into(), recorder, handshake_timeout).await
 			},
 		}
 	}
@@ -486,9 +489,9 @@ impl StreamWorker {
 				};
 				Ok(MsgResult::Continue)
 			},
-			ControlMessage::AcceptTls(ctx) => {
-				self.conn.starttls_accept(ctx, self.cfg.ssl_handshake_timeout).await?;
-				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify: verify::VerificationRecord::Unverified}).await {
+			ControlMessage::AcceptTls(ctx, recorder) => {
+				let verify = self.conn.starttls_accept(ctx, &recorder, self.cfg.ssl_handshake_timeout).await?;
+				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();
 						self.tx_mode = self.tx_mode.unblock();

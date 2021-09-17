@@ -63,6 +63,8 @@ pub(crate) enum Message {
 		stream: ServerTlsStream<TcpStream>,
 		/// The remote address of the accepted stream
 		addr: SocketAddr,
+		/// Verification information about the new connection
+		verify: verify::VerificationRecord,
 	},
 
 	/// TLS was started on an existing connection

@@ -25,6 +25,10 @@ use crate::tls;
 use crate::config;
 use crate::config::CONFIG;
 use crate::ioutil::iotimeout;
+use crate::verify;
+
+
+type ServerTlsCfg = (TlsAcceptor, Arc<verify::RecordingClientVerifier>);
 
 /**
 Control if and how TLS is accepted on listener sockets.
@@ -33,17 +37,17 @@ Control if and how TLS is accepted on listener sockets.
 enum TlsMode {
 	/// TLS is never established, but if the `tls_config` is given, it will be forwarded to any created connections for later use with STARTTLS.
 	Plain{
-		tls_config: Option<TlsAcceptor>,
+		tls_config: Option<ServerTlsCfg>,
 	},
 	/// TLS will always attempted and if it fails, the Lua side will never see the connection.
 	DirectTls{
-		tls_config: TlsAcceptor,
+		tls_config: ServerTlsCfg,
 	},
 	/// TLS is established if the first byte on the connection is 0x16 (the TLS handshake start). Otherwise, the connection is handled as plaintext connection.
 	///
 	/// In case of a plaintext connection, the TLS config is forwarded to the connection socket for later use with STARTTLS.
 	Multiplex{
-		tls_config: TlsAcceptor,
+		tls_config: ServerTlsCfg,
 	},
 }
 
@@ -90,24 +94,30 @@ impl TlsMode {
 					addr,
 				})
 			},
-			Self::DirectTls{tls_config} => {
-				let conn = iotimeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
+			Self::DirectTls{tls_config: (acceptor, recorder)} => {
+				let (verify, conn) = recorder.scope(async move {
+					iotimeout(ssl_handshake_timeout, acceptor.accept(conn), "TLS handshake timed out").await
+				}).await;
 				Ok(Message::TlsAccept{
 					handle: handle.clone(),
-					stream: conn,
+					stream: conn?,
 					addr,
+					verify,
 				})
 			},
-			Self::Multiplex{tls_config} => {
+			Self::Multiplex{tls_config: (acceptor, recorder)} => {
 				let mut buf = [0u8; 1];
 				match conn.peek(&mut buf).await? {
 					// first byte of the TLS handshake
 					1 if buf[0] == 0x16 => {
-						let conn = iotimeout(ssl_handshake_timeout, tls_config.accept(conn), "TLS handshake timed out").await?;
+						let (verify, conn) = recorder.scope(async move {
+							iotimeout(ssl_handshake_timeout, acceptor.accept(conn), "TLS handshake timed out").await
+						}).await;
 						Ok(Message::TlsAccept{
 							handle: handle.clone(),
-							stream: conn,
+							stream: conn?,
 							addr,
+							verify,
 						})
 					},
 					// if no byte is read or if it doesn't match -> assume plaintext
@@ -282,18 +292,18 @@ pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValu
 			};
 
 			let tls_config = match outer_tls_config.as_ref().map(|x| { x.as_ref() }) {
-				Some(tls::TlsConfig::Server{ref cfg, ..}) => Some(cfg.clone()),
+				Some(tls::TlsConfig::Server{ref cfg, ref recorder, ..}) => Some((cfg.clone(), recorder.clone())),
 				Some(_) => return Err(opaque("attempt to use non-server config with server socket").into()),
 				None => None,
 			};
 
 			(outer_tls_config.map(|x| { x.0 }), match tls_config {
-				Some(tls_config) => match config.get::<_, Option<bool>>("tls_direct")?.unwrap_or(false) {
+				Some((tls_config, recorder)) => match config.get::<_, Option<bool>>("tls_direct")?.unwrap_or(false) {
 					true => match config.get::<_, Option<bool>>("tls_auto")?.unwrap_or(false) {
-						true => TlsMode::Multiplex{tls_config: tls_config.into()},
-						false => TlsMode::DirectTls{tls_config: tls_config.into()},
+						true => TlsMode::Multiplex{tls_config: (tls_config.into(), recorder)},
+						false => TlsMode::DirectTls{tls_config: (tls_config.into(), recorder)},
 					},
-					false => TlsMode::Plain{tls_config: Some(tls_config.into())},
+					false => TlsMode::Plain{tls_config: Some((tls_config.into(), recorder))},
 				},
 				None => TlsMode::Plain{tls_config: None},
 			})

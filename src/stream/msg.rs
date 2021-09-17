@@ -20,6 +20,6 @@ pub(super) enum ControlMessage {
 	UnblockWrites,
 	Write(Bytes),
 	SetOption(SocketOption),
-	AcceptTls(Arc<rustls::ServerConfig>),
+	AcceptTls(Arc<rustls::ServerConfig>, Arc<verify::RecordingClientVerifier>),
 	ConnectTls(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>),
 }

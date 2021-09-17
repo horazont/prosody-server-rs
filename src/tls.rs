@@ -74,6 +74,7 @@ pub(crate) enum TlsConfig {
 	Server{
 		cfg: Arc<rustls::ServerConfig>,
 		resolver: Arc<DefaultingSNIResolver>,
+		recorder: Arc<verify::RecordingClientVerifier>,
 	},
 	Client{
 		cfg: Arc<rustls::ClientConfig>,
@@ -220,21 +221,73 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	}
 	let resolver = Arc::new(resolver);
 
+	let mut root_store = rustls::RootCertStore::empty();
+	let mut strict_verify = true;
 	let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
 	// TODO: handle verify in some way
 	for kv in config.pairs::<LuaString, LuaValue>() {
-		let (k, _v) = match kv {
+		let (k, v) = match kv {
 			Ok(kv) => kv,
 			// skip invalid keys
 			Err(_) => continue,
 		};
-		let _k = match k.to_str() {
+		let k = match k.to_str() {
 			Ok(k) => k,
 			// skip invalid keys
 			Err(_) => continue,
 		};
-		// TODO...
+		match k {
+			"cafile" => {
+				let fname = strerror_ok!(borrow_named_str(k, &v));
+				let f = strerror_ok!(File::open(fname));
+				let _ = root_store.add_pem_file(&mut io::BufReader::new(f));
+			},
+			"capath" => {
+				let dirname = strerror_ok!(borrow_named_str(k, &v));
+				for entry in strerror_ok!(read_dir(dirname)) {
+					let entry = match entry {
+						Ok(entry) => entry,
+						Err(_) => continue,
+					};
+					let f = strerror_ok!(File::open(entry.path()));
+					let _ = root_store.add_pem_file(&mut io::BufReader::new(f));
+				}
+			},
+			"verify" => {
+				let vs = match v {
+					LuaValue::Table(_) => {
+						strerror_ok!(Vec::<String>::from_lua(v, lua))
+					},
+					LuaValue::String(_) => {
+						let value = strerror_ok!(borrow_named_str(k, &v));
+						vec![value.into()]
+					},
+					_ => return Ok(Err(format!("invalid value for {:?} option (expected str or table)", k))),
+				};
+				for v in vs {
+					match v.as_str() {
+						"none" => {
+							strict_verify = false;
+						},
+						"peer" => {
+							strict_verify = true;
+						},
+						"client_once" => continue,
+						// no idea what this one is supposed to do?!
+						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v)))
+					};
+				}
+			},
+			// ignore unknown keys(?)
+			&_ => continue,
+		}
 	}
+
+	let verifier = rustls::AllowAnyAnonymousOrAuthenticatedClient::new(root_store);
+	let recorder = verify::RecordingClientVerifier::new(verifier, strict_verify);
+	let recorder = Arc::new(recorder);
+
+	cfg.set_client_certificate_verifier(recorder.clone());
 	cfg.versions = vec![rustls::ProtocolVersion::TLSv1_2, rustls::ProtocolVersion::TLSv1_3];
 	cfg.cert_resolver = resolver.clone();
 	cfg.ignore_client_order = true;
@@ -242,6 +295,7 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Server{
 		cfg: Arc::new(cfg),
 		resolver,
+		recorder,
 	})))?))
 }
 

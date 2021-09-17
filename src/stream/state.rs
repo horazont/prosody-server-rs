@@ -40,6 +40,12 @@ pub(crate) enum PreTlsConfig {
 	ServerSide(
 		/// The rustls server configuration.
 		Arc<rustls::ServerConfig>,
+
+		/// A handle on the verification recorder for use during the
+		/// handshake.
+		///
+		/// This is used to provide verification information to Lua.
+		Arc<verify::RecordingClientVerifier>,
 	),
 }
 
@@ -47,8 +53,8 @@ impl fmt::Debug for PreTlsConfig {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
 			Self::None => write!(f, "PreTlsConfig::None"),
-			Self::ClientSide(name, _, _) => write!(f, "PreTlsConfig::ClientSide({:?})", name),
-			Self::ServerSide(_) => write!(f, "PreTlsConfig::ServerSide(..)"),
+			Self::ClientSide(name, ..) => write!(f, "PreTlsConfig::ClientSide({:?})", name),
+			Self::ServerSide(..) => write!(f, "PreTlsConfig::ServerSide(..)"),
 		}
 	}
 }
@@ -239,17 +245,17 @@ impl StreamState {
 						Some(v) => ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()),
 						None => return Err((this, StateTransitionError::PeerNameRequired)),
 					},
-					Some(tls::TlsConfig::Server{cfg, ..}) => ControlMessage::AcceptTls(cfg.clone()),
+					Some(tls::TlsConfig::Server{cfg, recorder, ..}) => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
 					None => return Err((this, StateTransitionError::ContextRequired)),
 				},
-				PreTlsConfig::ServerSide(cfg) => match given_config {
+				PreTlsConfig::ServerSide(cfg, recorder) => match given_config {
 					// We can only *accept* connections based on the given config, as we lack a target hostname
 					Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
 						Some(v) => ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()),
 						None => return Err((this, StateTransitionError::PeerNameRequired)),
 					},
-					Some(tls::TlsConfig::Server{cfg, ..}) => ControlMessage::AcceptTls(cfg.clone()),
-					None => ControlMessage::AcceptTls(cfg.clone()),
+					Some(tls::TlsConfig::Server{cfg, recorder, ..}) => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
+					None => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
 				},
 				PreTlsConfig::ClientSide(name, cfg, recorder) => {
 					let name = match given_servername {
@@ -259,7 +265,7 @@ impl StreamState {
 					match given_config {
 						// We can only *accept* connections based on the given config, as we lack a target hostname
 						Some(tls::TlsConfig::Client{cfg, recorder}) => ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone()),
-						Some(tls::TlsConfig::Server{cfg, ..}) => ControlMessage::AcceptTls(cfg.clone()),
+						Some(tls::TlsConfig::Server{cfg, recorder, ..}) => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
 						None => ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone()),
 					}
 				},

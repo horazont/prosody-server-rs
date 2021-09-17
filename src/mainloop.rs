@@ -17,7 +17,6 @@ use super::core::{
 	may_call_listener,
 };
 use crate::stream;
-use crate::verify;
 use crate::config::CONFIG;
 
 
@@ -125,11 +124,11 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = stream::StreamHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr), cfg)?;
 			call_connect(&listeners, handle)?;
 		},
-		Message::TlsAccept{handle, stream, addr} => {
+		Message::TlsAccept{handle, stream, addr, verify} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = stream::StreamHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify::VerificationRecord::Unverified, cfg)?;
+			let handle = stream::StreamHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), verify, cfg)?;
 			call_starttls(&listeners, handle.clone())?;
 			call_tls_confirm(&listeners, handle.clone())?;
 			call_connect(&listeners, handle.clone())?;
