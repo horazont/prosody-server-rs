@@ -32,6 +32,20 @@ fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
 		nix::sys::signal::SigHandler::SigIgn,
 	).unwrap() };
 
+	// And we do another evil bit… Lua hooks SIGTERM and others... And that's
+	// a total buzzkill because the signal handling library used by tokio
+	// tries to be smart and will call those signal handlers. They will,
+	// however, inject a fault into the lua state, which we really can't have,
+	// so we remove those now. Sorry.
+	unsafe { nix::sys::signal::signal(
+		nix::sys::signal::Signal::SIGTERM,
+		nix::sys::signal::SigHandler::SigDfl,
+	).unwrap() };
+	unsafe { nix::sys::signal::signal(
+		nix::sys::signal::Signal::SIGINT,
+		nix::sys::signal::SigHandler::SigDfl,
+	).unwrap() };
+
 	let exports = lua.create_table()?;
 
 	let server = lua.create_table()?;
