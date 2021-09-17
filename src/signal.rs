@@ -3,7 +3,7 @@ use mlua::prelude::*;
 use tokio::select;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
-use crate::with_runtime_lua;
+use crate::{prosody_log_g, with_runtime_lua};
 use crate::core::{Message, LuaRegistryHandle, Spawn, MAIN_CHANNEL};
 
 
@@ -61,6 +61,8 @@ pub(crate) fn hook_signal<'l>(lua: &'l Lua, (kind, callback): (LuaString, LuaFun
 			handle,
 			signal: stream,
 		}.spawn();
-		Ok(Ok(true))
+		()
 	}
+	prosody_log_g!(lua, "debug", "registered signal handler for %s", kind_raw);
+	Ok(Ok(true))
 }
