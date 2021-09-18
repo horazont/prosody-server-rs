@@ -1,3 +1,6 @@
+/*!
+# Rustls wrappers and configuration parsers
+*/
 use mlua::prelude::*;
 
 use std::cell::Ref;

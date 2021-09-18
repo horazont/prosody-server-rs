@@ -1,5 +1,5 @@
-/**
-# Timers
+/*!
+# Delayed callbacks from the event loop into lua code
 
 Provides simple timer functionality. Timers are represented on the Lua side via their [`TimerHandle`] object. This object has `:close()` and `:reschedule(t)` methods which can be used to close the timer or change the time at which it fires next.
 

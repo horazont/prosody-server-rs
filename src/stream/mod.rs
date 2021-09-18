@@ -1,5 +1,5 @@
 /*!
-# Stream connection implementation
+# (TCP) stream connections, inbound and outbound
 
 This module provides a handle/worker pair for a stream-based network
 connection. In general, this will be a TCP connection, but it may also be a
@@ -8,8 +8,6 @@ used.
 
 Related modules:
 
-- [`crate::conn`] which handles creating stream connections either via a
-  connect call from Lua or by wrapping existing sockets.
 - [`crate::server`] which handles listening sockets.
 */
 

@@ -1,3 +1,6 @@
+/*!
+# Conversion helpers from/to Lua
+*/
 use mlua::prelude::*;
 
 use std::convert::TryInto;
@@ -43,6 +46,12 @@ impl From<OpaqueError> for LuaError {
 }
 
 
+/**
+Convert a `Result<T, E>` into a `Result<T, String>` and return any error
+immediately (stringified)
+
+Requires that `E` implements `Display`.
+*/
 #[macro_export]
 macro_rules! strerror {
 	($e:expr) => {
@@ -53,7 +62,12 @@ macro_rules! strerror {
 	}
 }
 
+/**
+Convert a `Result<T, E>` into a `Result<T, String>` and return any error
+immediately (stringified), wrapped in an `Ok()`.
 
+Requires that `E` implements `Display`.
+*/
 #[macro_export]
 macro_rules! strerror_ok {
 	($e:expr) => {

@@ -1,3 +1,6 @@
+/*!
+# Utilites for I/O via Tokio
+*/
 use std::error;
 use std::fmt;
 use std::future::Future;

@@ -1,3 +1,6 @@
+/*!
+# Recording of verification results during TLS handshake
+*/
 use std::cell::RefCell;
 use std::future::Future;
 use std::sync::Arc;

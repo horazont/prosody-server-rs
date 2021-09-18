@@ -1,3 +1,6 @@
+/*!
+# Watches on arbitrary file descriptors for arbitrary events
+*/
 use mlua::prelude::*;
 
 use std::os::unix::io::RawFd;

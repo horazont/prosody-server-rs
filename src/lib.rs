@@ -1,8 +1,54 @@
+#![allow(rustdoc::private_intra_doc_links)]
+/*!
+# Network backend for Prosody
+
+Writen in rust.
+
+## Features
+
+* Multi-threaded network I/O and TLS operations
+* Drop-in replacement (given some patches to prosody which will hopefully be
+  mainlined)
+* Support for direct TLS, STARTTLS and plain TCP connections.
+* Support for client and server certificate validation using a standard or
+  custom trust store.
+
+## Non-features
+
+* Full compatibility with OpenSSL / LuaSec options
+
+## Architecture
+
+This network backend bases on tokio and uses a multi-threaded runtime. In
+order to be safe to use with single-threaded prosody, a message passing
+architecture is employed.
+
+Each event source (network socket, timer, signal, watched fd etc.) gets a
+worker (which is a tokio task), a handle (lua userdata) and a message queue
+which allows the handle to send instructions to the worker.
+
+(In reality, not all primitives have a queue, as not all of them have ways to
+instruct the worker.)
+
+The worker holds a strong reference to the handle. This is required because
+the handle is where the listeners are attached and the handle needs to be
+passed to the listeners on each event. This is achieved using the Lua registry
+API exposed by mlua. When the worker exits, that handle is dropped (and a
+registry garbage collection is eventually triggered to run in the main loop).
+
+In order to call into lua from the workers, a bounded global message queue
+exists. The main loop function polls that message queue and acts on the
+messages, generally invoking listeners or transforming passed objects into lua
+handles (on tcp accepts).
+
+A very simple and well-documented part of this crate is the [`timer`] module.
+The most complex part is the [`stream`] module, which handles TCP stream
+connections, including starttls transitions and full-duplex I/O with timeouts.
+*/
 use mlua::prelude::*;
 
 pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-//mod backend;
 mod conversion;
 mod core;
 mod mainloop;
@@ -17,6 +63,9 @@ mod cert;
 mod config;
 pub mod ioutil;
 
+/**
+Entrypoint for for loading this crate as a Lua module.
+*/
 #[mlua::lua_module]
 fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
 	// Nothing expects the ~spanish inquisition~ SIGPIPE, so we mask it here.

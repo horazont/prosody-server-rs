@@ -1,3 +1,6 @@
+/*!
+# Event loop / network I/O configuration
+*/
 use mlua::prelude::*;
 
 use std::sync::RwLock;

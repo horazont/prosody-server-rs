@@ -1,3 +1,6 @@
+/*!
+# Exposure of X.509 certificates to Lua
+*/
 use mlua::prelude::*;
 
 use std::borrow::Cow;

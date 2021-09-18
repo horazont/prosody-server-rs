@@ -1,3 +1,6 @@
+/*!
+# Actual mainloop as invoked from Prosody on startup
+*/
 use mlua::prelude::*;
 
 use std::sync::{Arc, RwLock};
@@ -50,6 +53,30 @@ macro_rules! prosody_log {
 	}
 }
 
+/**
+Log a message via prosody.
+
+This macro is a no-op if the crate is built without the `prosody-log` feature
+(enabled by default) or if no logging function has been set at startup (done
+by default by the enclosed `server_rust.lua`).
+
+Otherwise, it dereferences the registry key under which the logging function
+was saved and attempts to log a message.
+
+Usage:
+
+```ignore
+// let lua: &Lua = ...
+prosody_log_g!(lua, "debug", "Hello World from %s", "someone");
+```
+
+*Note:* The message is string-interpolated by prosody according to its rules.
+It is preferable to rely on *that* string interpolation instead of using
+`format!`, because it integrates more smoothly with advanced logging sinks
+for Prosody.
+
+The downside is that all arguments to this macro need to be ToLua.
+*/
 #[macro_export]
 macro_rules! prosody_log_g {
 	($lua:expr, $level:expr, $($argv:expr),+) => {

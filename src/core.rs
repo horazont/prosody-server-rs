@@ -1,3 +1,6 @@
+/*!
+# Supporting infrastructure such as the global message queue
+*/
 use mlua::prelude::*;
 
 use std::borrow::Cow;
@@ -322,6 +325,15 @@ pub(crate) fn may_call_listener<'l, 'n, P: ToLuaMulti<'l>>(listeners: &'l LuaTab
 	}
 }
 
+/**
+Enter the Tokio runtime.
+
+This must be used in all Lua functions which interact with the runtime, for
+instance by creating TcpStream instances. Otherwise those functions will
+panic.
+
+If the runtime cannot be entered, a Lua error is returned.
+*/
 #[macro_export]
 macro_rules! with_runtime_lua {
 	($($b:stmt);*) => {
@@ -334,6 +346,21 @@ macro_rules! with_runtime_lua {
 	}
 }
 
+/**
+Send a log message via the main loop.
+
+This macro is a no-op if the crate is built without the `prosody-log` feature
+(enabled by default).
+
+Otherwise, a request to log a message is sent to the main loop. See the
+[`prosody_log_g`] macro for more details on the level and message arguments.
+No lua instance is required for this macro as the actual writing takes place
+in the event loop.
+
+*Note:* This macro can only be used within an `async` context. It requires
+polling on a free slot in the global message queue and generally has a very
+high overhead. Avoid calling this in places which may be invoked frequently.
+*/
 #[macro_export]
 macro_rules! send_log {
 	($level:expr, $msg:literal, $error:expr) => {

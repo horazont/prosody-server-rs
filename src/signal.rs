@@ -1,3 +1,6 @@
+/*!
+# POSIX signal handlers
+*/
 use mlua::prelude::*;
 
 use std::os::raw::c_int;

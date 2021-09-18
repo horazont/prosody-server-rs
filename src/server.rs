@@ -1,5 +1,5 @@
-/**
-# Listener sockets for stream connections
+/*!
+# (TCP) listening server
 
 Listener sockets for stream connections are generally TCP sockets. They may additionally have a TLS context associated to also transition to TLS right away or to forward the context to connections for later use with STARTTLS.
 */
