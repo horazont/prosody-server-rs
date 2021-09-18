@@ -538,11 +538,22 @@ impl StreamWorker {
 						debug_assert!(rxbuf.get_ref().has_remaining_mut());
 						// at eof
 						MAIN_CHANNEL.fire_and_forget(Message::ReadClosed{handle: self.handle.clone()}).await;
+						self.buf = None;
 						self.rx_mode = DirectionMode::Closed;
 					},
 					Ok(Ok(n)) => {
-						drop(rxbuf);
-						let buf = self.buf.take().unwrap().into_inner().freeze();
+						// This is very efficient especially on small reads:
+						// instead of resizing the buffer, we keep the existing
+						// buffer to avoid fragmentation, at least a little.
+						let buf = {
+							let inner = rxbuf.get_mut();
+							let buf = Bytes::copy_from_slice(&inner[..]);
+							inner.truncate(0);
+							inner.reserve(self.cfg.read_size);
+							drop(inner);
+							rxbuf.set_limit(self.cfg.read_size);
+							buf
+						};
 						debug_assert!(buf.len() == n);
 						match MAIN_CHANNEL.send(Message::Incoming{
 							handle: self.handle.clone(),
