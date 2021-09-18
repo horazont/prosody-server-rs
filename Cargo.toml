@@ -10,7 +10,7 @@ name = "rserver"
 crate-type = ["cdylib"]
 
 [dependencies]
-mlua = { version = "^0.6", features = ["async", "lua52", "vendored", "module"] }
+mlua = { version = "^0.6", features = ["async", "vendored", "module"] }
 tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 lazy_static = { version ="^1.4" }
 # we need the dangerous stuff because XMPP has its own ways to verify a connection, so we mustn't rely on PKI verification alone.
@@ -27,4 +27,8 @@ x509-parser = { version = "^0.11" }
 
 [features]
 prosody-log = []
-default = ["prosody-log"]
+lua51 = ["mlua/lua51"]
+lua52 = ["mlua/lua52"]
+lua53 = ["mlua/lua53"]
+lua54 = ["mlua/lua54"]
+default = ["prosody-log", "lua52"]
