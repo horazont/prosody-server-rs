@@ -201,7 +201,7 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 		Message::ReadTimeout{handle, keepalive} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
-			match call_listener::<_, bool>(&listeners, "onreadtimeout", ()) {
+			match call_listener::<_, bool>(&listeners, "onreadtimeout", handle) {
 				Err(e) => e.lua_error()?,
 				// not using let _ = here to explicitly only ignore a
 				// Result<> type, not a Future
