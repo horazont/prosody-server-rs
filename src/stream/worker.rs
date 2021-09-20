@@ -423,18 +423,40 @@ impl StreamWorker {
 
 	async fn force_flush(&mut self) -> io::Result<()> {
 		for mut buf in self.txq.drain(..) {
-			self.conn.write_all_buf(&mut buf).await?;
+			iotimeout(self.cfg.send_timeout, self.conn.write_all_buf(&mut buf), "write timed out").await?;
 		}
-		self.conn.flush().await?;
+		iotimeout(self.cfg.send_timeout, self.conn.flush(), "flush timed out").await?;
 		Ok(())
+	}
+
+	async fn clean_shutdown(&mut self) -> io::Result<()> {
+		match self.force_flush().await {
+			// ignore any errors here, we're doing a shutdown. this is best
+			// effort.
+			Ok(..) | Err(..) => (),
+		};
+		self.conn.shutdown().await
+	}
+
+	async fn clean_shutdown_with_msg(&mut self, err: Option<Box<dyn std::error::Error + Send + 'static>>) {
+		let shutdown_err = self.clean_shutdown().await.err();
+		let err = err.or(match shutdown_err {
+			Some(x) => Some(Box::new(x)),
+			None => None,
+		});
+		MAIN_CHANNEL.fire_and_forget(
+			Message::Disconnect{
+				handle: self.handle.clone(),
+				error: err,
+			},
+		).await;
 	}
 
 	#[inline]
 	async fn proc_msg(&mut self, msg: ControlMessage) -> io::Result<MsgResult> {
 		match msg {
 			ControlMessage::Close => {
-				self.conn.shutdown().await?;
-				MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: None}).await;
+				self.clean_shutdown_with_msg(None).await;
 				Ok(MsgResult::Exit)
 			},
 			ControlMessage::SetOption(option) => {
@@ -537,9 +559,11 @@ impl StreamWorker {
 					Ok(Ok(0)) => {
 						debug_assert!(rxbuf.get_ref().has_remaining_mut());
 						// at eof
-						MAIN_CHANNEL.fire_and_forget(Message::ReadClosed{handle: self.handle.clone()}).await;
 						self.buf = None;
 						self.rx_mode = DirectionMode::Closed;
+						// we flush our current buffers and then we exit
+						self.clean_shutdown_with_msg(None).await;
+						return;
 					},
 					Ok(Ok(n)) => {
 						// This is very efficient especially on small reads:

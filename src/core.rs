@@ -83,10 +83,6 @@ pub(crate) enum Message {
 		data: Bytes,
 	},
 
-	ReadClosed{
-		handle: LuaRegistryHandle,
-	},
-
 	ReadTimeout{
 		handle: LuaRegistryHandle,
 

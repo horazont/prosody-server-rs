@@ -210,17 +210,6 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 				},
 			}
 		},
-		Message::ReadClosed{handle} => {
-			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
-			let listeners = stream::get_listeners(&handle)?;
-			let should_call = {
-				let mut handle = handle.borrow_mut::<stream::StreamHandle>()?;
-				check_transition(handle.state_mut().disconnect())?
-			};
-			if should_call {
-				call_disconnect(&listeners, handle, None)?;
-			}
-		},
 		Message::Disconnect{handle, error} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
