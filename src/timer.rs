@@ -144,6 +144,23 @@ impl TimerWorker {
 	}
 }
 
+/**
+Add a timed task from Lua.
+
+This schedules the given function to execute after the given amount of
+seconds. Due to the architecture (see [`crate`])
+
+Lua use:
+
+```lua
+local server = require "rserver";
+local handle = rserver.add_task(10, function()
+	print("I got called!");
+end);
+```
+
+See [`TimerHandle`] for the lua methods offered on `handle`.
+*/
 pub(crate) fn add_task<'l>(lua: &'l Lua, (timeout, func): (f64, LuaFunction)) -> LuaResult<LuaAnyUserData<'l>> {
 	let timeout = std::time::Duration::from_secs_f64(timeout);
 	with_runtime_lua!{
