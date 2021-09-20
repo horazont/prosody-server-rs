@@ -256,7 +256,7 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 					let _ = root_store.add_pem_file(&mut io::BufReader::new(f));
 				}
 			},
-			"verify" => {
+			"verifyext" => {
 				let vs = match v {
 					LuaValue::Table(_) => {
 						strerror_ok!(Vec::<String>::from_lua(v, lua))
@@ -269,13 +269,10 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 				};
 				for v in vs {
 					match v.as_str() {
-						"none" => {
+						"lsec_continue" => {
 							strict_verify = false;
 						},
-						"peer" => {
-							strict_verify = true;
-						},
-						"client_once" => continue,
+						"lsec_ignore_purpose" => continue,
 						// no idea what this one is supposed to do?!
 						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v)))
 					};
@@ -340,7 +337,7 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 					let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
 				}
 			},
-			"verify" => {
+			"verifyext" => {
 				let vs = match v {
 					LuaValue::Table(_) => {
 						strerror_ok!(Vec::<String>::from_lua(v, lua))
@@ -353,13 +350,10 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 				};
 				for v in vs {
 					match v.as_str() {
-						"none" => {
+						"lsec_continue" => {
 							recorder.strict = false;
 						},
-						"peer" => {
-							recorder.strict = true;
-						},
-						"client_once" => continue,
+						"lsec_ignore_purpose" => continue,
 						// no idea what this one is supposed to do?!
 						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v)))
 					};
