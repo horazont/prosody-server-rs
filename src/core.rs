@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use tokio_rustls::server::{TlsStream as ServerTlsStream};
 
 use crate::conversion::opaque;
-use crate::verify;
+use crate::tls;
 
 /**
 # Message / Method Call into Lua
@@ -66,16 +66,16 @@ pub(crate) enum Message {
 		stream: ServerTlsStream<TcpStream>,
 		/// The remote address of the accepted stream
 		addr: SocketAddr,
-		/// Verification information about the new connection
-		verify: verify::VerificationRecord,
+		/// Information about the TLS connection.
+		tls_info: tls::Info,
 	},
 
 	/// TLS was started on an existing connection
 	TlsStarted{
 		/// The registry key of the connection handle
 		handle: LuaRegistryHandle,
-		/// Verification status
-		verify: verify::VerificationRecord,
+		/// Information about the TLS connection.
+		tls_info: tls::Info,
 	},
 
 	Incoming{

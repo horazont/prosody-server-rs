@@ -70,14 +70,16 @@ impl LuaUserData for StreamHandle {
 			})
 		});
 
-		methods.add_method("ssl_info", |_, _this: &Self, _: ()| -> LuaResult<()> {
-			// TODO: return something useful here
-			Ok(())
+		methods.add_method("ssl_info", |lua, this: &Self, _: ()| -> LuaResult<Option<LuaTable>> {
+			match &this.state {
+				StreamState::Tls{info, ..} => Ok(Some(info.handshake.to_lua_table(lua)?)),
+				_ => Ok(None)
+			}
 		});
 
 		methods.add_method("ssl_peercertificate", |_, this, _: ()| -> LuaResult<Option<cert::ParsedCertificate>> {
 			match &this.state {
-				StreamState::Tls{verify, ..} => match verify {
+				StreamState::Tls{info, ..} => match &info.verify {
 					verify::VerificationRecord::Unverified | verify::VerificationRecord::Failed{..} => {
 						Ok(None)
 					},
@@ -92,7 +94,7 @@ impl LuaUserData for StreamHandle {
 		methods.add_method("ssl_peerverification", |lua, this: &Self, _: ()| -> LuaResult<(bool, LuaTable)> {
 			let reasons = lua.create_table()?;
 			match &this.state {
-				StreamState::Tls{verify, ..} => match verify {
+				StreamState::Tls{info, ..} => match &info.verify {
 					verify::VerificationRecord::Unverified => {
 						reasons.raw_set(1, "verification disabled or did not complete")?;
 						Ok((false, reasons))
@@ -273,14 +275,14 @@ impl StreamHandle {
 			conn: server::TlsStream<TcpStream>,
 			listeners: LuaTable,
 			addr: Option<SocketAddr>,
-			verify: verify::VerificationRecord,
+			info: tls::Info,
 			cfg: config::StreamConfig,
 	) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = match addr {
 			Some(addr) => addr,
 			None => conn.get_ref().0.local_addr()?,
 		};
-		Self::wrap_state(lua, conn.into(), listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{verify}, cfg)
+		Self::wrap_state(lua, conn.into(), listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{info}, cfg)
 	}
 
 	pub(crate) fn state_mut(&mut self) -> &mut StreamState {

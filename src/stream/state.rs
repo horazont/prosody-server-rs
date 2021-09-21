@@ -127,7 +127,7 @@ pub(crate) enum StreamState {
 
 	/// The TLS handshake has completed.
 	Tls{
-		verify: verify::VerificationRecord,
+		info: tls::Info,
 	},
 
 	/// The connection has been closed either locally or remotely.
@@ -187,14 +187,14 @@ impl StreamState {
 	///
 	/// If the stream is in a state other than the ones mentioned above, an
 	/// error is returned and no transition takes place.
-	pub(crate) fn confirm_tls<'l>(&mut self, verify: verify::VerificationRecord) -> Result<bool, StateTransitionError> {
+	pub(crate) fn confirm_tls<'l>(&mut self, info: tls::Info) -> Result<bool, StateTransitionError> {
 		self.transition_impl(|this| {
 			match this {
 				Self::TlsHandshaking | Self::Plain(..) => {
-					Ok((Self::Tls{verify}, false))
+					Ok((Self::Tls{info}, false))
 				},
 				Self::Connecting(..) => {
-					Ok((Self::Tls{verify}, true))
+					Ok((Self::Tls{info}, true))
 				},
 				Self::Disconnected => Err((this, StateTransitionError::NotConnected)),
 				Self::Failed => Err((this, StateTransitionError::Failed)),

@@ -5,9 +5,10 @@ use mlua::prelude::*;
 
 use std::cell::Ref;
 use std::collections::HashMap;
-use std::io;
 use std::ffi::OsStr;
+use std::fmt::Write;
 use std::fs::{File, read_dir};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -381,4 +382,96 @@ pub(crate) fn new_tls_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Re
 		Ok(v) => Ok(Err(format!("must be either \"server\" or \"client\", got {:?}", v))),
 		Err(e) => Ok(Err(format!("mode is absent or of invalid type: {}", e))),
 	}
+}
+
+fn protocol_str(p: rustls::ProtocolVersion) -> &'static str {
+	match p {
+		rustls::ProtocolVersion::SSLv2 => "SSLv2",
+		rustls::ProtocolVersion::SSLv3 => "SSLv3",
+		rustls::ProtocolVersion::TLSv1_0 => "TLSv1.0",
+		rustls::ProtocolVersion::TLSv1_1 => "TLSv1.1",
+		rustls::ProtocolVersion::TLSv1_2 => "TLSv1.2",
+		rustls::ProtocolVersion::TLSv1_3 => "TLSv1.3",
+		rustls::ProtocolVersion::Unknown(_) => "unknown"
+	}
+}
+
+fn cipher_str(p: rustls::ProtocolVersion, cs: &rustls::SupportedCipherSuite) -> String {
+	use rustls::internal::msgs::handshake::{
+		KeyExchangeAlgorithm,
+	};
+	use rustls::BulkAlgorithm;
+	use rustls::internal::msgs::enums::{
+		HashAlgorithm,
+	};
+	let mut buf = String::with_capacity(32);
+	match p {
+		rustls::ProtocolVersion::TLSv1_3 => {
+			// TLSv1.3 is diffeernt with some separation of kex and cipher
+			// We'[l try to get hold of the IANA name of the cipher and use that
+			// not at *all* relying on any implementation details here *ahem*
+			write!(buf, "{:?}", cs.suite).unwrap();
+			if buf.len() >= 6 && &buf[..6] == "TLS13_" {
+				buf.drain(3..5);
+			}
+		},
+		_ => {
+			match cs.kx {
+				KeyExchangeAlgorithm::BulkOnly => (),
+				KeyExchangeAlgorithm::RSA => buf.push_str("RSA-"),
+				KeyExchangeAlgorithm::DH => buf.push_str("DH-"),
+				KeyExchangeAlgorithm::DHE => buf.push_str("DHE-"),
+				KeyExchangeAlgorithm::ECDH => buf.push_str("ECDH-"),
+				KeyExchangeAlgorithm::ECDHE => buf.push_str("ECDHE-"),
+			};
+			match cs.bulk {
+				BulkAlgorithm::AES_128_GCM => buf.push_str("AES128-GCM"),
+				BulkAlgorithm::AES_256_GCM => buf.push_str("AES128-GCM"),
+				BulkAlgorithm::CHACHA20_POLY1305 => buf.push_str("CHACHA20-POLY1305"),
+			};
+			match cs.hash {
+				HashAlgorithm::NONE => (),
+				HashAlgorithm::MD5 => buf.push_str("-MD5"),
+				HashAlgorithm::SHA1 => buf.push_str("-SHA"),
+				HashAlgorithm::SHA224 => buf.push_str("-SHA224"),
+				HashAlgorithm::SHA256 => buf.push_str("-SHA256"),
+				HashAlgorithm::SHA384 => buf.push_str("-SHA384"),
+				HashAlgorithm::SHA512 => buf.push_str("-SHA512"),
+				HashAlgorithm::Unknown(_) => buf.push_str("-UNKNOWN"),
+			};
+		},
+	}
+	buf.shrink_to_fit();
+	buf
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HandshakeInfo {
+	protocol: rustls::ProtocolVersion,
+	cipher: &'static rustls::SupportedCipherSuite,
+}
+
+impl<T: rustls::Session> From<&T> for HandshakeInfo {
+	fn from(other: &T) -> Self {
+		Self{
+			protocol: other.get_protocol_version().unwrap(),
+			cipher: other.get_negotiated_ciphersuite().unwrap(),
+		}
+	}
+}
+
+impl HandshakeInfo {
+	pub(crate) fn to_lua_table<'l>(&self, lua: &'l Lua) -> LuaResult<LuaTable<'l>> {
+		let result = lua.create_table_with_capacity(0, 3)?;
+		result.raw_set::<_, _>("compression", false)?;
+		result.raw_set::<_, _>("protocol", protocol_str(self.protocol))?;
+		result.raw_set::<_, _>("cipher", cipher_str(self.protocol, self.cipher))?;
+		Ok(result)
+	}
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Info {
+	pub(crate) handshake: HandshakeInfo,
+	pub(crate) verify: verify::VerificationRecord,
 }

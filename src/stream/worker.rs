@@ -47,6 +47,7 @@ use crate::ioutil::{
 	iotimeout,
 	iodeadline,
 };
+use crate::tls;
 use crate::verify;
 
 use super::msg::{
@@ -136,14 +137,15 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
+	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
 		let (verify, sock) = recorder.scope(async move {
 			iotimeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await
 		}).await;
 		match sock {
 			Ok(sock) => {
+				let handshake = sock.get_ref().1.into();
 				*self = sock.into();
-				Ok(verify)
+				Ok(tls::Info{verify, handshake})
 			},
 			Err(e) => {
 				// kaboom, break the thing
@@ -155,14 +157,15 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
+	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
 		let (verify, sock) = recorder.scope(async move {
 			iotimeout(handshake_timeout, connector.connect(name, sock), "STARTTLS handshake timed out").await
 		}).await;
 		match sock {
 			Ok(sock) => {
+				let handshake = sock.get_ref().1.into();
 				*self = sock.into();
-				Ok(verify)
+				Ok(tls::Info{verify, handshake})
 			},
 			Err(e) => {
 				// kaboom, break the thing
@@ -174,7 +177,7 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
+	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
 		let mut tmp = Stream::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -191,7 +194,7 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<verify::VerificationRecord> {
+	async fn starttls_accept(&mut self, ctx: Arc<rustls::ServerConfig>, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
 		let mut tmp = Stream::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -467,8 +470,8 @@ impl StreamWorker {
 			},
 			ControlMessage::AcceptTls(ctx, recorder) => {
 				self.force_flush().await?;
-				let verify = self.conn.starttls_accept(ctx, &recorder, self.cfg.ssl_handshake_timeout).await?;
-				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
+				let tls_info = self.conn.starttls_accept(ctx, &recorder, self.cfg.ssl_handshake_timeout).await?;
+				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), tls_info}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();
 						self.tx_mode = self.tx_mode.unblock();
@@ -478,8 +481,8 @@ impl StreamWorker {
 				}
 			},
 			ControlMessage::ConnectTls(name, ctx, recorder) => {
-				let verify = self.conn.starttls_connect(name.as_ref(), ctx, &*recorder, self.cfg.ssl_handshake_timeout).await?;
-				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
+				let tls_info = self.conn.starttls_connect(name.as_ref(), ctx, &*recorder, self.cfg.ssl_handshake_timeout).await?;
+				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), tls_info}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();
 						self.tx_mode = self.tx_mode.unblock();

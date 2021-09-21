@@ -106,11 +106,16 @@ impl TlsMode {
 				let (verify, conn) = recorder.scope(async move {
 					iotimeout(ssl_handshake_timeout, acceptor.accept(conn), "TLS handshake timed out").await
 				}).await;
+				let conn = conn?;
+				let handshake = conn.get_ref().1.into();
 				Ok(Message::TlsAccept{
 					handle: handle.clone(),
-					stream: conn?,
+					stream: conn,
 					addr,
-					verify,
+					tls_info: tls::Info{
+						verify,
+						handshake,
+					},
 				})
 			},
 			Self::Multiplex{tls_config: (acceptor, recorder)} => {
@@ -121,11 +126,16 @@ impl TlsMode {
 						let (verify, conn) = recorder.scope(async move {
 							iotimeout(ssl_handshake_timeout, acceptor.accept(conn), "TLS handshake timed out").await
 						}).await;
+						let conn = conn?;
+						let handshake = conn.get_ref().1.into();
 						Ok(Message::TlsAccept{
 							handle: handle.clone(),
-							stream: conn?,
+							stream: conn,
 							addr,
-							verify,
+							tls_info: tls::Info{
+								verify,
+								handshake,
+							},
 						})
 					},
 					// if no byte is read or if it doesn't match -> assume plaintext

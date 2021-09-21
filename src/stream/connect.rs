@@ -14,6 +14,7 @@ use crate::core::{
 	Spawn,
 };
 use crate::ioutil::iotimeout;
+use crate::tls;
 use crate::verify;
 
 use super::msg::{
@@ -80,7 +81,9 @@ impl ConnectWorker {
 						return;
 					},
 				};
-				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), verify}).await {
+				let handshake = sock.get_ref().1.into();
+				let tls_info = tls::Info{verify, handshake};
+				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), tls_info}).await {
 					Ok(_) => (),
 					// can only happen during shutdown, drop it.
 					Err(_) => return,
