@@ -63,6 +63,10 @@ impl LuaUserData for StreamHandle {
 			Ok(this.sockport)
 		});
 
+		methods.add_method("serverport", |_, this: &Self, _: ()| -> LuaResult<u16> {
+			Ok(this.sockport)
+		});
+
 		methods.add_method("ssl", |_, this: &Self, _: ()| -> LuaResult<bool> {
 			Ok(match this.state {
 				StreamState::Tls{..} => true,
