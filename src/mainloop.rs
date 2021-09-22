@@ -169,14 +169,27 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = stream::StreamHandle::wrap_plain(lua, stream, listeners.clone(), Some(addr), cfg)?;
+			let handle = stream::spawn_accepted_tcp_worker(
+				lua,
+				stream,
+				listeners.clone(),
+				Some(addr),
+				cfg,
+			)?;
 			call_connect(&listeners, handle)?;
 		},
 		Message::TlsAccept{handle, stream, addr, tls_info} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = stream::StreamHandle::wrap_tls_server(lua, stream, listeners.clone(), Some(addr), tls_info, cfg)?;
+			let handle = stream::spawn_accepted_tlstcp_worker(
+				lua,
+				stream,
+				listeners.clone(),
+				Some(addr),
+				tls_info,
+				cfg
+			)?;
 			call_starttls(&listeners, handle.clone())?;
 			call_tls_confirm(&listeners, handle.clone())?;
 			call_connect(&listeners, handle.clone())?;

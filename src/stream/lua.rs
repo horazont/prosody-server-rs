@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use tokio::net::TcpStream;
 
+use tokio_rustls::server;
+
 use nix::{
 	fcntl::FcntlArg,
 	fcntl::fcntl,
@@ -15,13 +17,20 @@ use crate::{
 	strerror_ok,
 	with_runtime_lua,
 };
+use crate::config;
 use crate::core::{
 	may_call_listener,
+	LuaRegistryHandle,
+	Spawn,
 };
 use crate::config::CONFIG;
 use crate::conversion;
 use crate::tls;
+use crate::verify;
 
+use super::connect::{
+	ConnectWorker,
+};
 use super::state::{
 	PreTlsConfig,
 	StateTransitionError,
@@ -32,6 +41,12 @@ use super::msg::{
 };
 use super::handle::{
 	StreamHandle,
+	Kind,
+	AddrStr,
+};
+use super::worker::{
+	StreamWorker,
+	FdStream,
 };
 
 
@@ -51,6 +66,131 @@ impl SocketOption {
 	}
 }
 
+fn prep_handle<'l>(
+		lua: &'l Lua,
+		handle: StreamHandle,
+		listeners: LuaTable,
+) -> LuaResult<(LuaAnyUserData<'l>, LuaRegistryHandle)> {
+	let handle = lua.create_userdata(handle)?;
+	let data = lua.create_table_with_capacity(0, 1)?;
+	handle.set_user_value(data)?;
+	set_listeners(&handle, listeners)?;
+	let reg_handle = lua.create_registry_value(handle.clone())?.into();
+	Ok((handle, reg_handle))
+}
+
+fn spawn_stream_worker<'l>(
+		lua: &'l Lua,
+		conn: FdStream,
+		listeners: LuaTable,
+		state: StreamState,
+		kind: Kind,
+		local: AddrStr,
+		remote: AddrStr,
+		cfg: config::StreamConfig
+) -> LuaResult<LuaAnyUserData<'l>> {
+	let (handle, rx) = StreamHandle::new(
+		state,
+		kind,
+		local,
+		remote,
+	);
+	let (handle, reg_handle) = prep_handle(
+		lua,
+		handle,
+		listeners,
+	)?;
+
+	StreamWorker::new(
+		rx,
+		conn,
+		cfg,
+		reg_handle,
+	).spawn();
+	Ok(handle)
+}
+
+fn spawn_connect_worker<'l>(
+		lua: &'l Lua,
+		addr: SocketAddr,
+		listeners: LuaTable,
+		tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
+		connect_cfg: config::ClientConfig,
+		stream_cfg: config::StreamConfig,
+) -> LuaResult<LuaAnyUserData<'l>> {
+	let (handle, rx) = StreamHandle::new(
+		// we might establish TLS right away, in that case it doesn't matter
+		StreamState::Connecting(PreTlsConfig::None),
+		Kind::Client,
+		// local address is not known until connect is done
+		AddrStr::Unspecified,
+		addr.into(),
+	);
+	let (handle, reg_handle) = prep_handle(
+		lua,
+		handle,
+		listeners,
+	)?;
+
+	ConnectWorker::new(
+		rx,
+		addr,
+		tls_config,
+		connect_cfg,
+		stream_cfg,
+		reg_handle,
+	).spawn();
+	Ok(handle)
+}
+
+pub(crate) fn spawn_accepted_tcp_worker<'l>(
+		lua: &'l Lua,
+		conn: TcpStream,
+		listeners: LuaTable,
+		remoteaddr: Option<SocketAddr>,
+		cfg: config::StreamConfig,
+) -> LuaResult<LuaAnyUserData<'l>> {
+	let remoteaddr = match remoteaddr {
+		Some(remoteaddr) => remoteaddr.into(),
+		None => conn.peer_addr()?.into(),
+	};
+	let localaddr = conn.local_addr()?.into();
+	spawn_stream_worker(
+		lua,
+		conn.into(),
+		listeners,
+		StreamState::Plain(PreTlsConfig::None),
+		Kind::Server,
+		localaddr,
+		remoteaddr,
+		cfg,
+	)
+}
+
+pub(crate) fn spawn_accepted_tlstcp_worker<'l>(
+		lua: &'l Lua,
+		conn: server::TlsStream<TcpStream>,
+		listeners: LuaTable,
+		remoteaddr: Option<SocketAddr>,
+		info: tls::Info,
+		cfg: config::StreamConfig,
+) -> LuaResult<LuaAnyUserData<'l>> {
+	let remoteaddr = match remoteaddr {
+		Some(remoteaddr) => remoteaddr.into(),
+		None => conn.get_ref().0.peer_addr()?.into(),
+	};
+	let localaddr = conn.get_ref().0.local_addr()?.into();
+	spawn_stream_worker(
+		lua,
+		conn.into(),
+		listeners,
+		StreamState::Tls{info},
+		Kind::Server,
+		localaddr,
+		remoteaddr,
+		cfg,
+	)
+}
 
 pub(crate) fn set_listeners<'l>(ud: &LuaAnyUserData<'l>, listeners: LuaTable<'l>) -> LuaResult<()> {
 	let tbl = ud.get_user_value::<LuaTable>()?;
@@ -109,8 +249,18 @@ pub(crate) fn wrapclient<'l>(
 	cfg.read_size = read_size;
 
 	with_runtime_lua!{
+		let localaddr = sock.local_addr()?.into();
 		let sock = TcpStream::from_std(sock)?;
-		let handle = StreamHandle::wrap_state(lua, sock.into(), listeners.clone(), (addr, port), StreamState::Plain(tls_state), cfg)?;
+		let handle = spawn_stream_worker(
+			lua,
+			sock.into(),
+			listeners.clone(),
+			StreamState::Plain(tls_state),
+			Kind::Client,
+			localaddr,
+			AddrStr::InetAny{addr, port},
+			cfg,
+		)?;
 		may_call_listener(&listeners, "onconnect", handle.clone())?;
 		Ok(Ok(handle))
 	}
@@ -160,6 +310,14 @@ pub(crate) fn addclient<'l>(
 	stream_cfg.read_size = read_size;
 
 	with_runtime_lua!{
-		Ok(Ok(StreamHandle::connect(lua, addr, listeners, tls_config, connect_cfg, stream_cfg)?))
+		let handle = spawn_connect_worker(
+			lua,
+			addr,
+			listeners,
+			tls_config,
+			connect_cfg,
+			stream_cfg,
+		)?;
+		Ok(Ok(handle))
 	}
 }

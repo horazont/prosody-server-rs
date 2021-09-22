@@ -2,45 +2,76 @@ use mlua::prelude::*;
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use bytes::Bytes;
 
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use tokio_rustls::server;
-
 use crate::cert;
-use crate::config;
-use crate::core::Spawn;
 use crate::conversion::opaque;
 use crate::tls;
 use crate::verify;
 
 use super::state::{
-	PreTlsConfig,
 	StreamState,
 };
 use super::msg::{
 	ControlMessage,
 	SocketOption,
 };
-use super::worker::{
-	StreamWorker,
-	FdStream,
-};
-use super::connect::{
-	ConnectWorker,
-};
 use super::lua::set_listeners;
 
+
+pub(super) enum AddrStr {
+	Unspecified,
+	InetAny{
+		addr: String,
+		port: u16,
+	},
+	#[allow(dead_code)]
+	Unix{
+		path: String,
+	},
+}
+
+impl AddrStr {
+	fn addr(&self) -> Option<&str> {
+		match self {
+			Self::Unspecified => None,
+			Self::InetAny{addr, ..} => Some(&addr),
+			Self::Unix{path} => Some(&path),
+		}
+	}
+
+	fn port(&self) -> Option<u16> {
+		match self {
+			Self::InetAny{port, ..} => Some(*port),
+			Self::Unspecified => None,
+			Self::Unix{..} => None,
+		}
+	}
+}
+
+impl From<SocketAddr> for AddrStr {
+	fn from(other: SocketAddr) -> Self {
+		Self::InetAny{
+			addr: other.ip().to_string(),
+			port: other.port(),
+		}
+	}
+}
+
+pub(super) enum Kind {
+	Server,
+	Client,
+}
 
 pub(crate) struct StreamHandle {
 	tx: mpsc::UnboundedSender<ControlMessage>,
 	state: StreamState,
-	sockaddr: String,
-	sockport: u16,
+	kind: Kind,
+	local: AddrStr,
+	remote: AddrStr,
 }
 
 impl StreamHandle {
@@ -51,20 +82,33 @@ impl StreamHandle {
 
 impl LuaUserData for StreamHandle {
 	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
-		methods.add_method("ip", |_, this: &Self, _: ()| -> LuaResult<String> {
-			Ok(this.sockaddr.clone())
+		methods.add_method("ip", |_, this: &Self, _: ()| -> LuaResult<Option<String>> {
+			let addr = match this.kind {
+				Kind::Server => this.local.addr(),
+				Kind::Client => this.remote.addr(),
+			}.map(|x| { x.to_string() });
+			Ok(addr)
 		});
 
-		methods.add_method("port", |_, this: &Self, _: ()| -> LuaResult<u16> {
-			Ok(this.sockport)
+		methods.add_method("port", |_, this: &Self, _: ()| -> LuaResult<Option<u16>> {
+			match this.kind {
+				Kind::Server => Ok(this.local.port()),
+				Kind::Client => Ok(this.remote.port()),
+			}
 		});
 
-		methods.add_method("clientport", |_, this: &Self, _: ()| -> LuaResult<u16> {
-			Ok(this.sockport)
+		methods.add_method("clientport", |_, this: &Self, _: ()| -> LuaResult<Option<u16>> {
+			match this.kind {
+				Kind::Server => Ok(this.remote.port()),
+				Kind::Client => Ok(this.local.port()),
+			}
 		});
 
-		methods.add_method("serverport", |_, this: &Self, _: ()| -> LuaResult<u16> {
-			Ok(this.sockport)
+		methods.add_method("serverport", |_, this: &Self, _: ()| -> LuaResult<Option<u16>> {
+			match this.kind {
+				Kind::Server => Ok(this.local.port()),
+				Kind::Client => Ok(this.remote.port()),
+			}
 		});
 
 		methods.add_method("ssl", |_, this: &Self, _: ()| -> LuaResult<bool> {
@@ -196,97 +240,20 @@ impl LuaUserData for StreamHandle {
 }
 
 impl StreamHandle {
-	pub(super) fn wrap_state<'l>(
-			lua: &'l Lua,
-			conn: FdStream,
-			listeners: LuaTable,
-			addr: (String, u16),
-			state: StreamState,
-			cfg: config::StreamConfig,
-	) -> LuaResult<LuaAnyUserData<'l>> {
+	pub(super) fn new(
+		state: StreamState,
+		kind: Kind,
+		local: AddrStr,
+		remote: AddrStr,
+	) -> (Self, mpsc::UnboundedReceiver<ControlMessage>) {
 		let (tx, rx) = mpsc::unbounded_channel();
-
-		let v = lua.create_userdata(Self{
+		(Self{
 			tx,
 			state,
-			sockaddr: addr.0,
-			sockport: addr.1,
-		})?;
-		let data = lua.create_table_with_capacity(0, 1)?;
-		v.set_user_value(data)?;
-		set_listeners(&v, listeners)?;
-		let handle = lua.create_registry_value(v.clone())?.into();
-
-		StreamWorker::new(
-			rx,
-			conn,
-			cfg,
-			handle,
-		).spawn();
-		Ok(v)
-	}
-
-	pub(super) fn connect<'l>(
-			lua: &'l Lua,
-			addr: SocketAddr,
-			listeners: LuaTable,
-			tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
-			connect_cfg: config::ClientConfig,
-			stream_cfg: config::StreamConfig,
-	) -> LuaResult<LuaAnyUserData<'l>> {
-		let (tx, rx) = mpsc::unbounded_channel();
-
-		let v = lua.create_userdata(Self{
-			tx,
-			// we might establish TLS right away, in that case it doesn't matter
-			state: StreamState::Connecting(PreTlsConfig::None),
-			// this is actually correct because ip() is supposed to return the remote IP for clients
-			sockaddr: format!("{}", addr.ip()),
-			sockport: addr.port(),
-		})?;
-		let data = lua.create_table_with_capacity(0, 1)?;
-		v.set_user_value(data)?;
-		set_listeners(&v, listeners)?;
-		let handle = lua.create_registry_value(v.clone())?.into();
-
-		ConnectWorker::new(
-			rx,
-			addr,
-			tls_config,
-			connect_cfg,
-			stream_cfg,
-			handle,
-		).spawn();
-		Ok(v)
-	}
-
-	pub(crate) fn wrap_plain<'l>(
-			lua: &'l Lua,
-			conn: TcpStream,
-			listeners: LuaTable,
-			addr: Option<SocketAddr>,
-			cfg: config::StreamConfig,
-	) -> LuaResult<LuaAnyUserData<'l>> {
-		let addr = match addr {
-			Some(addr) => addr,
-			None => conn.local_addr()?,
-		};
-		Self::wrap_state(lua, conn.into(), listeners, (addr.ip().to_string(), addr.port()), StreamState::Plain(PreTlsConfig::None), cfg)
-	}
-
-	pub(crate) fn wrap_tls_server<'l>(
-			lua: &'l Lua,
-			conn: server::TlsStream<TcpStream>,
-			listeners: LuaTable,
-			addr: Option<SocketAddr>,
-			info: tls::Info,
-			cfg: config::StreamConfig,
-	) -> LuaResult<LuaAnyUserData<'l>> {
-		let addr = match addr {
-			Some(addr) => addr,
-			None => conn.get_ref().0.local_addr()?,
-		};
-		Self::wrap_state(lua, conn.into(), listeners, (addr.ip().to_string(), addr.port()), StreamState::Tls{info}, cfg)
+			kind,
+			local,
+			remote,
+		}, rx)
 	}
 
 	pub(crate) fn state_mut(&mut self) -> &mut StreamState {

@@ -30,4 +30,6 @@ pub(crate) use lua::{
 	get_listeners,
 	addclient,
 	wrapclient,
+	spawn_accepted_tcp_worker,
+	spawn_accepted_tlstcp_worker,
 };
