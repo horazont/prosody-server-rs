@@ -104,7 +104,8 @@ impl rustls::ClientCertVerifier for RecordingClientVerifier {
 		self.inner.offer_client_auth()
 	}
 
-	fn client_auth_root_subjects(&self, sni: Option<&webpki::DNSName>) -> Option<Vec<rustls::internal::msgs::base::PayloadU16>> {
+	fn client_auth_root_subjects(&self, _sni: Option<&webpki::DNSName>) -> Option<Vec<rustls::internal::msgs::base::PayloadU16>> {
+		// We never tell the peer which certificates we accept ... Otherwise it would be an awfully long list in the general case.
 		Some(Vec::new())
 	}
 
