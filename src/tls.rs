@@ -228,7 +228,6 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 	let mut root_store = rustls::RootCertStore::empty();
 	let mut strict_verify = true;
 	let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
-	// TODO: handle verify in some way
 	for kv in config.pairs::<LuaString, LuaValue>() {
 		let (k, v) = match kv {
 			Ok(kv) => kv,
