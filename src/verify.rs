@@ -105,7 +105,7 @@ impl rustls::ClientCertVerifier for RecordingClientVerifier {
 	}
 
 	fn client_auth_root_subjects(&self, sni: Option<&webpki::DNSName>) -> Option<Vec<rustls::internal::msgs::base::PayloadU16>> {
-		self.inner.client_auth_root_subjects(sni)
+		Some(Vec::new())
 	}
 
     fn verify_client_cert(
