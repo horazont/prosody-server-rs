@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::fmt;
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd, FromRawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -56,6 +57,7 @@ use super::msg::{
 	ControlMessage,
 	SocketOption,
 };
+use super::handle::AddrStr;
 
 
 pin_project! {
@@ -393,6 +395,44 @@ impl AsyncWrite for Stream {
     }
 }
 
+pub(super) enum AnyStream {
+	Tcp(std::net::TcpStream),
+	Unix(std::os::unix::net::UnixStream),
+}
+
+impl AnyStream {
+	pub(super) fn try_from_raw_fd(fd: RawFd) -> io::Result<Self> {
+		// Safety: We check that this is a socket FD by calling getsockopt later and we'll also assert the correct address family'
+		let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
+		if sock.r#type()? != socket2::Type::STREAM {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"attempt to pass non-stream socket to FdStream",
+			));
+		}
+		sock.set_nonblocking(true)?;
+		match sock.domain()? {
+			socket2::Domain::IPV4 | socket2::Domain::IPV6 => {
+				Ok(Self::Tcp(sock.into()))
+			},
+			socket2::Domain::UNIX => {
+				Ok(Self::Unix(sock.into()))
+			},
+			_ => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"unsupported socket domain",
+			)),
+		}
+	}
+
+	pub(super) fn local_addr_str(&self) -> io::Result<AddrStr> {
+		match self {
+			Self::Tcp(sock) => Ok(sock.local_addr()?.into()),
+			Self::Unix(sock) => Ok(sock.local_addr()?.into()),
+		}
+	}
+}
+
 pin_project! {
 	#[derive(Debug)]
 	pub(super) struct FdStream {
@@ -425,6 +465,23 @@ impl From<UnixStream> for FdStream {
 		Self{
 			fd: other.as_raw_fd(),
 			inner: other.into(),
+		}
+	}
+}
+
+impl TryFrom<AnyStream> for FdStream {
+	type Error = io::Error;
+
+	fn try_from(other: AnyStream) -> Result<Self, Self::Error> {
+		match other {
+			AnyStream::Tcp(sock) => {
+				let sock = TcpStream::from_std(sock)?;
+				Ok(sock.into())
+			},
+			AnyStream::Unix(sock) => {
+				let sock = UnixStream::from_std(sock)?;
+				Ok(sock.into())
+			},
 		}
 	}
 }

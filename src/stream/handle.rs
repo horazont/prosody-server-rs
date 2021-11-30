@@ -28,7 +28,6 @@ pub(super) enum AddrStr {
 		addr: String,
 		port: u16,
 	},
-	#[allow(dead_code)]
 	Unix{
 		path: String,
 	},
@@ -57,6 +56,17 @@ impl From<SocketAddr> for AddrStr {
 		Self::InetAny{
 			addr: other.ip().to_string(),
 			port: other.port(),
+		}
+	}
+}
+
+impl From<std::os::unix::net::SocketAddr> for AddrStr {
+	fn from(other: std::os::unix::net::SocketAddr) -> Self {
+		match other.as_pathname() {
+			Some(v) => Self::Unix{
+				path: v.to_string_lossy().into(),
+			},
+			None => Self::Unspecified
 		}
 	}
 }

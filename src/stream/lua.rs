@@ -1,7 +1,8 @@
 use mlua::prelude::*;
 
+use std::convert::TryInto;
 use std::net::SocketAddr;
-use std::os::unix::io::{RawFd, FromRawFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
@@ -47,6 +48,7 @@ use super::handle::{
 use super::worker::{
 	StreamWorker,
 	FdStream,
+	AnyStream,
 };
 
 
@@ -211,10 +213,7 @@ pub(crate) fn wrapclient<'l>(
 		fd,
 		FcntlArg::F_DUPFD_CLOEXEC(0),
 	));
-	// this is probably the worst one could do... let's hope the syscalls will quickly let this fail
-	let sock = unsafe { socket2::Socket::from_raw_fd(fd) };
-	strerror_ok!(sock.set_nonblocking(true));
-	let sock: std::net::TcpStream = sock.into();
+	let sock = strerror_ok!(AnyStream::try_from_raw_fd(fd));
 
 	// extra is required, we MUST have the server name...
 	let servername = match extra.as_ref() {
@@ -249,11 +248,10 @@ pub(crate) fn wrapclient<'l>(
 	cfg.read_size = read_size;
 
 	with_runtime_lua!{
-		let localaddr = sock.local_addr()?.into();
-		let sock = TcpStream::from_std(sock)?;
+		let localaddr = sock.local_addr_str()?;
 		let handle = spawn_stream_worker(
 			lua,
-			sock.into(),
+			sock.try_into()?,
 			listeners.clone(),
 			StreamState::Plain(tls_state),
 			Kind::Client,
