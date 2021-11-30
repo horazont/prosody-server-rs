@@ -20,6 +20,7 @@ rustls-pemfile = { version = "^0.2" }
 pin-project-lite = { version = "^0.2" }
 bytes = { version = "^1" }
 nix = { version = "^0.22" }
+pin-utils = { version = "^0.1" }
 # bounded by rustls
 webpki = { version = "^0.21.0" }
 socket2 = { version = "^0.4" }

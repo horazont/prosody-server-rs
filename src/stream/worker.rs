@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use pin_utils::pin_mut;
+
 use bytes::{Bytes, BytesMut, BufMut, Buf, buf::Limit};
 
 use tokio::select;
@@ -211,12 +213,12 @@ impl Stream {
 		}
 	}
 
-	fn as_parts_mut(&mut self) -> (Box<&mut (dyn AsyncRead + Unpin + Send + 'static)>, Box<&mut (dyn AsyncWrite + Unpin + Send + 'static)>) {
+	fn as_parts_mut(&mut self) -> (&mut (dyn AsyncRead + Unpin + Send + 'static), &mut (dyn AsyncWrite + Unpin + Send + 'static)) {
 		match self {
 			Self::Broken{ref e} => panic!("broken stream: {:?}", e),
-			Self::Plain{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
-			Self::TlsServer{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
-			Self::TlsClient{ref mut rx, ref mut tx} => (Box::new(rx), Box::new(tx)),
+			Self::Plain{ref mut rx, ref mut tx} => (rx, tx),
+			Self::TlsServer{ref mut rx, ref mut tx} => (rx, tx),
+			Self::TlsClient{ref mut rx, ref mut tx} => (rx, tx),
 		}
 	}
 }
@@ -555,7 +557,9 @@ impl StreamWorker {
 				&mut txdummy
 			};
 
-			let (mut rx, mut tx) = self.conn.as_parts_mut();
+			let (rx, tx) = self.conn.as_parts_mut();
+			pin_mut!(rx);
+			pin_mut!(tx);
 
 			select! {
 				result = timeout_at(read_deadline.into(), rx.read_buf(rxbuf)), if self.rx_mode.may() => match result {
@@ -616,7 +620,7 @@ impl StreamWorker {
 							},
 							Ok(false) | Err(_) => {
 								MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
-									handle: self.handle,
+									handle: self.handle.clone(),
 									error: Some(Box::new(io::Error::new(
 										io::ErrorKind::TimedOut,
 										"read timeout",
@@ -650,7 +654,7 @@ impl StreamWorker {
 						Ok(MsgResult::Exit) => return,
 						Ok(MsgResult::Continue) => (),
 						Err(e) => {
-							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle, error: Some(Box::new(e))}).await;
+							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
 							return
 						},
 					},
@@ -664,6 +668,6 @@ impl StreamWorker {
 
 impl Spawn for StreamWorker {
 	fn spawn(self) {
-		tokio::spawn(async move { self.run().await });
+		tokio::spawn(self.run());
 	}
 }

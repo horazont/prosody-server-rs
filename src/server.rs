@@ -205,7 +205,7 @@ impl ListenerWorker {
 
 impl Spawn for ListenerWorker {
 	fn spawn(self) {
-		tokio::spawn(async move { self.run().await });
+		tokio::spawn(self.run());
 	}
 }
 
