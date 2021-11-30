@@ -308,7 +308,7 @@ fn mk_listen_socket(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 	sock.set_nonblocking(true)?;
 	sock.set_reuse_address(true)?;
 	sock.bind(&addr.into())?;
-	sock.listen(0)?;
+	sock.listen(128)?;
 	Ok(sock.into())
 }
 
