@@ -3,8 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use tokio_rustls::rustls;
-
-use webpki;
+use tokio_rustls::webpki;
 
 use crate::verify;
 

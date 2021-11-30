@@ -13,16 +13,12 @@ crate-type = ["cdylib"]
 mlua = { version = "^0.6", features = ["async", "vendored", "module"] }
 tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 lazy_static = { version ="^1.4" }
-# we need the dangerous stuff because XMPP has its own ways to verify a connection, so we mustn't rely on PKI verification alone.
-rustls = { version = "^0.19", features = ["dangerous_configuration"] }
-tokio-rustls = { version = "^0.22" }
+tokio-rustls = { version = "^0.22", features = ["dangerous_configuration"] }
 rustls-pemfile = { version = "^0.2" }
 pin-project-lite = { version = "^0.2" }
 bytes = { version = "^1" }
 nix = { version = "^0.22" }
 pin-utils = { version = "^0.1" }
-# bounded by rustls
-webpki = { version = "^0.21.0" }
 socket2 = { version = "^0.4", features = ["all"] }
 x509-parser = { version = "^0.11" }
 

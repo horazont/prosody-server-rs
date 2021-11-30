@@ -8,8 +8,7 @@ use std::sync::Arc;
 use tokio::task_local;
 
 use tokio_rustls::rustls;
-
-use webpki;
+use tokio_rustls::webpki;
 
 
 #[derive(Debug, Clone)]
