@@ -86,6 +86,18 @@ pin_project! {
 			#[pin]
 			tx: WriteHalf<client::TlsStream<TcpStream>>,
 		},
+		TlsUnixServer{
+			#[pin]
+			rx: ReadHalf<server::TlsStream<UnixStream>>,
+			#[pin]
+			tx: WriteHalf<server::TlsStream<UnixStream>>,
+		},
+		TlsUnixClient{
+			#[pin]
+			rx: ReadHalf<client::TlsStream<UnixStream>>,
+			#[pin]
+			tx: WriteHalf<client::TlsStream<UnixStream>>,
+		},
 	}
 }
 
@@ -129,6 +141,26 @@ impl From<client::TlsStream<TcpStream>> for Stream {
 	}
 }
 
+impl From<client::TlsStream<UnixStream>> for Stream {
+	fn from(other: client::TlsStream<UnixStream>) -> Self {
+		let (rx, tx) = tokio::io::split(other);
+		Self::TlsUnixClient{
+			rx,
+			tx,
+		}
+	}
+}
+
+impl From<server::TlsStream<UnixStream>> for Stream {
+	fn from(other: server::TlsStream<UnixStream>) -> Self {
+		let (rx, tx) = tokio::io::split(other);
+		Self::TlsUnixServer{
+			rx,
+			tx,
+		}
+	}
+}
+
 impl fmt::Debug for Stream {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
@@ -137,6 +169,8 @@ impl fmt::Debug for Stream {
 			Self::PlainUnix{..} => f.debug_struct("Stream::PlainUnix").finish_non_exhaustive(),
 			Self::TlsTcpServer{..} => f.debug_struct("Stream::TlsTcpServer").finish_non_exhaustive(),
 			Self::TlsTcpClient{..} => f.debug_struct("Stream::TlsTcpClient").finish_non_exhaustive(),
+			Self::TlsUnixServer{..} => f.debug_struct("Stream::TlsUnixServer").finish_non_exhaustive(),
+			Self::TlsUnixClient{..} => f.debug_struct("Stream::TlsUnixClient").finish_non_exhaustive(),
 		}
 	}
 }
@@ -156,7 +190,15 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
+	async fn starttls_server<T: AsyncRead + AsyncWrite + Unpin>(
+		&mut self,
+		sock: T,
+		acceptor: TlsAcceptor,
+		recorder: &verify::RecordingClientVerifier,
+		handshake_timeout: Duration,
+	) -> io::Result<tls::Info>
+		where server::TlsStream<T>: Into<Self>
+	{
 		let (verify, sock) = recorder.scope(iotimeout(
 			handshake_timeout,
 			acceptor.accept(sock),
@@ -178,7 +220,16 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
+	async fn starttls_client<T: AsyncRead + AsyncWrite + Unpin>(
+		&mut self,
+		sock: T,
+		name: webpki::DNSNameRef<'_>,
+		connector: TlsConnector,
+		recorder: &verify::RecordingVerifier,
+		handshake_timeout: Duration,
+	) -> io::Result<tls::Info>
+		where client::TlsStream<T>: Into<Self>
+	{
 		let (verify, sock) = recorder.scope(iotimeout(
 			handshake_timeout,
 			connector.connect(name, sock),
@@ -200,7 +251,13 @@ impl Stream {
 		}
 	}
 
-	async fn starttls_connect(&mut self, name: webpki::DNSNameRef<'_>, ctx: Arc<rustls::ClientConfig>, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
+	async fn starttls_connect(
+		&mut self,
+		name: webpki::DNSNameRef<'_>,
+		ctx: Arc<rustls::ClientConfig>,
+		recorder: &verify::RecordingVerifier,
+		handshake_timeout: Duration
+	) -> io::Result<tls::Info> {
 		let mut tmp = Stream::Broken{e: None};
 		std::mem::swap(&mut tmp, self);
 		match tmp {
@@ -209,12 +266,15 @@ impl Stream {
 				*self = tmp;
 				result
 			},
-			Self::TlsTcpServer{..} | Self::TlsTcpClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
+			Self::TlsTcpServer{..} | Self::TlsTcpClient{..} | Self::TlsUnixServer{..} | Self::TlsUnixClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
 			Self::PlainTcp{rx, tx} => {
 				let sock = rx.reunite(tx).unwrap();
 				self.starttls_client(sock, name, ctx.into(), recorder, handshake_timeout).await
 			},
-			Self::PlainUnix{..} => todo!(),
+			Self::PlainUnix{rx, tx} => {
+				let sock = rx.reunite(tx).unwrap();
+				self.starttls_client(sock, name, ctx.into(), recorder, handshake_timeout).await
+			},
 		}
 	}
 
@@ -227,12 +287,15 @@ impl Stream {
 				*self = tmp;
 				result
 			},
-			Self::TlsTcpServer{..} | Self::TlsTcpClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
+			Self::TlsTcpServer{..} | Self::TlsTcpClient{..} | Self::TlsUnixServer{..} | Self::TlsUnixClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
 			Self::PlainTcp{rx, tx} => {
 				let sock = rx.reunite(tx).unwrap();
 				self.starttls_server(sock, ctx.into(), recorder, handshake_timeout).await
 			},
-			Self::PlainUnix{..} => todo!(),
+			Self::PlainUnix{rx, tx} => {
+				let sock = rx.reunite(tx).unwrap();
+				self.starttls_server(sock, ctx.into(), recorder, handshake_timeout).await
+			},
 		}
 	}
 
@@ -243,6 +306,8 @@ impl Stream {
 			Self::PlainUnix{ref mut rx, ref mut tx} => (rx, tx),
 			Self::TlsTcpServer{ref mut rx, ref mut tx} => (rx, tx),
 			Self::TlsTcpClient{ref mut rx, ref mut tx} => (rx, tx),
+			Self::TlsUnixServer{ref mut rx, ref mut tx} => (rx, tx),
+			Self::TlsUnixClient{ref mut rx, ref mut tx} => (rx, tx),
 		}
 	}
 }
@@ -256,6 +321,8 @@ impl AsyncRead for Stream {
             StreamProj::PlainUnix{rx, ..} => rx.poll_read(cx, buf),
             StreamProj::TlsTcpServer{rx, ..} => rx.poll_read(cx, buf),
             StreamProj::TlsTcpClient{rx, ..} => rx.poll_read(cx, buf),
+            StreamProj::TlsUnixServer{rx, ..} => rx.poll_read(cx, buf),
+            StreamProj::TlsUnixClient{rx, ..} => rx.poll_read(cx, buf),
 		}
 	}
 }
@@ -269,6 +336,8 @@ impl AsyncWrite for Stream {
             StreamProj::PlainUnix{tx, ..} => tx.poll_write(cx, buf),
             StreamProj::TlsTcpServer{tx, ..} => tx.poll_write(cx, buf),
             StreamProj::TlsTcpClient{tx, ..} => tx.poll_write(cx, buf),
+            StreamProj::TlsUnixServer{tx, ..} => tx.poll_write(cx, buf),
+            StreamProj::TlsUnixClient{tx, ..} => tx.poll_write(cx, buf),
         }
     }
 
@@ -280,6 +349,8 @@ impl AsyncWrite for Stream {
             StreamProj::PlainUnix{tx, ..} => tx.poll_write_vectored(cx, bufs),
             StreamProj::TlsTcpServer{tx, ..} => tx.poll_write_vectored(cx, bufs),
             StreamProj::TlsTcpClient{tx, ..} => tx.poll_write_vectored(cx, bufs),
+            StreamProj::TlsUnixServer{tx, ..} => tx.poll_write_vectored(cx, bufs),
+            StreamProj::TlsUnixClient{tx, ..} => tx.poll_write_vectored(cx, bufs),
         }
     }
 
@@ -291,6 +362,8 @@ impl AsyncWrite for Stream {
             StreamProj::PlainUnix{tx, ..} => tx.poll_flush(cx),
             StreamProj::TlsTcpServer{tx, ..} => tx.poll_flush(cx),
             StreamProj::TlsTcpClient{tx, ..} => tx.poll_flush(cx),
+            StreamProj::TlsUnixServer{tx, ..} => tx.poll_flush(cx),
+            StreamProj::TlsUnixClient{tx, ..} => tx.poll_flush(cx),
         }
     }
 
@@ -302,6 +375,8 @@ impl AsyncWrite for Stream {
             StreamProj::PlainUnix{tx, ..} => tx.poll_shutdown(cx),
             StreamProj::TlsTcpServer{tx, ..} => tx.poll_shutdown(cx),
             StreamProj::TlsTcpClient{tx, ..} => tx.poll_shutdown(cx),
+            StreamProj::TlsUnixServer{tx, ..} => tx.poll_shutdown(cx),
+            StreamProj::TlsUnixClient{tx, ..} => tx.poll_shutdown(cx),
         }
     }
 
@@ -312,6 +387,8 @@ impl AsyncWrite for Stream {
             Self::PlainUnix{tx, ..} => tx.is_write_vectored(),
             Self::TlsTcpServer{tx, ..} => tx.is_write_vectored(),
             Self::TlsTcpClient{tx, ..} => tx.is_write_vectored(),
+            Self::TlsUnixServer{tx, ..} => tx.is_write_vectored(),
+            Self::TlsUnixClient{tx, ..} => tx.is_write_vectored(),
         }
     }
 }
