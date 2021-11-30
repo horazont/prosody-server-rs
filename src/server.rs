@@ -103,9 +103,11 @@ impl TlsMode {
 				})
 			},
 			Self::DirectTls{tls_config: (acceptor, recorder)} => {
-				let (verify, conn) = recorder.scope(async move {
-					iotimeout(ssl_handshake_timeout, acceptor.accept(conn), "TLS handshake timed out").await
-				}).await;
+				let (verify, conn) = recorder.scope(iotimeout(
+					ssl_handshake_timeout,
+					acceptor.accept(conn),
+					"TLS handshake timed out"),
+				).await;
 				let conn = conn?;
 				let handshake = conn.get_ref().1.into();
 				Ok(Message::TlsAccept{
@@ -123,9 +125,11 @@ impl TlsMode {
 				match conn.peek(&mut buf).await? {
 					// first byte of the TLS handshake
 					1 if buf[0] == 0x16 => {
-						let (verify, conn) = recorder.scope(async move {
-							iotimeout(ssl_handshake_timeout, acceptor.accept(conn), "TLS handshake timed out").await
-						}).await;
+						let (verify, conn) = recorder.scope(iotimeout(
+							ssl_handshake_timeout,
+							acceptor.accept(conn),
+							"TLS handshake timed out",
+						)).await;
 						let conn = conn?;
 						let handshake = conn.get_ref().1.into();
 						Ok(Message::TlsAccept{

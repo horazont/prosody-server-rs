@@ -157,9 +157,11 @@ impl Stream {
 	}
 
 	async fn starttls_server(&mut self, sock: TcpStream, acceptor: TlsAcceptor, recorder: &verify::RecordingClientVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
-		let (verify, sock) = recorder.scope(async move {
-			iotimeout(handshake_timeout, acceptor.accept(sock), "STARTTLS handshake timed out").await
-		}).await;
+		let (verify, sock) = recorder.scope(iotimeout(
+			handshake_timeout,
+			acceptor.accept(sock),
+			"STARTTLS handshake timed out",
+		)).await;
 		match sock {
 			Ok(sock) => {
 				let handshake = sock.get_ref().1.into();
@@ -177,9 +179,11 @@ impl Stream {
 	}
 
 	async fn starttls_client(&mut self, sock: TcpStream, name: webpki::DNSNameRef<'_>, connector: TlsConnector, recorder: &verify::RecordingVerifier, handshake_timeout: Duration) -> io::Result<tls::Info> {
-		let (verify, sock) = recorder.scope(async move {
-			iotimeout(handshake_timeout, connector.connect(name, sock), "STARTTLS handshake timed out").await
-		}).await;
+		let (verify, sock) = recorder.scope(iotimeout(
+			handshake_timeout,
+			connector.connect(name, sock),
+			"STARTTLS handshake timed out",
+		)).await;
 		match sock {
 			Ok(sock) => {
 				let handshake = sock.get_ref().1.into();

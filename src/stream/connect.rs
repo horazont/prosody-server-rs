@@ -68,9 +68,11 @@ impl ConnectWorker {
 			Some((name, config, recorder)) => {
 				let connector: TlsConnector = config.into();
 				let handshake_timeout = self.stream_cfg.ssl_handshake_timeout;
-				let (verify, result) = recorder.scope(async move {
-					iotimeout(handshake_timeout, connector.connect(name.as_ref(), sock), "timeout during TLS handshake").await
-				}).await;
+				let (verify, result) = recorder.scope(iotimeout(
+					handshake_timeout,
+					connector.connect(name.as_ref(), sock),
+					"timeout during TLS handshake",
+				)).await;
 				let sock = match result {
 					Ok(sock) => sock,
 					Err(e) => {
@@ -110,6 +112,6 @@ impl ConnectWorker {
 
 impl Spawn for ConnectWorker {
 	fn spawn(self) {
-		tokio::spawn(async move { self.run().await });
+		tokio::spawn(self.run());
 	}
 }

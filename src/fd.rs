@@ -126,7 +126,7 @@ impl WatchWorker {
 
 impl Spawn for WatchWorker {
 	fn spawn(self) {
-		tokio::spawn(async move { self.run().await });
+		tokio::spawn(self.run());
 	}
 }
 

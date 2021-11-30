@@ -38,7 +38,7 @@ impl SignalWorker {
 
 impl Spawn for SignalWorker {
 	fn spawn(self) {
-		tokio::spawn(async move { self.run().await });
+		tokio::spawn(self.run());
 	}
 }
 

@@ -99,7 +99,7 @@ struct TimerWorker {
 
 impl TimerWorker {
 	fn spawn(self) {
-		tokio::spawn(async move { self.run().await });
+		tokio::spawn(self.run());
 	}
 
 	async fn elapsed(&mut self) -> Option<Instant> {
