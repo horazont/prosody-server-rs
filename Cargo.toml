@@ -1,6 +1,6 @@
 [package]
 name = "prosody-server"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 mlua = { version = "^0.6", features = ["async", "vendored", "module"] }
 tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 lazy_static = { version ="^1.4" }
-tokio-rustls = { version = "^0.22", features = ["dangerous_configuration"] }
+tokio-rustls = { version = "^0.23", features = ["dangerous_configuration"] }
 rustls-pemfile = { version = "^0.2" }
 pin-project-lite = { version = "^0.2" }
 bytes = { version = "^1" }

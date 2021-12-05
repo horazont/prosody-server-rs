@@ -7,8 +7,6 @@ use bytes::Bytes;
 
 use tokio::sync::mpsc;
 
-use tokio_rustls::webpki;
-
 use crate::cert;
 use crate::conversion::opaque;
 use crate::tls;
@@ -21,7 +19,10 @@ use super::msg::{
 	ControlMessage,
 	SocketOption,
 };
-use super::lua::set_listeners;
+use super::lua::{
+	set_listeners,
+	to_servername,
+};
 
 
 pub(super) enum AddrStr {
@@ -198,12 +199,11 @@ impl LuaUserData for StreamHandle {
 		methods.add_method_mut("starttls", |_, this: &mut Self, (ctx, servername): (Option<tls::TlsConfigHandle>, Option<LuaString>)| -> LuaResult<()> {
 			let ctx_arc = ctx.map(|x| { x.0 });
 			let ctx_ref = ctx_arc.as_ref().map(|x| { &**x });
-			let servername_ref = match servername.as_ref().map(|x| { webpki::DNSNameRef::try_from_ascii(x.as_bytes()) }) {
-				Some(Ok(v)) => Some(v),
-				Some(Err(e)) => return Err(opaque(format!("passed server name {:?} is invalid: {}", servername.unwrap().to_string_lossy(), e)).into()),
+			let servername = match servername.as_ref().map(|x| { to_servername(x) }) {
+				Some(v) => Some(v?),
 				None => None,
 			};
-			let msg = this.state.start_tls(ctx_ref, servername_ref)?;
+			let msg = this.state.start_tls(ctx_ref, servername)?;
 			match this.tx.send(msg) {
 				Ok(()) => Ok(()),
 				Err(_) => return Err(opaque("socket already closed").into()),

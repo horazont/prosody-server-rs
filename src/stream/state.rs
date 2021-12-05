@@ -2,7 +2,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use tokio_rustls::rustls;
-use tokio_rustls::webpki;
 
 use crate::tls;
 use crate::verify;
@@ -27,7 +26,7 @@ pub(crate) enum PreTlsConfig {
 	/// A client-side TLS context was provided.
 	ClientSide(
 		/// The server name to connect to. This is mandatory in rustls.
-		webpki::DNSName,
+		rustls::ServerName,
 
 		/// The rustls client configuration.
 		Arc<rustls::ClientConfig>,
@@ -231,7 +230,7 @@ impl StreamState {
 	///
 	/// Otherwise, the [`ControlMessage`] required to initiate or accept a TLS
 	/// connection is returned and the state transitions to `TlsHandshaking`.
-	pub(super) fn start_tls(&mut self, given_config: Option<&tls::TlsConfig>, given_servername: Option<webpki::DNSNameRef>) -> Result<ControlMessage, StateTransitionError> {
+	pub(super) fn start_tls(&mut self, given_config: Option<&tls::TlsConfig>, given_servername: Option<rustls::ServerName>) -> Result<ControlMessage, StateTransitionError> {
 		self.transition_impl(|this| {
 			let tls_config = match this {
 				Self::TlsHandshaking => return Err((this, StateTransitionError::TlsInProgress)),

@@ -34,7 +34,6 @@ use tokio_rustls::{
 	TlsConnector,
 	server,
 	client,
-	webpki,
 	rustls,
 };
 
@@ -227,7 +226,7 @@ impl Stream {
 	async fn starttls_client<T: AsyncRead + AsyncWrite + Unpin>(
 		&mut self,
 		sock: T,
-		name: webpki::DNSNameRef<'_>,
+		name: rustls::ServerName,
 		connector: TlsConnector,
 		recorder: &verify::RecordingVerifier,
 		handshake_timeout: Duration,
@@ -257,7 +256,7 @@ impl Stream {
 
 	async fn starttls_connect(
 		&mut self,
-		name: webpki::DNSNameRef<'_>,
+		name: rustls::ServerName,
 		ctx: Arc<rustls::ClientConfig>,
 		recorder: &verify::RecordingVerifier,
 		handshake_timeout: Duration
@@ -658,7 +657,7 @@ impl StreamWorker {
 				}
 			},
 			ControlMessage::ConnectTls(name, ctx, recorder) => {
-				let tls_info = self.conn.starttls_connect(name.as_ref(), ctx, &*recorder, self.cfg.ssl_handshake_timeout).await?;
+				let tls_info = self.conn.starttls_connect(name, ctx, &*recorder, self.cfg.ssl_handshake_timeout).await?;
 				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), tls_info}).await {
 					Ok(_) => {
 						self.rx_mode = self.rx_mode.unblock();

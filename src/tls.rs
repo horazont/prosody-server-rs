@@ -6,7 +6,6 @@ use mlua::prelude::*;
 use std::cell::Ref;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fmt::Write;
 use std::fs::{File, read_dir};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -14,7 +13,6 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use tokio_rustls::rustls;
-use tokio_rustls::webpki;
 
 use rustls_pemfile;
 
@@ -25,8 +23,8 @@ use crate::verify;
 
 
 pub(crate) struct DefaultingSNIResolver {
-	default_keypair: RwLock<Option<rustls::sign::CertifiedKey>>,
-	named_keypairs: RwLock<HashMap<String, rustls::sign::CertifiedKey>>,
+	default_keypair: RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
+	named_keypairs: RwLock<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
 }
 
 impl DefaultingSNIResolver {
@@ -37,12 +35,12 @@ impl DefaultingSNIResolver {
 		}
 	}
 
-	fn get_default(&self) -> Option<rustls::sign::CertifiedKey> {
+	fn get_default(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
 		let default_keypair = self.default_keypair.read().unwrap();
 		default_keypair.clone()
 	}
 
-	fn get_by_name(&self, name: webpki::DNSNameRef) -> Option<rustls::sign::CertifiedKey> {
+	fn get_by_name(&self, name: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
 		let name: &str = name.into();
 		let by_name = {
 			let keypairs = self.named_keypairs.read().unwrap();
@@ -54,19 +52,19 @@ impl DefaultingSNIResolver {
 		}
 	}
 
-	fn set_default_keypair(&self, keypair: rustls::sign::CertifiedKey) {
+	fn set_default_keypair(&self, keypair: Arc<rustls::sign::CertifiedKey>) {
 		*self.default_keypair.write().unwrap() = Some(keypair)
 	}
 
-	fn set_keypair(&self, name: webpki::DNSNameRef, keypair: rustls::sign::CertifiedKey) {
+	fn set_keypair(&self, name: &str, keypair: Arc<rustls::sign::CertifiedKey>) {
 		let name: &str = name.into();
 		let mut keypairs = self.named_keypairs.write().unwrap();
 		keypairs.insert(name.to_string(), keypair);
 	}
 }
 
-impl rustls::ResolvesServerCert for DefaultingSNIResolver {
-	fn resolve(&self, client_hello: rustls::ClientHello<'_>) -> Option<rustls::sign::CertifiedKey> {
+impl rustls::server::ResolvesServerCert for DefaultingSNIResolver {
+	fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
 		match client_hello.server_name() {
 			Some(name) => self.get_by_name(name.into()),
 			None => self.get_default(),
@@ -88,25 +86,21 @@ pub(crate) enum TlsConfig {
 }
 
 impl TlsConfig {
-	fn set_sni_host<H: AsRef<[u8]>, C: AsRef<Path>, K: AsRef<Path>>(&self, hostname: H, cert: C, key: K) -> io::Result<()> {
+	fn set_sni_host<H: AsRef<str>, C: AsRef<Path>, K: AsRef<Path>>(&self, hostname: H, cert: C, key: K) -> io::Result<()> {
 		match self {
 			Self::Server{resolver, ..} => {
 				let hostname = hostname.as_ref();
-				let hostname = match webpki::DNSNameRef::try_from_ascii(hostname) {
-					Ok(v) => v,
-					Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid hostname ({})", e))),
-				};
 				let (certs, key) = read_keypair(cert, key)?;
-				let key = match rustls::sign::RSASigningKey::new(&key) {
+				let key = match rustls::sign::RsaSigningKey::new(&key) {
 					Ok(v) => v,
 					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RSA key encountered")),
 				};
-				resolver.set_keypair(hostname, rustls::sign::CertifiedKey{
+				resolver.set_keypair(hostname, Arc::new(rustls::sign::CertifiedKey{
 					cert: certs,
-					key: Arc::new(Box::new(key)),
+					key: Arc::new(key),
 					ocsp: None,
 					sct_list: None,
-				});
+				}));
 				Ok(())
 			},
 			Self::Client{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot add SNI host to client context")),
@@ -131,7 +125,7 @@ impl LuaUserData for TlsConfigHandle {
 	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
 		methods.add_method("set_sni_host", |_, this: &Self, (hostname, cert, key): (LuaString, LuaString, LuaString)| -> LuaResult<Result<bool, String>> {
 			match this.0.set_sni_host(
-					hostname.as_bytes(),
+					hostname.to_str()?,
 					OsStr::from_bytes(cert.as_bytes()),
 					OsStr::from_bytes(key.as_bytes())
 			) {
@@ -196,13 +190,13 @@ fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::si
 		Some(v) => v,
 		None => return Ok(None)
 	};
-	let key = match rustls::sign::RSASigningKey::new(&key) {
+	let key = match rustls::sign::RsaSigningKey::new(&key) {
 		Ok(v) => v,
 		Err(_) => return Err(opaque("invalid RSA key encountered").into()),
 	};
 	Ok(Some(rustls::sign::CertifiedKey{
 		cert: certs,
-		key: Arc::new(Box::new(key)),
+		key: Arc::new(key),
 		ocsp: None,
 		sct_list: None,
 	}))
@@ -215,6 +209,21 @@ fn borrow_named_str<'l>(name: &str, v: &'l LuaValue<'l>) -> Result<&'l str, Stri
 	}
 }
 
+fn read_rootstore_file<P: AsRef<Path>>(name: P, into: &mut rustls::RootCertStore) -> io::Result<()> {
+	let f = File::open(name.as_ref())?;
+	let mut f = io::BufReader::new(f);
+	let mut certs = Vec::new();
+	for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut f).transpose()) {
+		match item {
+			Ok(rustls_pemfile::Item::X509Certificate(cert)) => certs.push(cert),
+			Ok(_) => continue,
+			Err(_) => continue,
+		}
+	}
+	into.add_parsable_certificates(&certs[..]);
+	Ok(())
+}
+
 fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let resolver = DefaultingSNIResolver::new();
 	let default_keypair = match certificatekey_from_lua(&config) {
@@ -222,13 +231,12 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		Err(e) => return Ok(Err(format!("invalid keypair: {}", e))),
 	};
 	if let Some(default_keypair) = default_keypair {
-		resolver.set_default_keypair(default_keypair);
+		resolver.set_default_keypair(Arc::new(default_keypair));
 	}
 	let resolver = Arc::new(resolver);
 
 	let mut root_store = rustls::RootCertStore::empty();
 	let mut strict_verify = true;
-	let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
 	for kv in config.pairs::<LuaString, LuaValue>() {
 		let (k, v) = match kv {
 			Ok(kv) => kv,
@@ -243,8 +251,7 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		match k {
 			"cafile" => {
 				let fname = strerror_ok!(borrow_named_str(k, &v));
-				let f = strerror_ok!(File::open(fname));
-				let _ = root_store.add_pem_file(&mut io::BufReader::new(f));
+				strerror_ok!(read_rootstore_file(fname, &mut root_store));
 			},
 			"capath" => {
 				let dirname = strerror_ok!(borrow_named_str(k, &v));
@@ -253,8 +260,7 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 						Ok(entry) => entry,
 						Err(_) => continue,
 					};
-					let f = strerror_ok!(File::open(entry.path()));
-					let _ = root_store.add_pem_file(&mut io::BufReader::new(f));
+					strerror_ok!(read_rootstore_file(entry.path(), &mut root_store));
 				}
 			},
 			"verifyext" => {
@@ -284,14 +290,14 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		}
 	}
 
-	let verifier = rustls::AllowAnyAnonymousOrAuthenticatedClient::new(root_store);
+	let verifier = rustls::server::AllowAnyAnonymousOrAuthenticatedClient::new(root_store);
 	let recorder = verify::RecordingClientVerifier::new(verifier, strict_verify);
 	let recorder = Arc::new(recorder);
 
-	cfg.set_client_certificate_verifier(recorder.clone());
-	cfg.versions = vec![rustls::ProtocolVersion::TLSv1_2, rustls::ProtocolVersion::TLSv1_3];
-	cfg.cert_resolver = resolver.clone();
-	cfg.ignore_client_order = true;
+	let cfg = rustls::ServerConfig::builder()
+		.with_safe_defaults()
+		.with_client_cert_verifier(recorder.clone())
+		.with_cert_resolver(resolver.clone());
 
 	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Server{
 		cfg: Arc::new(cfg),
@@ -301,15 +307,9 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 }
 
 fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
-	let mut cfg = rustls::ClientConfig::new();
-	match keypair_from_lua(&config)? {
-		Some((certs, key)) => strerror_ok!(cfg.set_single_client_cert(certs, key)),
-		None => (),
-	};
-	let mut recorder = verify::RecordingVerifier::new(
-		Arc::new(rustls::WebPKIVerifier::new()),
-		true,
-	);
+	let mut root_store = rustls::RootCertStore::empty();
+	let mut strict_verify = true;
+	let keypair = keypair_from_lua(&config)?;
 	for kv in config.pairs::<LuaString, LuaValue>() {
 		let (k, v) = match kv {
 			Ok(kv) => kv,
@@ -324,8 +324,7 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		match k {
 			"cafile" => {
 				let fname = strerror_ok!(borrow_named_str(k, &v));
-				let f = strerror_ok!(File::open(fname));
-				let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
+				strerror_ok!(read_rootstore_file(fname, &mut root_store));
 			},
 			"capath" => {
 				let dirname = strerror_ok!(borrow_named_str(k, &v));
@@ -334,8 +333,7 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 						Ok(entry) => entry,
 						Err(_) => continue,
 					};
-					let f = strerror_ok!(File::open(entry.path()));
-					let _ = cfg.root_store.add_pem_file(&mut io::BufReader::new(f));
+					strerror_ok!(read_rootstore_file(entry.path(), &mut root_store));
 				}
 			},
 			"verifyext" => {
@@ -352,7 +350,7 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 				for v in vs {
 					match v.as_str() {
 						"lsec_continue" => {
-							recorder.strict = false;
+							strict_verify = false;
 						},
 						"lsec_ignore_purpose" => continue,
 						// no idea what this one is supposed to do?!
@@ -365,8 +363,18 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		}
 	}
 
-	let recorder = Arc::new(recorder);
-	cfg.dangerous().set_certificate_verifier(recorder.clone());
+	let recorder = Arc::new(verify::RecordingVerifier::new(
+		Arc::new(rustls::client::WebPkiVerifier::new(root_store, None)),
+		strict_verify,
+	));
+	let cfg = rustls::ClientConfig::builder()
+		.with_safe_defaults()
+		.with_custom_certificate_verifier(recorder.clone());
+
+	let cfg = match keypair {
+		Some((certs, key)) => strerror_ok!(cfg.with_single_cert(certs, key)),
+		None => cfg.with_no_client_auth(),
+	};
 
 	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Client{
 		cfg: Arc::new(cfg),
@@ -396,66 +404,30 @@ fn protocol_str(p: rustls::ProtocolVersion) -> &'static str {
 	}
 }
 
-fn cipher_str(p: rustls::ProtocolVersion, cs: &rustls::SupportedCipherSuite) -> String {
-	use rustls::internal::msgs::handshake::{
-		KeyExchangeAlgorithm,
-	};
-	use rustls::BulkAlgorithm;
-	use rustls::internal::msgs::enums::{
-		HashAlgorithm,
-	};
-	let mut buf = String::with_capacity(32);
-	match p {
-		rustls::ProtocolVersion::TLSv1_3 => {
-			// TLSv1.3 is diffeernt with some separation of kex and cipher
-			// We'[l try to get hold of the IANA name of the cipher and use that
-			// not at *all* relying on any implementation details here *ahem*
-			write!(buf, "{:?}", cs.suite).unwrap();
-			if buf.len() >= 6 && &buf[..6] == "TLS13_" {
-				buf.drain(3..5);
-			}
-		},
-		_ => {
-			match cs.kx {
-				KeyExchangeAlgorithm::BulkOnly => (),
-				KeyExchangeAlgorithm::RSA => buf.push_str("RSA-"),
-				KeyExchangeAlgorithm::DH => buf.push_str("DH-"),
-				KeyExchangeAlgorithm::DHE => buf.push_str("DHE-"),
-				KeyExchangeAlgorithm::ECDH => buf.push_str("ECDH-"),
-				KeyExchangeAlgorithm::ECDHE => buf.push_str("ECDHE-"),
-			};
-			match cs.bulk {
-				BulkAlgorithm::AES_128_GCM => buf.push_str("AES128-GCM"),
-				BulkAlgorithm::AES_256_GCM => buf.push_str("AES128-GCM"),
-				BulkAlgorithm::CHACHA20_POLY1305 => buf.push_str("CHACHA20-POLY1305"),
-			};
-			match cs.hash {
-				HashAlgorithm::NONE => (),
-				HashAlgorithm::MD5 => buf.push_str("-MD5"),
-				HashAlgorithm::SHA1 => buf.push_str("-SHA"),
-				HashAlgorithm::SHA224 => buf.push_str("-SHA224"),
-				HashAlgorithm::SHA256 => buf.push_str("-SHA256"),
-				HashAlgorithm::SHA384 => buf.push_str("-SHA384"),
-				HashAlgorithm::SHA512 => buf.push_str("-SHA512"),
-				HashAlgorithm::Unknown(_) => buf.push_str("-UNKNOWN"),
-			};
-		},
-	}
-	buf.shrink_to_fit();
-	buf
+fn cipher_str(cs: rustls::SupportedCipherSuite) -> String {
+	format!("{:?}", cs.suite())
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HandshakeInfo {
 	protocol: rustls::ProtocolVersion,
-	cipher: &'static rustls::SupportedCipherSuite,
+	cipher: rustls::SupportedCipherSuite,
 }
 
-impl<T: rustls::Session> From<&T> for HandshakeInfo {
-	fn from(other: &T) -> Self {
+impl From<&rustls::server::ServerConnection> for HandshakeInfo {
+	fn from(other: &rustls::server::ServerConnection) -> Self {
 		Self{
-			protocol: other.get_protocol_version().unwrap(),
-			cipher: other.get_negotiated_ciphersuite().unwrap(),
+			protocol: other.protocol_version().unwrap(),
+			cipher: other.negotiated_cipher_suite().unwrap(),
+		}
+	}
+}
+
+impl From<&rustls::client::ClientConnection> for HandshakeInfo {
+	fn from(other: &rustls::client::ClientConnection) -> Self {
+		Self{
+			protocol: other.protocol_version().unwrap(),
+			cipher: other.negotiated_cipher_suite().unwrap(),
 		}
 	}
 }
@@ -465,7 +437,7 @@ impl HandshakeInfo {
 		let result = lua.create_table_with_capacity(0, 3)?;
 		result.raw_set::<_, _>("compression", false)?;
 		result.raw_set::<_, _>("protocol", protocol_str(self.protocol))?;
-		result.raw_set::<_, _>("cipher", cipher_str(self.protocol, self.cipher))?;
+		result.raw_set::<_, _>("cipher", cipher_str(self.cipher))?;
 		Ok(result)
 	}
 }

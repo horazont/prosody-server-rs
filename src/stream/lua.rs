@@ -9,7 +9,6 @@ use tokio::net::TcpStream;
 
 use tokio_rustls::rustls;
 use tokio_rustls::server;
-use tokio_rustls::webpki;
 
 use nix::{
 	fcntl::FcntlArg,
@@ -118,7 +117,7 @@ fn spawn_connect_worker<'l>(
 		lua: &'l Lua,
 		addr: SocketAddr,
 		listeners: LuaTable,
-		tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
+		tls_config: Option<(rustls::ServerName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
 		connect_cfg: config::ClientConfig,
 		stream_cfg: config::StreamConfig,
 ) -> LuaResult<LuaAnyUserData<'l>> {
@@ -196,6 +195,17 @@ pub(crate) fn spawn_accepted_tlstcp_worker<'l>(
 	)
 }
 
+pub(crate) fn to_servername<'l>(servername: &LuaString<'l>) -> LuaResult<rustls::ServerName> {
+	let servername = match servername.to_str() {
+		Ok(v) => v,
+		Err(e) => return Err(conversion::opaque(format!("passed server name {:?} is invalid utf-8: {}", servername, e)).into()),
+	};
+	match servername.try_into() {
+		Ok(v) => Ok(v),
+		Err(e) => return Err(conversion::opaque(format!("passed server name {:?} is invalid dns name: {}", servername, e)).into()),
+	}
+}
+
 pub(crate) fn set_listeners<'l>(ud: &LuaAnyUserData<'l>, listeners: LuaTable<'l>) -> LuaResult<()> {
 	let tbl = ud.get_user_value::<LuaTable>()?;
 	tbl.set(0, listeners)
@@ -220,8 +230,8 @@ pub(crate) fn wrapclient<'l>(
 	// extra is required, we MUST have the server name...
 	let servername = match extra.as_ref() {
 		Some(extra) => match extra.get::<_, Option<LuaString>>("servername") {
-			Ok(Some(v)) => match webpki::DNSNameRef::try_from_ascii(v.as_bytes()) {
-				Ok(v) => Some(v.to_owned()),
+			Ok(Some(v)) => match to_servername(&v) {
+				Ok(v) => Some(v),
 				Err(e) => return Ok(Err(format!("servername is not a DNSName: {}", e))),
 			},
 			Ok(None) => None,
@@ -291,7 +301,7 @@ pub(crate) fn addclient<'l>(
 				Ok(None) => return Ok(Err(format!("missing option servername (required for TLS, and TLS context is given)"))),
 				Err(e) => return Ok(Err(format!("invalid option servername (required for TLS, and TLS context is given): {}", e))),
 			};
-			let servername = match webpki::DNSNameRef::try_from_ascii(servername.as_bytes()) {
+			let servername = match to_servername(&servername) {
 				Ok(v) => v,
 				Err(e) => return Ok(Err(format!("servername is not a DNSName: {}", e))),
 			};

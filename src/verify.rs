@@ -8,14 +8,13 @@ use std::sync::Arc;
 use tokio::task_local;
 
 use tokio_rustls::rustls;
-use tokio_rustls::webpki;
 
 
 #[derive(Debug, Clone)]
 pub(crate) enum VerificationRecord {
 	Unverified,
 	Passed{cert: rustls::Certificate},
-	Failed{err: rustls::TLSError},
+	Failed{err: rustls::Error},
 }
 
 impl Default for VerificationRecord {
@@ -30,12 +29,12 @@ task_local! {
 }
 
 pub(crate) struct RecordingVerifier {
-	inner: Arc<dyn rustls::ServerCertVerifier>,
+	inner: Arc<dyn rustls::client::ServerCertVerifier>,
 	pub(crate) strict: bool,
 }
 
 impl RecordingVerifier {
-	pub(crate) fn new(inner: Arc<dyn rustls::ServerCertVerifier>, strict: bool) -> Self {
+	pub(crate) fn new(inner: Arc<dyn rustls::client::ServerCertVerifier>, strict: bool) -> Self {
 		Self{inner, strict}
 	}
 
@@ -47,18 +46,27 @@ impl RecordingVerifier {
 	}
 }
 
-impl rustls::ServerCertVerifier for RecordingVerifier {
+impl rustls::client::ServerCertVerifier for RecordingVerifier {
     fn verify_server_cert(
         &self,
-        roots: &rustls::RootCertStore,
-        presented_certs: &[rustls::Certificate],
-        dns_name: webpki::DNSNameRef<'_>,
-        ocsp_response: &[u8]
-    ) -> Result<rustls::ServerCertVerified, rustls::TLSError> {
+        end_entity: &rustls::Certificate,
+        intermediates: &[rustls::Certificate],
+        server_name: &rustls::ServerName,
+        scts: &mut dyn Iterator<Item = &[u8]>,
+        ocsp_response: &[u8],
+        now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
 		CURRENT_VERIFIER.with(|x| {
-			let (record, result) = match self.inner.verify_server_cert(roots, presented_certs, dns_name, ocsp_response) {
+			let (record, result) = match self.inner.verify_server_cert(
+				end_entity,
+				intermediates,
+				server_name,
+				scts,
+				ocsp_response,
+				now,
+			) {
 				Ok(r) => {
-					let cert = presented_certs[0].clone();
+					let cert = end_entity.clone();
 					(VerificationRecord::Passed{cert}, Ok(r))
 				},
 				Err(e) => (VerificationRecord::Failed{err: e.clone()}, Err(e)),
@@ -67,19 +75,19 @@ impl rustls::ServerCertVerifier for RecordingVerifier {
 			if self.strict {
 				result
 			} else {
-				Ok(rustls::ServerCertVerified::assertion())
+				Ok(rustls::client::ServerCertVerified::assertion())
 			}
 		})
 	}
 }
 
 pub(crate) struct RecordingClientVerifier {
-	inner: Arc<dyn rustls::ClientCertVerifier>,
+	inner: Arc<dyn rustls::server::ClientCertVerifier>,
 	pub(crate) strict: bool,
 }
 
 impl RecordingClientVerifier {
-	pub(crate) fn new(inner: Arc<dyn rustls::ClientCertVerifier>, strict: bool) -> Self {
+	pub(crate) fn new(inner: Arc<dyn rustls::server::ClientCertVerifier>, strict: bool) -> Self {
 		Self{inner, strict}
 	}
 
@@ -91,9 +99,9 @@ impl RecordingClientVerifier {
 	}
 }
 
-impl rustls::ClientCertVerifier for RecordingClientVerifier {
-	fn client_auth_mandatory(&self, sni: Option<&webpki::DNSName>) -> Option<bool> {
-		match self.inner.client_auth_mandatory(sni) {
+impl rustls::server::ClientCertVerifier for RecordingClientVerifier {
+	fn client_auth_mandatory(&self) -> Option<bool> {
+		match self.inner.client_auth_mandatory() {
 			Some(mandatory) => Some(mandatory && !self.strict),
 			None => None,
 		}
@@ -103,20 +111,21 @@ impl rustls::ClientCertVerifier for RecordingClientVerifier {
 		self.inner.offer_client_auth()
 	}
 
-	fn client_auth_root_subjects(&self, _sni: Option<&webpki::DNSName>) -> Option<Vec<rustls::internal::msgs::base::PayloadU16>> {
+	fn client_auth_root_subjects(&self) -> Option<Vec<rustls::internal::msgs::base::PayloadU16>> {
 		// We never tell the peer which certificates we accept ... Otherwise it would be an awfully long list in the general case.
 		Some(Vec::new())
 	}
 
     fn verify_client_cert(
         &self,
-        presented_certs: &[rustls::Certificate],
-        sni: Option<&webpki::DNSName>,
-    ) -> Result<rustls::ClientCertVerified, rustls::TLSError> {
+        end_entity: &rustls::Certificate,
+        intermediates: &[rustls::Certificate],
+        now: std::time::SystemTime,
+    ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
 		CURRENT_VERIFIER.with(|x| {
-			let (record, result) = match self.inner.verify_client_cert(presented_certs, sni) {
+			let (record, result) = match self.inner.verify_client_cert(end_entity, intermediates, now) {
 				Ok(r) => {
-					let cert = presented_certs[0].clone();
+					let cert = end_entity.clone();
 					(VerificationRecord::Passed{cert}, Ok(r))
 				},
 				Err(e) => (VerificationRecord::Failed{err: e.clone()}, Err(e)),
@@ -125,7 +134,7 @@ impl rustls::ClientCertVerifier for RecordingClientVerifier {
 			if self.strict {
 				result
 			} else {
-				Ok(rustls::ClientCertVerified::assertion())
+				Ok(rustls::server::ClientCertVerified::assertion())
 			}
 		})
 	}

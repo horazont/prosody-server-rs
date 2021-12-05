@@ -5,7 +5,6 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use tokio_rustls::TlsConnector;
-use tokio_rustls::webpki;
 use tokio_rustls::rustls;
 
 use crate::config;
@@ -32,7 +31,7 @@ pub(super) struct ConnectWorker {
 	addr: SocketAddr,
 	connect_cfg: config::ClientConfig,
 	stream_cfg: config::StreamConfig,
-	tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
+	tls_config: Option<(rustls::ServerName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
 	handle: LuaRegistryHandle,
 }
 
@@ -40,7 +39,7 @@ impl ConnectWorker {
 	pub(super) fn new(
 			rx: mpsc::UnboundedReceiver<ControlMessage>,
 			addr: SocketAddr,
-			tls_config: Option<(webpki::DNSName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
+			tls_config: Option<(rustls::ServerName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>)>,
 			connect_cfg: config::ClientConfig,
 			stream_cfg: config::StreamConfig,
 			handle: LuaRegistryHandle,
@@ -72,7 +71,7 @@ impl ConnectWorker {
 				let handshake_timeout = self.stream_cfg.ssl_handshake_timeout;
 				let (verify, result) = recorder.scope(iotimeout(
 					handshake_timeout,
-					connector.connect(name.as_ref(), sock),
+					connector.connect(name, sock),
 					"timeout during TLS handshake",
 				)).await;
 				let sock = match result {
