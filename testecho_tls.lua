@@ -5,13 +5,15 @@ server.set_config({
 server.listen("0.0.0.0", 1234, {
 	onconnect = function(sock)
 		-- print("connection from "..sock:ip()..":"..tostring(sock:port()));
-		print("new connection in lua");
+		-- print("new connection in lua");
 	end,
 	onincoming = function(sock, data)
 		sock:write(data);
 	end,
 	ondisconnect = function(sock, err)
-		print("ondisconnect", err)
+		if err ~= nil and err ~= "closed" then
+			print("ondisconnect", err)
+		end
 		sock:close();
 	end,
 }, {
