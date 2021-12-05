@@ -200,7 +200,11 @@ pub(crate) fn to_servername<'l>(servername: &LuaString<'l>) -> LuaResult<rustls:
 		Ok(v) => v,
 		Err(e) => return Err(conversion::opaque(format!("passed server name {:?} is invalid utf-8: {}", servername, e)).into()),
 	};
-	match servername.try_into() {
+	let servername = match idna::domain_to_ascii(servername) {
+		Ok(v) => v,
+		Err(e) => return Err(conversion::opaque(format!("passed server name {:?} cannot be converted to ascii: {}", servername, e)).into()),
+	};
+	match servername.as_str().try_into() {
 		Ok(v) => Ok(v),
 		Err(e) => return Err(conversion::opaque(format!("passed server name {:?} is invalid dns name: {}", servername, e)).into()),
 	}
