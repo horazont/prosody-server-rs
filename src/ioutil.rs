@@ -4,7 +4,6 @@
 use std::error;
 use std::fmt;
 use std::future::Future;
-use std::mem::MaybeUninit;
 use std::io;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
@@ -15,7 +14,7 @@ use pin_project_lite::pin_project;
 
 use bytes::{Buf, BufMut};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{timeout, timeout_at};
 
@@ -225,39 +224,18 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin, T: Buf, R: BufMut> Future for Duplex
 			}
 		}
 
-		// Now for the read attempt. This is trickier because we need to deal
-		// with potentially uninitialized bytes in the rxbuf.
-		// This is inspired by what tokio internally does with the ReadBuf
-		// future (not to be confused with the ReadBuf struct we use here!).
-		// It is re-written to avoid relying on implementation details of
-		// bytes::UninitSlice.
 		let n = {
-			let dst = this.rxbuf.chunk_mut();
-			let dst = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut MaybeUninit<u8>, dst.len()) };
-			let mut buf = ReadBuf::uninit(dst);
-			let ptr = buf.filled().as_ptr();
-			match Pin::new(this.stream).poll_read(cx, &mut buf) {
-				// continue evaluation
-				Poll::Ready(Ok(())) => {
-					// safeguard shamelessly stolen
-					assert_eq!(ptr, buf.filled().as_ptr());
-					Some(buf.filled().len())
-				},
-				// return errors immediately
+			let read_buf = this.stream.read_buf(this.rxbuf);
+			tokio::pin!(read_buf);
+			match read_buf.poll(cx) {
+				Poll::Ready(Ok(n)) => Some(n),
 				Poll::Ready(Err(e)) => return Poll::Ready(Err(DuplexError::Read(e))),
-				// no bytes read
-				Poll::Pending => {
-					None
-				}
+				Poll::Pending => None,
 			}
 		};
 
 		match n {
 			Some(n) => {
-				// safety: due to how ReadBuf::filled works, it is guaranteed
-				// that n bytes have actually been initialized.
-				unsafe { this.rxbuf.advance_mut(n) }
-
 				// We received something, we let them know and return
 				// successfully.
 				if *this.nwritten > 0 {
@@ -330,6 +308,8 @@ mod tests {
 	use std::task::{Waker, RawWaker, RawWakerVTable};
 
 	use bytes::{Bytes, BytesMut};
+
+	use tokio::io::ReadBuf;
 
 	struct IoPattern {
 		clock: usize,
