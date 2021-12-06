@@ -20,6 +20,56 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{timeout, timeout_at};
 
 
+pub trait AsyncReadable {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+}
+
+impl AsyncReadable for TcpStream {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		TcpStream::poll_read_ready(self, cx)
+	}
+}
+
+impl AsyncReadable for UnixStream {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		UnixStream::poll_read_ready(self, cx)
+	}
+}
+
+impl<T: AsyncReadable> AsyncReadable for tokio_rustls::client::TlsStream<T> {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		let (sock, tls) = self.get_mut();
+		if tls.wants_read() {
+			sock.poll_read_ready(cx)
+		} else {
+			Poll::Ready(Ok(()))
+		}
+	}
+}
+
+impl<T: AsyncReadable> AsyncReadable for tokio_rustls::server::TlsStream<T> {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		let (sock, tls) = self.get_mut();
+		if tls.wants_read() {
+			sock.poll_read_ready(cx)
+		} else {
+			Poll::Ready(Ok(()))
+		}
+	}
+}
+
+impl<T: AsyncReadable> AsyncReadable for tokio_rustls::TlsStream<T> {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		let (sock, tls) = self.get_mut();
+		if tls.wants_read() {
+			sock.poll_read_ready(cx)
+		} else {
+			Poll::Ready(Ok(()))
+		}
+	}
+}
+
+
 /// Attempt an I/O operation, returning a timeout if it does not complete
 /// within the given duration.
 ///
@@ -1026,74 +1076,27 @@ impl<'a, B: BufMut, F: FnOnce() -> B, S: AsyncRead + Unpin> LazyAllocRead<'a, S,
 	}
 }
 
-macro_rules! lazy_alloc_read_tls_impl {
-	($t:ty) => {
-		impl<'a, B: BufMut, F: FnOnce() -> B> Future for LazyAllocRead<'a, $t, B, F> {
-			type Output = io::Result<B>;
+impl<'a, B: BufMut, F: FnOnce() -> B, S: AsyncReadable + AsyncRead + Unpin> Future for LazyAllocRead<'a, S, B, F> {
+	type Output = io::Result<B>;
 
-			fn poll(
-				self: Pin<&mut Self>,
-				cx: &mut Context<'_>,
-			) -> Poll<Self::Output> {
-				let this = self.project();
-				if this.stream.get_ref().1.wants_read() {
-					match this.stream.get_ref().0.poll_read_ready(cx) {
-						Poll::Ready(Ok(_)) => (),
-						Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-						Poll::Pending => return Poll::Pending,
-					};
-				}
+	fn poll(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+	) -> Poll<Self::Output> {
+		let this = self.project();
+		match this.stream.poll_read_ready(cx) {
+			Poll::Ready(Ok(_)) => (),
+			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+			Poll::Pending => return Poll::Pending,
+		};
 
-				let mut buf = this.buf.get_mut();
-				let read_buf = this.stream.read_buf(&mut buf);
-				tokio::pin!(read_buf);
-				match read_buf.poll(cx) {
-					Poll::Ready(Ok(_)) => Poll::Ready(Ok(this.buf.take().unwrap())),
-					Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-					Poll::Pending => return Poll::Pending,
-				}
-			}
+		let mut buf = this.buf.get_mut();
+		let read_buf = this.stream.read_buf(&mut buf);
+		tokio::pin!(read_buf);
+		match read_buf.poll(cx) {
+			Poll::Ready(Ok(_)) => Poll::Ready(Ok(this.buf.take().unwrap())),
+			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+			Poll::Pending => return Poll::Pending,
 		}
-
 	}
 }
-
-macro_rules! lazy_alloc_read_plain_impl {
-	($t:ty) => {
-		impl<'a, B: BufMut, F: FnOnce() -> B> Future for LazyAllocRead<'a, $t, B, F> {
-			type Output = io::Result<B>;
-
-			fn poll(
-				self: Pin<&mut Self>,
-				cx: &mut Context<'_>,
-			) -> Poll<Self::Output> {
-				let this = self.project();
-				match this.stream.poll_read_ready(cx) {
-					Poll::Ready(Ok(_)) => (),
-					Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-					Poll::Pending => return Poll::Pending,
-				};
-
-				let mut buf = this.buf.get_mut();
-				let read_buf = this.stream.read_buf(&mut buf);
-				tokio::pin!(read_buf);
-				match read_buf.poll(cx) {
-					Poll::Ready(Ok(_)) => Poll::Ready(Ok(this.buf.take().unwrap())),
-					Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-					Poll::Pending => return Poll::Pending,
-				}
-			}
-		}
-
-	}
-}
-
-
-lazy_alloc_read_tls_impl!(tokio_rustls::client::TlsStream<TcpStream>);
-lazy_alloc_read_tls_impl!(tokio_rustls::client::TlsStream<UnixStream>);
-lazy_alloc_read_tls_impl!(tokio_rustls::server::TlsStream<TcpStream>);
-lazy_alloc_read_tls_impl!(tokio_rustls::server::TlsStream<UnixStream>);
-lazy_alloc_read_tls_impl!(tokio_rustls::TlsStream<TcpStream>);
-lazy_alloc_read_tls_impl!(tokio_rustls::TlsStream<UnixStream>);
-lazy_alloc_read_plain_impl!(TcpStream);
-lazy_alloc_read_plain_impl!(UnixStream);
