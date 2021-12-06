@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use pin_utils::pin_mut;
-
 use bytes::{Bytes, BytesMut, BufMut, Buf, buf::Limit};
 
 use tokio::select;
@@ -732,8 +730,8 @@ impl StreamWorker {
 			};
 
 			let (rx, tx) = self.conn.as_parts_mut();
-			pin_mut!(rx);
-			pin_mut!(tx);
+			tokio::pin!(rx);
+			tokio::pin!(tx);
 
 			select! {
 				result = timeout_at(read_deadline.into(), rx.read_buf(rxbuf)), if self.rx_mode.may() => match result {
