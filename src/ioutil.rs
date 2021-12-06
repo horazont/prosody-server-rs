@@ -15,7 +15,8 @@ use pin_project_lite::pin_project;
 
 use bytes::{Buf, BufMut};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{timeout, timeout_at};
 
 
@@ -963,3 +964,136 @@ mod tests {
 		assert_eq!(txbuf.remaining(), 2);
 	}
 }
+
+
+#[derive(Debug)]
+struct LazyBuffer<F, B> {
+	allocator: Option<F>,
+	buffer: Option<B>,
+}
+
+impl<B: BufMut, F: FnOnce() -> B> LazyBuffer<F, B> {
+	// not used *yet*
+	#[allow(dead_code)]
+	fn new(f: F) -> Self {
+		Self{
+			allocator: Some(f),
+			buffer: None,
+		}
+	}
+
+	fn get_mut(&mut self) -> &mut B {
+		debug_assert!(!(self.allocator.is_none() && self.buffer.is_none()));
+		debug_assert!(!(self.allocator.is_some() && self.buffer.is_some()));
+		match self.buffer {
+			Some(ref mut buf) => buf,
+			None => {
+				let buf = self.allocator.take().unwrap()();
+				self.buffer = Some(buf);
+				self.buffer.as_mut().unwrap()
+			},
+		}
+	}
+
+	fn take(&mut self) -> Option<B> {
+		self.buffer.take()
+	}
+}
+
+
+pin_project! {
+	#[derive(Debug)]
+	#[must_use = "futures do nothing unless you `.await` or poll them"]
+	pub struct LazyAllocRead<'a, S, B, F> {
+		stream: &'a mut S,
+		buf: LazyBuffer<F, B>,
+		#[pin]
+		_pin: PhantomPinned,
+	}
+}
+
+impl<'a, B: BufMut, F: FnOnce() -> B, S: AsyncRead + Unpin> LazyAllocRead<'a, S, B, F>
+	where LazyAllocRead<'a, S, B, F>: Future
+{
+	// not used *yet*
+	#[allow(dead_code)]
+	fn new(stream: &'a mut S, f: F) -> Self {
+		Self{
+			stream,
+			buf: LazyBuffer::new(f),
+			_pin: PhantomPinned,
+		}
+	}
+}
+
+macro_rules! lazy_alloc_read_tls_impl {
+	($t:ty) => {
+		impl<'a, B: BufMut, F: FnOnce() -> B> Future for LazyAllocRead<'a, $t, B, F> {
+			type Output = io::Result<B>;
+
+			fn poll(
+				self: Pin<&mut Self>,
+				cx: &mut Context<'_>,
+			) -> Poll<Self::Output> {
+				let this = self.project();
+				if this.stream.get_ref().1.wants_read() {
+					match this.stream.get_ref().0.poll_read_ready(cx) {
+						Poll::Ready(Ok(_)) => (),
+						Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+						Poll::Pending => return Poll::Pending,
+					};
+				}
+
+				let mut buf = this.buf.get_mut();
+				let read_buf = this.stream.read_buf(&mut buf);
+				tokio::pin!(read_buf);
+				match read_buf.poll(cx) {
+					Poll::Ready(Ok(_)) => Poll::Ready(Ok(this.buf.take().unwrap())),
+					Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+					Poll::Pending => return Poll::Pending,
+				}
+			}
+		}
+
+	}
+}
+
+macro_rules! lazy_alloc_read_plain_impl {
+	($t:ty) => {
+		impl<'a, B: BufMut, F: FnOnce() -> B> Future for LazyAllocRead<'a, $t, B, F> {
+			type Output = io::Result<B>;
+
+			fn poll(
+				self: Pin<&mut Self>,
+				cx: &mut Context<'_>,
+			) -> Poll<Self::Output> {
+				let this = self.project();
+				match this.stream.poll_read_ready(cx) {
+					Poll::Ready(Ok(_)) => (),
+					Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+					Poll::Pending => return Poll::Pending,
+				};
+
+				let mut buf = this.buf.get_mut();
+				let read_buf = this.stream.read_buf(&mut buf);
+				tokio::pin!(read_buf);
+				match read_buf.poll(cx) {
+					Poll::Ready(Ok(_)) => Poll::Ready(Ok(this.buf.take().unwrap())),
+					Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+					Poll::Pending => return Poll::Pending,
+				}
+			}
+		}
+
+	}
+}
+
+
+lazy_alloc_read_tls_impl!(tokio_rustls::client::TlsStream<TcpStream>);
+lazy_alloc_read_tls_impl!(tokio_rustls::client::TlsStream<UnixStream>);
+lazy_alloc_read_tls_impl!(tokio_rustls::server::TlsStream<TcpStream>);
+lazy_alloc_read_tls_impl!(tokio_rustls::server::TlsStream<UnixStream>);
+lazy_alloc_read_tls_impl!(tokio_rustls::TlsStream<TcpStream>);
+lazy_alloc_read_tls_impl!(tokio_rustls::TlsStream<UnixStream>);
+lazy_alloc_read_plain_impl!(TcpStream);
+lazy_alloc_read_plain_impl!(UnixStream);
