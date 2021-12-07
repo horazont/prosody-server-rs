@@ -21,6 +21,7 @@ nix = { version = "^0.22" }
 socket2 = { version = "^0.4", features = ["all"] }
 x509-parser = { version = "^0.11" }
 idna = { version = "^0.2" }
+futures-util = { version = "^0.3" }
 
 [features]
 prosody-log = []
@@ -32,3 +33,6 @@ default = ["prosody-log", "lua52"]
 
 [profile.release]
 debug = true
+
+[dev-dependencies]
+tokio = { version = "^1.9", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal", "test-util"] }

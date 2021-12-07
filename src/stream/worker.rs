@@ -804,7 +804,7 @@ impl StreamWorker {
 						}
 					},
 				},
-				result = iodeadline(write_deadline, tx.write_all_buf(txbuf), "write timed out"), if self.tx_mode.may() && txbuf.has_remaining() => match result {
+				result = iodeadline(write_deadline.into(), tx.write_all_buf(txbuf), "write timed out"), if self.tx_mode.may() && txbuf.has_remaining() => match result {
 					Ok(()) => {
 						// set to false because we cleared the buffer. if this
 						// is false, the write deadline will be advanced on

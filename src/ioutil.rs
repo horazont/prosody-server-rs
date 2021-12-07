@@ -8,15 +8,17 @@ use std::io;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 
 use pin_project_lite::pin_project;
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use futures_util::stream::Stream;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::time::{timeout, timeout_at};
+use tokio::time::{timeout, timeout_at, Sleep, sleep, Instant};
 
 
 pub trait AsyncReadable {
@@ -96,6 +98,192 @@ pub(crate) async fn iodeadline<T, F: std::future::Future<Output = io::Result<T>>
 	match timeout_at(t.into(), f).await {
 		Ok(r) => r,
 		Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, msg)),
+	}
+}
+
+
+pub trait TxBufRead {
+	/// Return the current buffer if one is available, otherwise return None.
+	///
+	/// This must never block. If a buffer is temporarily not available, it should simply return None.
+	///
+	/// If no call to advance is made in between calls to get_buf, the same buffer MUST be returned.
+	fn get_buf(&mut self) -> Option<&[u8]>;
+
+	/// Consume the given amount of bytes.
+	///
+	/// Calling this with a value larger than the length of the buffer currently returned by get_buf causes a panic.
+	fn advance(&mut self, by: usize);
+}
+
+
+pin_project! {
+	pub struct DuplexStream<I, T> {
+		#[pin]
+		inner: I,
+		txsrc: T,
+		rxbuf: Option<BytesMut>,
+		read_timeout: tokio::time::Duration,
+		write_timeout: tokio::time::Duration,
+		#[pin]
+		read_deadline: Sleep,
+		#[pin]
+		write_deadline: Sleep,
+	}
+}
+
+
+impl<I, T> DuplexStream<I, T> where DuplexStream<I, T>: Stream {
+	pub fn new(
+			inner: I,
+			txsrc: T,
+			read_timeout: tokio::time::Duration,
+			write_timeout: tokio::time::Duration,
+	) -> Self {
+		Self{
+			inner,
+			txsrc,
+			rxbuf: None,
+			read_timeout,
+			write_timeout,
+			read_deadline: sleep(read_timeout),
+			write_deadline: sleep(write_timeout),
+		}
+	}
+
+	pub fn into_inner(self) -> (I, T) {
+		(self.inner, self.txsrc)
+	}
+
+	pub fn get_txsrc_mut(&self) -> &T {
+		&self.txsrc
+	}
+
+	pub fn set_read_deadline(self: Pin<&mut Self>, deadline: Instant) {
+		let this = self.project();
+		this.read_deadline.reset(deadline);
+	}
+
+	pub fn set_write_deadline(self: Pin<&mut Self>, deadline: Instant) {
+		let this = self.project();
+		this.write_deadline.reset(deadline);
+	}
+}
+
+#[derive(Debug)]
+pub struct DuplexStreamItem {
+	// Possible situations for a read:
+	// - Some data read: return buffer
+	// - Read failed: return io error
+	// - Timeout triggered: return io::ErrorKind::TimedOut
+	// - No data read (but call returned because a write error for instance): return None
+	pub read_result: Result<Option<Bytes>, io::Error>,
+
+	// Possible situations for a write:
+	// - Did not happen because no buffer
+	// - Write timeout triggered: return io::ErrorKind::TimedOut
+	// - Some bytes written, but there's still some data left in the buffer
+	// - All bytes written, no more data in the buffer
+	// - Write stuck pending
+	// - Write or flush failed: return io error
+	pub write_result: Result<(), io::Error>,
+}
+
+impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I, T> {
+	type Item = DuplexStreamItem;
+
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		// This has three main tasks:
+		// 1. Attempt a write if we've got anything to write
+		// 2. Attempt a read
+		// 3. Return if: something was read *or* something was written *or* a timeout triggered
+		//
+		// Effectively, we'll never return None though.
+
+		let mut this = self.project();
+		let now = tokio::time::Instant::now();
+
+		let mut wrote_something = false;
+		let mut write_result = Ok(());
+		while let Some(txbuf) = this.txsrc.get_buf() {
+			assert!(txbuf.len() > 0);
+			// TODO: ensure that flush gets awaited, too, when there's no txbuf left.
+			match Pin::new(&mut this.inner).poll_write(cx, txbuf) {
+				Poll::Ready(Ok(nbytes)) => {
+					// TODO: account for written bytes maybe
+					this.txsrc.advance(nbytes);
+					// if the buffer is depleted, we will see that below during
+					// the read poll, but we first try to read to make this fair.
+					wrote_something = true;
+				},
+				Poll::Ready(Err(e)) => {
+					write_result = Err(e);
+					// write failed, let's exit
+					break
+				},
+				Poll::Pending => {
+					// if we cannot write right now, we still try to read and
+					// exit the loop.
+					break
+				},
+			}
+		}
+		if wrote_something {
+			// ensure to advance the write deadline
+			this.write_deadline.as_mut().reset(now + *this.write_timeout);
+		}
+
+		let rxbuf = this.rxbuf.get_or_insert_with(|| BytesMut::with_capacity(8192));
+		let mut read_result = {
+			let read_buf = this.inner.read_buf(rxbuf);
+			tokio::pin!(read_buf);
+			match read_buf.poll(cx) {
+				Poll::Ready(Ok(_)) => {
+					// advance read timeout
+					this.read_deadline.as_mut().reset(now + *this.read_timeout);
+					Ok(Some(this.rxbuf.take().unwrap().freeze()))
+				},
+				Poll::Ready(Err(e)) => Err(e),
+				Poll::Pending => Ok(None),
+			}
+		};
+
+		if matches!(read_result.as_ref(), Ok(None)) {
+			// no read result? check if we need to check the read timeout
+			match this.read_deadline.poll(cx) {
+				Poll::Ready(_) => {
+					read_result = Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout elapsed"));
+				},
+				_ => (),
+			}
+		}
+
+		// no error during write && nothing written -> problematic
+		if !wrote_something && write_result.is_ok() {
+			// no read result? check if we need to check the read timeout
+			match this.write_deadline.poll(cx) {
+				Poll::Ready(_) => {
+					write_result = Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout elapsed"));
+				},
+				_ => (),
+			}
+		}
+
+		println!("{:?} {:?}", read_result, write_result);
+		match (read_result.as_ref(), write_result.as_ref()) {
+			// something failed, return immediately
+			(Err(_), _) | (_, Err(_)) |
+			// something was read, return immediately
+				(Ok(Some(_)), _)
+			=> {
+				Poll::Ready(Some(DuplexStreamItem{
+					read_result,
+					write_result,
+				}))
+			},
+			// otherwise, no return
+			_ => Poll::Pending,
+		}
 	}
 }
 
@@ -304,6 +492,7 @@ pub fn duplex<'a, S: AsyncRead + AsyncWrite + Unpin, R: BufMut, T: Buf>(stream: 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::time::Duration;
 
 	use std::task::{Waker, RawWaker, RawWakerVTable};
 
@@ -559,7 +748,10 @@ mod tests {
 	}
 
 	fn rw_clone(_: *const ()) -> RawWaker {
-		todo!();
+		RawWaker::new(
+			std::ptr::null(),
+			&VTABLE,
+		)
 	}
 
 	fn rw_wake(_: *const ()) -> () {
@@ -757,241 +949,637 @@ mod tests {
 		assert_eq!(&dst[..], &SAMPLE_DATA[..]);
 	}
 
-	// now that we're reasonably certain that the test fixtures do their job,
-	// let's test the actual duplex thing
+	mod duplex_op {
+		use super::*;
 
-	#[test]
-	fn duplex_io_reads_and_writes_in_single_call() {
-		let src = ChunkedPendingReader::new(
-			&SAMPLE_DATA[..],
-			IoPattern::contiguous(4),
-		);
-		let mut dst = [0u8; 44];
-		assert_eq!(dst[..].len(), SAMPLE_DATA.len());
-		let writer = ChunkedPendingWriter::new(
-			&mut dst,
-			// need alternating here to make the second call pending
-			IoPattern::alternating(4).make_writable(),
-		);
+		// now that we're reasonably certain that the test fixtures do their job,
+		// let's test the actual duplex thing
 
-		let mut stream = ChunkedPendingPair{r: src, w: writer};
+		#[test]
+		fn duplex_io_reads_and_writes_in_single_call() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::contiguous(4),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				// need alternating here to make the second call pending
+				IoPattern::alternating(4).make_writable(),
+			);
 
-		let mut txbuf = Bytes::from_static(b"foobar");
-		let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+			let mut stream = ChunkedPendingPair{r: src, w: writer};
 
-		let waker = dummy_waker();
-		let mut ctx = Context::from_waker(&waker);
-		let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
-		match Pin::new(&mut fut).poll(&mut ctx) {
-			Poll::Ready(Ok(DuplexResult::Duplex(r, w))) => {
-				assert_eq!(r, 4);
-				assert_eq!(txbuf.remaining(), 2);
-				assert_eq!(w, 4);
-			},
-			other => panic!("unexpected poll result: {:?}", other),
+			let mut txbuf = Bytes::from_static(b"foobar");
+			let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
+			match Pin::new(&mut fut).poll(&mut ctx) {
+				Poll::Ready(Ok(DuplexResult::Duplex(r, w))) => {
+					assert_eq!(r, 4);
+					assert_eq!(txbuf.remaining(), 2);
+					assert_eq!(w, 4);
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let rxbuf = rxbuf.into_inner();
+			assert_eq!(&dst[..4], b"foob");
+			assert_eq!(rxbuf.remaining(), 4);
+			assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
 		}
 
-		let rxbuf = rxbuf.into_inner();
-		assert_eq!(&dst[..4], b"foob");
-		assert_eq!(rxbuf.remaining(), 4);
-		assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
+		#[test]
+		fn duplex_io_returns_when_txbuf_is_exhausted_even_without_reads() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				// need alternating here to make the second call pending
+				IoPattern::alternating(6).make_writable(),
+			);
+
+			let mut stream = ChunkedPendingPair{r: src, w: writer};
+
+			let mut txbuf = Bytes::from_static(b"foobar");
+			let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
+			match Pin::new(&mut fut).poll(&mut ctx) {
+				Poll::Ready(Ok(DuplexResult::Written(w))) => {
+					assert_eq!(w, 6);
+					assert_eq!(txbuf.remaining(), 0);
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let rxbuf = rxbuf.into_inner();
+			assert_eq!(&dst[..6], b"foobar");
+			assert_eq!(rxbuf.remaining(), 0);
+		}
+
+		#[test]
+		fn duplex_io_returns_on_read_even_without_write() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::contiguous(1),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let mut stream = ChunkedPendingPair{r: src, w: writer};
+
+			let mut txbuf = Bytes::from_static(b"foobar");
+			let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
+			match Pin::new(&mut fut).poll(&mut ctx) {
+				Poll::Ready(Ok(DuplexResult::Read(r))) => {
+					assert_eq!(r, 1);
+					assert_eq!(txbuf.remaining(), 6);
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let rxbuf = rxbuf.into_inner();
+			assert_eq!(rxbuf.remaining(), 1);
+			assert_eq!(&rxbuf[..], &SAMPLE_DATA[..1]);
+		}
+
+		#[test]
+		fn duplex_io_pending_if_both_are_pending_and_txbuf_non_empty() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let mut stream = ChunkedPendingPair{r: src, w: writer};
+
+			let mut txbuf = Bytes::from_static(b"foobar");
+			let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
+			match Pin::new(&mut fut).poll(&mut ctx) {
+				Poll::Pending => (),
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let rxbuf = rxbuf.into_inner();
+			assert_eq!(rxbuf.remaining(), 0);
+			assert_eq!(txbuf.remaining(), 6);
+		}
+
+		#[test]
+		fn duplex_io_returns_with_zero_write_if_both_pending_and_txbuf_empty() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let mut stream = ChunkedPendingPair{r: src, w: writer};
+
+			let mut txbuf = Bytes::from_static(b"");
+			let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
+			match Pin::new(&mut fut).poll(&mut ctx) {
+				Poll::Ready(Ok(DuplexResult::Written(0))) => (),
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let rxbuf = rxbuf.into_inner();
+			assert_eq!(rxbuf.remaining(), 0);
+			assert_eq!(txbuf.remaining(), 0);
+		}
+
+		#[test]
+		fn duplex_io_returns_write_error_without_read_immediately() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::error(io::ErrorKind::Other, "the error"),
+			);
+
+			let mut stream = ChunkedPendingPair{r: src, w: writer};
+
+			let mut txbuf = Bytes::from_static(b"foobar");
+			let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
+			match Pin::new(&mut fut).poll(&mut ctx) {
+				Poll::Ready(Err(DuplexError::Write(e))) => {
+					assert_eq!(e.kind(), io::ErrorKind::Other);
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let rxbuf = rxbuf.into_inner();
+			assert_eq!(rxbuf.remaining(), 0);
+			assert_eq!(txbuf.remaining(), 6);
+		}
+
+		#[test]
+		fn duplex_io_returns_read_error_after_write() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::error(io::ErrorKind::Other, "the error"),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::alternating(4).make_writable(),
+			);
+
+			let mut stream = ChunkedPendingPair{r: src, w: writer};
+
+			let mut txbuf = Bytes::from_static(b"foobar");
+			let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
+			match Pin::new(&mut fut).poll(&mut ctx) {
+				Poll::Ready(Err(DuplexError::Read(e))) => {
+					assert_eq!(e.kind(), io::ErrorKind::Other);
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let rxbuf = rxbuf.into_inner();
+			assert_eq!(rxbuf.remaining(), 0);
+			assert_eq!(txbuf.remaining(), 2);
+		}
 	}
 
-	#[test]
-	fn duplex_io_returns_when_txbuf_is_exhausted_even_without_reads() {
-		let src = ChunkedPendingReader::new(
-			&SAMPLE_DATA[..],
-			IoPattern::never(),
-		);
-		let mut dst = [0u8; 44];
-		assert_eq!(dst[..].len(), SAMPLE_DATA.len());
-		let writer = ChunkedPendingWriter::new(
-			&mut dst,
-			// need alternating here to make the second call pending
-			IoPattern::alternating(6).make_writable(),
-		);
+	mod duplex_stream {
+		use super::*;
 
-		let mut stream = ChunkedPendingPair{r: src, w: writer};
+		use futures_util::stream::StreamExt;
 
-		let mut txbuf = Bytes::from_static(b"foobar");
-		let mut rxbuf = BytesMut::with_capacity(10).limit(10);
 
-		let waker = dummy_waker();
-		let mut ctx = Context::from_waker(&waker);
-		let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
-		match Pin::new(&mut fut).poll(&mut ctx) {
-			Poll::Ready(Ok(DuplexResult::Written(w))) => {
-				assert_eq!(w, 6);
-				assert_eq!(txbuf.remaining(), 0);
-			},
-			other => panic!("unexpected poll result: {:?}", other),
+		struct SingleTxBuf<T> {
+			buf: Option<T>,
 		}
 
-		let rxbuf = rxbuf.into_inner();
-		assert_eq!(&dst[..6], b"foobar");
-		assert_eq!(rxbuf.remaining(), 0);
-	}
+		impl<T: Buf> SingleTxBuf<T> {
+			fn new(buf: T) -> Self {
+				Self{buf: Some(buf)}
+			}
 
-	#[test]
-	fn duplex_io_returns_on_read_even_without_write() {
-		let src = ChunkedPendingReader::new(
-			&SAMPLE_DATA[..],
-			IoPattern::contiguous(1),
-		);
-		let mut dst = [0u8; 44];
-		assert_eq!(dst[..].len(), SAMPLE_DATA.len());
-		let writer = ChunkedPendingWriter::new(
-			&mut dst,
-			IoPattern::never(),
-		);
-
-		let mut stream = ChunkedPendingPair{r: src, w: writer};
-
-		let mut txbuf = Bytes::from_static(b"foobar");
-		let mut rxbuf = BytesMut::with_capacity(10).limit(10);
-
-		let waker = dummy_waker();
-		let mut ctx = Context::from_waker(&waker);
-		let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
-		match Pin::new(&mut fut).poll(&mut ctx) {
-			Poll::Ready(Ok(DuplexResult::Read(r))) => {
-				assert_eq!(r, 1);
-				assert_eq!(txbuf.remaining(), 6);
-			},
-			other => panic!("unexpected poll result: {:?}", other),
+			fn get(&self) -> Option<&T> {
+				self.buf.as_ref()
+			}
 		}
 
-		let rxbuf = rxbuf.into_inner();
-		assert_eq!(rxbuf.remaining(), 1);
-		assert_eq!(&rxbuf[..], &SAMPLE_DATA[..1]);
-	}
+		impl<T: Buf> TxBufRead for SingleTxBuf<T> {
+			fn get_buf(&mut self) -> Option<&[u8]> {
+				let buf = self.buf.as_ref()?.chunk();
+				if buf.len() > 0 {
+					Some(buf)
+				} else {
+					None
+				}
+			}
 
-	#[test]
-	fn duplex_io_pending_if_both_are_pending_and_txbuf_non_empty() {
-		let src = ChunkedPendingReader::new(
-			&SAMPLE_DATA[..],
-			IoPattern::never(),
-		);
-		let mut dst = [0u8; 44];
-		assert_eq!(dst[..].len(), SAMPLE_DATA.len());
-		let writer = ChunkedPendingWriter::new(
-			&mut dst,
-			IoPattern::never(),
-		);
-
-		let mut stream = ChunkedPendingPair{r: src, w: writer};
-
-		let mut txbuf = Bytes::from_static(b"foobar");
-		let mut rxbuf = BytesMut::with_capacity(10).limit(10);
-
-		let waker = dummy_waker();
-		let mut ctx = Context::from_waker(&waker);
-		let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
-		match Pin::new(&mut fut).poll(&mut ctx) {
-			Poll::Pending => (),
-			other => panic!("unexpected poll result: {:?}", other),
+			fn advance(&mut self, by: usize) {
+				self.buf.as_mut().unwrap().advance(by)
+			}
 		}
 
-		let rxbuf = rxbuf.into_inner();
-		assert_eq!(rxbuf.remaining(), 0);
-		assert_eq!(txbuf.remaining(), 6);
-	}
+		#[tokio::test]
+		async fn duplex_io_reads_and_writes_in_single_call() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::contiguous(4),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				// need alternating here to make the second call pending
+				IoPattern::alternating(4).make_writable(),
+			);
 
-	#[test]
-	fn duplex_io_returns_with_zero_write_if_both_pending_and_txbuf_empty() {
-		let src = ChunkedPendingReader::new(
-			&SAMPLE_DATA[..],
-			IoPattern::never(),
-		);
-		let mut dst = [0u8; 44];
-		assert_eq!(dst[..].len(), SAMPLE_DATA.len());
-		let writer = ChunkedPendingWriter::new(
-			&mut dst,
-			IoPattern::never(),
-		);
+			let stream = ChunkedPendingPair{r: src, w: writer};
 
-		let mut stream = ChunkedPendingPair{r: src, w: writer};
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
-		let mut txbuf = Bytes::from_static(b"");
-		let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			tokio::pin!(fut);
+			match fut.as_mut().poll_next(&mut ctx) {
+				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+					match read_result {
+						Ok(Some(rxbuf)) => {
+							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
+						},
+						other => panic!("unexpected read result: {:?}", other),
+					};
 
-		let waker = dummy_waker();
-		let mut ctx = Context::from_waker(&waker);
-		let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
-		match Pin::new(&mut fut).poll(&mut ctx) {
-			Poll::Ready(Ok(DuplexResult::Written(0))) => (),
-			other => panic!("unexpected poll result: {:?}", other),
+					match write_result {
+						Ok(()) => (),
+						other => panic!("unexpected write result: {:?}", other),
+					}
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			assert_eq!(txbuf.remaining(), 2);
 		}
 
-		let rxbuf = rxbuf.into_inner();
-		assert_eq!(rxbuf.remaining(), 0);
-		assert_eq!(txbuf.remaining(), 0);
-	}
+		#[tokio::test]
+		async fn duplex_io_returns_on_read_even_without_write() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::contiguous(4),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
 
-	#[test]
-	fn duplex_io_returns_write_error_without_read_immediately() {
-		let src = ChunkedPendingReader::new(
-			&SAMPLE_DATA[..],
-			IoPattern::never(),
-		);
-		let mut dst = [0u8; 44];
-		assert_eq!(dst[..].len(), SAMPLE_DATA.len());
-		let writer = ChunkedPendingWriter::new(
-			&mut dst,
-			IoPattern::error(io::ErrorKind::Other, "the error"),
-		);
+			let stream = ChunkedPendingPair{r: src, w: writer};
 
-		let mut stream = ChunkedPendingPair{r: src, w: writer};
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
-		let mut txbuf = Bytes::from_static(b"foobar");
-		let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			tokio::pin!(fut);
+			match fut.as_mut().poll_next(&mut ctx) {
+				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+					match read_result {
+						Ok(Some(rxbuf)) => {
+							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
+						},
+						other => panic!("unexpected read result: {:?}", other),
+					};
 
-		let waker = dummy_waker();
-		let mut ctx = Context::from_waker(&waker);
-		let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
-		match Pin::new(&mut fut).poll(&mut ctx) {
-			Poll::Ready(Err(DuplexError::Write(e))) => {
-				assert_eq!(e.kind(), io::ErrorKind::Other);
-			},
-			other => panic!("unexpected poll result: {:?}", other),
+					match write_result {
+						Ok(()) => (),
+						other => panic!("unexpected write result: {:?}", other),
+					}
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			assert_eq!(txbuf.remaining(), 6);
 		}
 
-		let rxbuf = rxbuf.into_inner();
-		assert_eq!(rxbuf.remaining(), 0);
-		assert_eq!(txbuf.remaining(), 6);
-	}
+		#[tokio::test]
+		async fn duplex_io_pending_if_both_are_pending_and_txbuf_non_empty_and_timeout_not_elapsed() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
 
-	#[test]
-	fn duplex_io_returns_read_error_after_write() {
-		let src = ChunkedPendingReader::new(
-			&SAMPLE_DATA[..],
-			IoPattern::error(io::ErrorKind::Other, "the error"),
-		);
-		let mut dst = [0u8; 44];
-		assert_eq!(dst[..].len(), SAMPLE_DATA.len());
-		let writer = ChunkedPendingWriter::new(
-			&mut dst,
-			IoPattern::alternating(4).make_writable(),
-		);
+			let stream = ChunkedPendingPair{r: src, w: writer};
 
-		let mut stream = ChunkedPendingPair{r: src, w: writer};
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
-		let mut txbuf = Bytes::from_static(b"foobar");
-		let mut rxbuf = BytesMut::with_capacity(10).limit(10);
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			tokio::pin!(fut);
+			match fut.as_mut().poll_next(&mut ctx) {
+				Poll::Pending => (),
+				other => panic!("unexpected poll result: {:?}", other),
+			}
 
-		let waker = dummy_waker();
-		let mut ctx = Context::from_waker(&waker);
-		let mut fut = Box::pin(duplex(&mut stream, &mut rxbuf, &mut txbuf));
-		match Pin::new(&mut fut).poll(&mut ctx) {
-			Poll::Ready(Err(DuplexError::Read(e))) => {
-				assert_eq!(e.kind(), io::ErrorKind::Other);
-			},
-			other => panic!("unexpected poll result: {:?}", other),
+			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			assert_eq!(txbuf.remaining(), 6);
 		}
 
-		let rxbuf = rxbuf.into_inner();
-		assert_eq!(rxbuf.remaining(), 0);
-		assert_eq!(txbuf.remaining(), 2);
+		#[tokio::test]
+		async fn duplex_io_pending_if_both_are_pending_and_txbuf_empty_and_timeout_not_elapsed() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let stream = ChunkedPendingPair{r: src, w: writer};
+
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b""));
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			tokio::pin!(fut);
+			match fut.as_mut().poll_next(&mut ctx) {
+				Poll::Pending => (),
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			assert_eq!(txbuf.remaining(), 0);
+		}
+
+		#[tokio::test]
+		async fn duplex_io_returns_write_error_without_read_immediately() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::error(io::ErrorKind::Other, "the error"),
+			);
+
+			let stream = ChunkedPendingPair{r: src, w: writer};
+
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			tokio::pin!(fut);
+			match fut.as_mut().poll_next(&mut ctx) {
+				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+					match read_result {
+						Ok(None) => (),
+						other => panic!("unexpected read result: {:?}", other),
+					};
+
+					match write_result {
+						Err(e) => {
+							assert_eq!(e.kind(), io::ErrorKind::Other);
+						},
+						other => panic!("unexpected write result: {:?}", other),
+					}
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			assert_eq!(txbuf.remaining(), 6);
+		}
+
+		#[tokio::test]
+		async fn duplex_io_returns_read_error_after_write() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::error(io::ErrorKind::Other, "the error"),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::alternating(4).make_writable(),
+			);
+
+			let stream = ChunkedPendingPair{r: src, w: writer};
+
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
+
+			let waker = dummy_waker();
+			let mut ctx = Context::from_waker(&waker);
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			tokio::pin!(fut);
+			match fut.as_mut().poll_next(&mut ctx) {
+				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+					match read_result {
+						Err(e) => {
+							assert_eq!(e.kind(), io::ErrorKind::Other);
+						},
+						other => panic!("unexpected read result: {:?}", other),
+					};
+
+					match write_result {
+						Ok(()) => (),
+						other => panic!("unexpected write result: {:?}", other),
+					}
+				},
+				other => panic!("unexpected poll result: {:?}", other),
+			}
+
+			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			assert_eq!(txbuf.remaining(), 2);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn check_sleep_behaviour() {
+			let t0 = Instant::now();
+			sleep(Duration::new(10, 0)).await;
+			let t1 = Instant::now();
+			let dt = t1 - t0;
+			println!("{:?}", dt);
+			assert!(dt.as_secs_f64() >= 10.0);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn duplex_io_returns_read_timeout_error_on_timeout() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let stream = ChunkedPendingPair{r: src, w: writer};
+
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
+
+			let t0 = Instant::now();
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
+			tokio::pin!(fut);
+			let result = fut.next().await.unwrap();
+			let t1 = Instant::now();
+			match result.read_result {
+				Err(e) => {
+					assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+				},
+				other => panic!("unexpected read result: {:?}", other),
+			};
+			match result.write_result {
+				Ok(()) => (),
+				other => panic!("unexpected write result: {:?}", other),
+			};
+			let dt = t1 - t0;
+			println!("{:?}", dt);
+			assert!(dt.as_secs_f64() >= 10.0);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn duplex_io_loops_read_timeout() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let stream = ChunkedPendingPair{r: src, w: writer};
+
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
+
+			let t0 = Instant::now();
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
+			tokio::pin!(fut);
+			let _ = fut.next().await.unwrap();
+			let result = fut.next().await.unwrap();
+			let t1 = Instant::now();
+			match result.read_result {
+				Err(e) => {
+					assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+				},
+				other => panic!("unexpected read result: {:?}", other),
+			};
+			match result.write_result {
+				Ok(()) => (),
+				other => panic!("unexpected write result: {:?}", other),
+			};
+			let dt = t1 - t0;
+			println!("{:?}", dt);
+			assert!(dt.as_secs_f64() >= 10.0);
+			assert!(dt.as_secs_f64() < 20.0);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn duplex_io_loops_advance_read_deadline() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let stream = ChunkedPendingPair{r: src, w: writer};
+
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
+
+			let t0 = Instant::now();
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
+			tokio::pin!(fut);
+			let _ = fut.next().await.unwrap();
+			// definitely after the write deadline
+			fut.as_mut().set_read_deadline(Instant::now() + Duration::new(20, 0));
+			let result = fut.next().await.unwrap();
+			let t1 = Instant::now();
+			match result.write_result {
+				Err(e) => {
+					assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+				},
+				other => panic!("unexpected read result: {:?}", other),
+			};
+			match result.read_result {
+				Ok(None) => (),
+				other => panic!("unexpected write result: {:?}", other),
+			};
+			let dt = t1 - t0;
+			println!("{:?}", dt);
+			assert!(dt.as_secs_f64() >= 20.0);
+			assert!(dt.as_secs_f64() < 25.0);
+		}
 	}
 }
 
