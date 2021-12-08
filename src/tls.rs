@@ -260,6 +260,12 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 						Ok(entry) => entry,
 						Err(_) => continue,
 					};
+					match entry.file_type() {
+						Err(_) => continue,
+						Ok(t) => if !t.is_file() {
+							continue
+						},
+					};
 					strerror_ok!(read_rootstore_file(entry.path(), &mut root_store));
 				}
 			},
@@ -332,6 +338,12 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 					let entry = match entry {
 						Ok(entry) => entry,
 						Err(_) => continue,
+					};
+					match entry.file_type() {
+						Err(_) => continue,
+						Ok(t) => if !t.is_file() {
+							continue
+						},
 					};
 					strerror_ok!(read_rootstore_file(entry.path(), &mut root_store));
 				}

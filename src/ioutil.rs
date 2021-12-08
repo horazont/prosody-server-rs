@@ -290,8 +290,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I,
 					Poll::Pending => (),
 				}
 			}
-			// no error during write && nothing written -> problematic
-			if !wrote_anything && write_result.is_ok() {
+			// no error during write && nothing written && not all written -> problematic
+			if !wrote_anything && !all_written && write_result.is_ok() {
 				// no read result? check if we need to check the read timeout
 				match this.write_deadline.poll(cx) {
 					Poll::Ready(_) => {
@@ -1705,6 +1705,43 @@ mod tests {
 			let fut = DuplexStream::new(stream, txbuf, Duration::new(20, 0), Duration::new(10, 0));
 			tokio::pin!(fut);
 			fut.as_mut().set_may_write(false);
+			let result = fut.next().await.unwrap();
+			let t1 = Instant::now();
+			match result.read_result {
+				ReadResult::Err(e) => {
+					assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+				},
+				other => panic!("unexpected read result: {:?}", other),
+			};
+			match result.write_result {
+				Ok(()) => (),
+				other => panic!("unexpected write result: {:?}", other),
+			};
+			let dt = t1 - t0;
+			println!("{:?}", dt);
+			assert!(dt.as_secs_f64() >= 20.0);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn duplex_io_nothing_to_write_prevents_write_timeout() {
+			let src = ChunkedPendingReader::new(
+				&SAMPLE_DATA[..],
+				IoPattern::never(),
+			);
+			let mut dst = [0u8; 44];
+			assert_eq!(dst[..].len(), SAMPLE_DATA.len());
+			let writer = ChunkedPendingWriter::new(
+				&mut dst,
+				IoPattern::never(),
+			);
+
+			let stream = ChunkedPendingPair{r: src, w: writer};
+
+			let txbuf = SingleTxBuf::new(Bytes::from_static(b""));
+
+			let t0 = Instant::now();
+			let fut = DuplexStream::new(stream, txbuf, Duration::new(20, 0), Duration::new(10, 0));
+			tokio::pin!(fut);
 			let result = fut.next().await.unwrap();
 			let t1 = Instant::now();
 			match result.read_result {
