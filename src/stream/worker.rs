@@ -721,7 +721,8 @@ impl StreamWorker {
 			this.stream.as_mut().set_may_read(this.rx_mode.may());
 			this.stream.as_mut().set_may_write(this.tx_mode.may());
 			select! {
-				result = this.stream.next() => {
+				// if we can neither send nor receive, stream.next() would in fact panic :)
+				result = this.stream.next(), if this.rx_mode.may() || this.tx_mode.may() => {
 					let DuplexResult{
 						read_result,
 						write_result,
