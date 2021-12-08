@@ -136,6 +136,7 @@ pin_project! {
 		may_read: bool,
 		may_write: bool,
 		flush_needed: bool,
+		alloc_buffer: Box<dyn Fn() -> BytesMut + Send + 'static>,
 		#[pin]
 		read_deadline: Sleep,
 		#[pin]
@@ -151,6 +152,38 @@ impl<I, T> Duplex<I, T> where Duplex<I, T>: Stream {
 			read_timeout: tokio::time::Duration,
 			write_timeout: tokio::time::Duration,
 	) -> Self {
+		Self::with_buffer_size(
+			inner,
+			txsrc,
+			read_timeout,
+			write_timeout,
+			8192,
+		)
+	}
+
+	pub fn with_buffer_size(
+			inner: I,
+			txsrc: T,
+			read_timeout: tokio::time::Duration,
+			write_timeout: tokio::time::Duration,
+			read_buffer_size: usize,
+	) -> Self {
+		Self::with_custom_allocator(
+			inner,
+			txsrc,
+			read_timeout,
+			write_timeout,
+			move || BytesMut::with_capacity(read_buffer_size),
+		)
+	}
+
+	pub fn with_custom_allocator<A: Fn() -> BytesMut + Send + 'static>(
+			inner:I,
+			txsrc: T,
+			read_timeout: tokio::time::Duration,
+			write_timeout: tokio::time::Duration,
+			alloc_buffer: A,
+	) -> Self {
 		Self{
 			inner,
 			txsrc,
@@ -158,6 +191,7 @@ impl<I, T> Duplex<I, T> where Duplex<I, T>: Stream {
 			may_read: true,
 			may_write: true,
 			flush_needed: false,
+			alloc_buffer: Box::new(alloc_buffer),
 			read_timeout,
 			write_timeout,
 			read_deadline: sleep(read_timeout),
@@ -301,7 +335,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for Duplex<I, T> {
 		}
 
 		let read_result = if *this.may_read {
-			let rxbuf = this.rxbuf.get_or_insert_with(|| BytesMut::with_capacity(8192));
+			let rxbuf = this.rxbuf.get_or_insert_with(this.alloc_buffer);
 			let mut read_result = {
 				let read_buf = this.inner.read_buf(rxbuf);
 				tokio::pin!(read_buf);
