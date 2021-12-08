@@ -127,6 +127,7 @@ impl<T: Buf> TxBufRead for VecDeque<T> {
 
 
 pin_project! {
+	#[project = DuplexProj]
 	pub struct Duplex<I, T> {
 		inner: I,
 		txsrc: T,
@@ -262,6 +263,106 @@ pub struct DuplexResult {
 	pub write_result: Result<(), io::Error>,
 }
 
+impl<I: AsyncRead + Unpin, T> DuplexProj<'_, I, T> {
+	fn poll_read(&mut self, now: Instant, cx: &mut Context<'_>) -> ReadResult {
+		if !*self.may_read {
+			return ReadResult::NoRead
+		}
+
+		let rxbuf = self.rxbuf.get_or_insert_with(&*self.alloc_buffer);
+		let mut read_result = {
+			let read_buf = self.inner.read_buf(rxbuf);
+			tokio::pin!(read_buf);
+			match read_buf.poll(cx) {
+				Poll::Ready(Ok(n)) => {
+					// advance read timeout
+					self.read_deadline.as_mut().reset(now + *self.read_timeout);
+					if n > 0 {
+						ReadResult::Ok(self.rxbuf.take().unwrap().freeze())
+					} else {
+						ReadResult::Eof
+					}
+				},
+				Poll::Ready(Err(e)) => ReadResult::Err(e),
+				Poll::Pending => ReadResult::NoRead,
+			}
+		};
+
+		if matches!(&read_result, &ReadResult::NoRead) {
+			// no read result? check if we need to check the read timeout
+			match self.read_deadline.as_mut().poll(cx) {
+				Poll::Ready(_) => {
+					read_result = ReadResult::Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout elapsed"));
+				},
+				_ => (),
+			}
+		}
+		read_result
+	}
+}
+
+impl<I: AsyncWrite + Unpin, T: TxBufRead> DuplexProj<'_, I, T> {
+	fn poll_write(&mut self, now: Instant, cx: &mut Context<'_>) -> Result<(), io::Error> {
+		let mut write_result = Ok(());
+		if !*self.may_write {
+			return write_result
+		}
+
+		let mut wrote_anything = false;
+		let mut all_written = true;
+		while let Some(txbuf) = self.txsrc.get_buf() {
+			assert!(txbuf.len() > 0);
+			match Pin::new(&mut self.inner).poll_write(cx, txbuf) {
+				Poll::Ready(Ok(nbytes)) => {
+					// TODO: account for written bytes maybe
+					self.txsrc.advance(nbytes);
+					// if the buffer is depleted, we will see that below during
+					// the read poll, but we first try to read to make this fair.
+					wrote_anything = true;
+					*self.flush_needed = true;
+				},
+				Poll::Ready(Err(e)) => {
+					write_result = Err(e);
+					// write failed, let's exit
+					all_written = false;
+					break
+				},
+				Poll::Pending => {
+					// if we cannot write right now, we still try to read and
+					// exit the loop.
+					all_written = false;
+					break
+				},
+			}
+		}
+		if wrote_anything {
+			// ensure to advance the write deadline
+			self.write_deadline.as_mut().reset(now + *self.write_timeout);
+		}
+		if all_written && *self.flush_needed && write_result.is_ok() {
+			match Pin::new(&mut self.inner).poll_flush(cx) {
+				Poll::Ready(Ok(())) => {
+					*self.flush_needed = false;
+				},
+				Poll::Ready(Err(e)) => {
+					write_result = Err(e);
+					// TODO: cancel flushing here?
+				},
+				Poll::Pending => (),
+			}
+		}
+		// no error during write && nothing written && not all written -> problematic
+		if !wrote_anything && !all_written && write_result.is_ok() {
+			// no read result? check if we need to check the read timeout
+			match self.write_deadline.as_mut().poll(cx) {
+				Poll::Ready(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout elapsed")),
+				_ => (),
+			}
+		}
+		write_result
+	}
+}
+
 impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for Duplex<I, T> {
 	type Item = DuplexResult;
 
@@ -277,96 +378,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for Duplex<I, T> {
 		let mut this = self.project();
 		let now = tokio::time::Instant::now();
 
-		let mut write_result = Ok(());
-		if *this.may_write {
-			let mut wrote_anything = false;
-			let mut all_written = true;
-			while let Some(txbuf) = this.txsrc.get_buf() {
-				assert!(txbuf.len() > 0);
-				match Pin::new(&mut this.inner).poll_write(cx, txbuf) {
-					Poll::Ready(Ok(nbytes)) => {
-						// TODO: account for written bytes maybe
-						this.txsrc.advance(nbytes);
-						// if the buffer is depleted, we will see that below during
-						// the read poll, but we first try to read to make this fair.
-						wrote_anything = true;
-						*this.flush_needed = true;
-					},
-					Poll::Ready(Err(e)) => {
-						write_result = Err(e);
-						// write failed, let's exit
-						all_written = false;
-						break
-					},
-					Poll::Pending => {
-						// if we cannot write right now, we still try to read and
-						// exit the loop.
-						all_written = false;
-						break
-					},
-				}
-			}
-			if wrote_anything {
-				// ensure to advance the write deadline
-				this.write_deadline.as_mut().reset(now + *this.write_timeout);
-			}
-			if all_written && *this.flush_needed && write_result.is_ok() {
-				match Pin::new(&mut this.inner).poll_flush(cx) {
-					Poll::Ready(Ok(())) => {
-						*this.flush_needed = false;
-					},
-					Poll::Ready(Err(e)) => {
-						write_result = Err(e);
-						// TODO: cancel flushing here?
-					},
-					Poll::Pending => (),
-				}
-			}
-			// no error during write && nothing written && not all written -> problematic
-			if !wrote_anything && !all_written && write_result.is_ok() {
-				// no read result? check if we need to check the read timeout
-				match this.write_deadline.poll(cx) {
-					Poll::Ready(_) => {
-						write_result = Err(io::Error::new(io::ErrorKind::TimedOut, "write timeout elapsed"));
-					},
-					_ => (),
-				}
-			}
-		}
-
-		let read_result = if *this.may_read {
-			let rxbuf = this.rxbuf.get_or_insert_with(this.alloc_buffer);
-			let mut read_result = {
-				let read_buf = this.inner.read_buf(rxbuf);
-				tokio::pin!(read_buf);
-				match read_buf.poll(cx) {
-					Poll::Ready(Ok(n)) => {
-						// advance read timeout
-						this.read_deadline.as_mut().reset(now + *this.read_timeout);
-						if n > 0 {
-							ReadResult::Ok(this.rxbuf.take().unwrap().freeze())
-						} else {
-							ReadResult::Eof
-						}
-					},
-					Poll::Ready(Err(e)) => ReadResult::Err(e),
-					Poll::Pending => ReadResult::NoRead,
-				}
-			};
-
-			if matches!(&read_result, &ReadResult::NoRead) {
-				// no read result? check if we need to check the read timeout
-				match this.read_deadline.poll(cx) {
-					Poll::Ready(_) => {
-						read_result = ReadResult::Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout elapsed"));
-					},
-					_ => (),
-				}
-			}
-			read_result
-		} else {
-			ReadResult::NoRead
-		};
+		let write_result = this.poll_write(now, cx);
+		let read_result = this.poll_read(now, cx);
 
 		match (&read_result, write_result.as_ref()) {
 			// anything failed, return immediately
