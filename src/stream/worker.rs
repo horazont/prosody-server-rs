@@ -47,6 +47,7 @@ use crate::ioutil::{
 	Duplex,
 	DuplexResult,
 	ReadResult,
+	AsyncReadable,
 };
 use crate::tls;
 use crate::verify;
@@ -263,6 +264,20 @@ impl AsyncRead for Stream {
             StreamProj::TlsTcpClient{conn, ..} => conn.poll_read(cx, buf),
             StreamProj::TlsUnixServer{conn, ..} => conn.poll_read(cx, buf),
             StreamProj::TlsUnixClient{conn, ..} => conn.poll_read(cx, buf),
+		}
+	}
+}
+
+impl AsyncReadable for Stream {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
+            Self::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
+            Self::PlainTcp{conn, ..} => conn.poll_read_ready(cx),
+            Self::PlainUnix{conn, ..} => conn.poll_read_ready(cx),
+            Self::TlsTcpServer{conn, ..} => conn.poll_read_ready(cx),
+            Self::TlsTcpClient{conn, ..} => conn.poll_read_ready(cx),
+            Self::TlsUnixServer{conn, ..} => conn.poll_read_ready(cx),
+            Self::TlsUnixClient{conn, ..} => conn.poll_read_ready(cx),
 		}
 	}
 }
@@ -487,6 +502,12 @@ impl AsyncWrite for FdStream {
     fn is_write_vectored(&self) -> bool {
 		self.inner.is_write_vectored()
     }
+}
+
+impl AsyncReadable for FdStream {
+	fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.inner.poll_read_ready(cx)
+	}
 }
 
 enum MsgResult {

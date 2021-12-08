@@ -263,13 +263,31 @@ pub struct DuplexResult {
 	pub write_result: Result<(), io::Error>,
 }
 
-impl<I: AsyncRead + Unpin, T> DuplexProj<'_, I, T> {
+impl<I: AsyncRead + AsyncReadable + Unpin, T> DuplexProj<'_, I, T> {
 	fn poll_read(&mut self, now: Instant, cx: &mut Context<'_>) -> ReadResult {
 		if !*self.may_read {
+			// we don't know when we'll be allowed to read again, hence we drop the buffer here
+			*self.rxbuf = None;
 			return ReadResult::NoRead
 		}
 
-		let rxbuf = self.rxbuf.get_or_insert_with(&*self.alloc_buffer);
+		let rxbuf = match self.rxbuf {
+			// if we do not have a buffer yet, we first check whether a read is likely to do anything at this point in time.
+			None => {
+				match self.inner.poll_read_ready(cx) {
+					// is ready, allocate!
+					Poll::Ready(Ok(())) => {
+						self.rxbuf.get_or_insert_with(&*self.alloc_buffer)
+					},
+					// error => return
+					Poll::Ready(Err(e)) => return ReadResult::Err(e),
+					// nothing to read, return
+					Poll::Pending => return ReadResult::NoRead,
+				}
+			},
+			Some(ref mut v) => v,
+		};
+
 		let mut read_result = {
 			let read_buf = self.inner.read_buf(rxbuf);
 			tokio::pin!(read_buf);
@@ -363,7 +381,7 @@ impl<I: AsyncWrite + Unpin, T: TxBufRead> DuplexProj<'_, I, T> {
 	}
 }
 
-impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for Duplex<I, T> {
+impl<I: AsyncRead + AsyncReadable + AsyncWrite + Unpin, T: TxBufRead> Stream for Duplex<I, T> {
 	type Item = DuplexResult;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -494,10 +512,9 @@ mod tests {
 			}
 		}
 
-		fn advance(&mut self) -> io::Result<IoStep> {
+		fn peek(&self) -> io::Result<IoStep> {
 			self.may_error()?;
 			let curr = self.clock;
-			self.clock = self.clock.checked_add(1).expect("clock overflow");
 			let len = self.rhythm_len();
 			let step = curr % len;
 			if step >= self.num_pending {
@@ -505,6 +522,13 @@ mod tests {
 			} else {
 				Ok(IoStep::Block)
 			}
+		}
+
+		fn advance(&mut self) -> io::Result<IoStep> {
+			self.may_error()?;
+			let result = self.peek();
+			self.clock = self.clock.checked_add(1).expect("clock overflow");
+			result
 		}
 
 		fn make_writable(mut self) -> Self {
@@ -556,6 +580,17 @@ mod tests {
 				},
 				Err(e) => Poll::Ready(Err(e)),
 			}
+		}
+	}
+
+	impl<'a> AsyncReadable for ChunkedPendingReader<'a> {
+		fn poll_read_ready(
+			&mut self,
+			_: &mut Context<'_>,
+		) -> Poll<io::Result<()>> {
+			// we always pretend readiness: otherwise, temporary IoStep::Block
+			// conditions will not work correctly.
+			Poll::Ready(Ok(()))
 		}
 	}
 
@@ -631,6 +666,15 @@ mod tests {
 			buf: &mut ReadBuf<'_>,
 		) -> Poll<io::Result<()>> {
 			self.project().r.poll_read(cx, buf)
+		}
+	}
+
+	impl<'a> AsyncReadable for ChunkedPendingPair<'a> {
+		fn poll_read_ready(
+			&mut self,
+			cx: &mut Context<'_>,
+		) -> Poll<io::Result<()>> {
+			self.r.poll_read_ready(cx)
 		}
 	}
 
