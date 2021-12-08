@@ -127,7 +127,7 @@ impl<T: Buf> TxBufRead for VecDeque<T> {
 
 
 pin_project! {
-	pub struct DuplexStream<I, T> {
+	pub struct Duplex<I, T> {
 		inner: I,
 		txsrc: T,
 		rxbuf: Option<BytesMut>,
@@ -144,7 +144,7 @@ pin_project! {
 }
 
 
-impl<I, T> DuplexStream<I, T> where DuplexStream<I, T>: Stream {
+impl<I, T> Duplex<I, T> where Duplex<I, T>: Stream {
 	pub fn new(
 			inner: I,
 			txsrc: T,
@@ -209,7 +209,7 @@ pub enum ReadResult {
 }
 
 #[derive(Debug)]
-pub struct DuplexStreamItem {
+pub struct DuplexResult {
 	// Possible situations for a read:
 	// - Some data read: return buffer
 	// - Read failed: return io error
@@ -228,8 +228,8 @@ pub struct DuplexStreamItem {
 	pub write_result: Result<(), io::Error>,
 }
 
-impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I, T> {
-	type Item = DuplexStreamItem;
+impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for Duplex<I, T> {
+	type Item = DuplexResult;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		// This has three main tasks:
@@ -342,7 +342,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I,
 			// eof detected, return immediately
 				(ReadResult::Eof, _)
 			=> {
-				Poll::Ready(Some(DuplexStreamItem{
+				Poll::Ready(Some(DuplexResult{
 					read_result,
 					write_result,
 				}))
@@ -868,10 +868,10 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			match fut.as_mut().poll_next(&mut ctx) {
-				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+				Poll::Ready(Some(DuplexResult{read_result, write_result})) => {
 					match read_result {
 						ReadResult::Ok(rxbuf) => {
 							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
@@ -911,11 +911,11 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			fut.as_mut().set_may_write(false);
 			match fut.as_mut().poll_next(&mut ctx) {
-				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+				Poll::Ready(Some(DuplexResult{read_result, write_result})) => {
 					match read_result {
 						ReadResult::Ok(rxbuf) => {
 							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
@@ -955,7 +955,7 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			fut.as_mut().set_may_read(false);
 			match fut.as_mut().poll_next(&mut ctx) {
@@ -987,10 +987,10 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			match fut.as_mut().poll_next(&mut ctx) {
-				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+				Poll::Ready(Some(DuplexResult{read_result, write_result})) => {
 					match read_result {
 						ReadResult::Ok(rxbuf) => {
 							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
@@ -1029,7 +1029,7 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			match fut.as_mut().poll_next(&mut ctx) {
 				Poll::Pending => (),
@@ -1059,7 +1059,7 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			match fut.as_mut().poll_next(&mut ctx) {
 				Poll::Pending => (),
@@ -1089,10 +1089,10 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			match fut.as_mut().poll_next(&mut ctx) {
-				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+				Poll::Ready(Some(DuplexResult{read_result, write_result})) => {
 					match read_result {
 						ReadResult::NoRead => (),
 						other => panic!("unexpected read result: {:?}", other),
@@ -1131,10 +1131,10 @@ mod tests {
 
 			let waker = dummy_waker();
 			let mut ctx = Context::from_waker(&waker);
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(100, 0), Duration::new(100, 0));
 			tokio::pin!(fut);
 			match fut.as_mut().poll_next(&mut ctx) {
-				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
+				Poll::Ready(Some(DuplexResult{read_result, write_result})) => {
 					match read_result {
 						ReadResult::Err(e) => {
 							assert_eq!(e.kind(), io::ErrorKind::Other);
@@ -1182,7 +1182,7 @@ mod tests {
 			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
 			let t0 = Instant::now();
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
 			tokio::pin!(fut);
 			let result = fut.next().await.unwrap();
 			let t1 = Instant::now();
@@ -1219,7 +1219,7 @@ mod tests {
 			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
 			let t0 = Instant::now();
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
 			tokio::pin!(fut);
 			fut.as_mut().set_may_read(false);
 			let result = fut.next().await.unwrap();
@@ -1257,7 +1257,7 @@ mod tests {
 			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
 			let t0 = Instant::now();
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(20, 0), Duration::new(10, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(20, 0), Duration::new(10, 0));
 			tokio::pin!(fut);
 			fut.as_mut().set_may_write(false);
 			let result = fut.next().await.unwrap();
@@ -1295,7 +1295,7 @@ mod tests {
 			let txbuf = SingleTxBuf::new(Bytes::from_static(b""));
 
 			let t0 = Instant::now();
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(20, 0), Duration::new(10, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(20, 0), Duration::new(10, 0));
 			tokio::pin!(fut);
 			let result = fut.next().await.unwrap();
 			let t1 = Instant::now();
@@ -1332,7 +1332,7 @@ mod tests {
 			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
 			let t0 = Instant::now();
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
 			tokio::pin!(fut);
 			let _ = fut.next().await.unwrap();
 			let result = fut.next().await.unwrap();
@@ -1371,7 +1371,7 @@ mod tests {
 			let txbuf = SingleTxBuf::new(Bytes::from_static(b"foobar"));
 
 			let t0 = Instant::now();
-			let fut = DuplexStream::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
+			let fut = Duplex::new(stream, txbuf, Duration::new(10, 0), Duration::new(20, 0));
 			tokio::pin!(fut);
 			let _ = fut.next().await.unwrap();
 			// definitely after the write deadline

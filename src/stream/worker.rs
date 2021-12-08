@@ -44,8 +44,8 @@ use crate::core::{
 };
 use crate::ioutil::{
 	iotimeout,
-	DuplexStream,
-	DuplexStreamItem,
+	Duplex,
+	DuplexResult,
 	ReadResult,
 };
 use crate::tls;
@@ -537,7 +537,7 @@ pin_project! {
 		rx: mpsc::UnboundedReceiver<ControlMessage>,
 		cfg: config::StreamConfig,
 		#[pin]
-		stream: DuplexStream<FdStream, VecDeque<Bytes>>,
+		stream: Duplex<FdStream, VecDeque<Bytes>>,
 		rx_mode: DirectionMode,
 		tx_mode: DirectionMode,
 		handle: LuaRegistryHandle,
@@ -681,7 +681,7 @@ impl StreamWorker {
 			rx,
 			cfg,
 			handle,
-			stream: DuplexStream::new(conn, VecDeque::new(), cfg.read_timeout, cfg.send_timeout),
+			stream: Duplex::new(conn, VecDeque::new(), cfg.read_timeout, cfg.send_timeout),
 			tx_mode: DirectionMode::Open,
 			rx_mode: DirectionMode::Open,
 		}
@@ -701,10 +701,10 @@ impl StreamWorker {
 			this.stream.as_mut().set_may_write(this.tx_mode.may());
 			select! {
 				result = this.stream.next() => {
-					let DuplexStreamItem{
+					let DuplexResult{
 						read_result,
 						write_result,
-					} = result.expect("DuplexStream always returns something");
+					} = result.expect("Duplex always returns something");
 					match read_result {
 						// some data received
 						ReadResult::Ok(buf) => {
