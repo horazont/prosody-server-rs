@@ -126,6 +126,7 @@ pin_project! {
 		write_timeout: tokio::time::Duration,
 		may_read: bool,
 		may_write: bool,
+		flush_needed: bool,
 		#[pin]
 		read_deadline: Sleep,
 		#[pin]
@@ -147,6 +148,7 @@ impl<I, T> DuplexStream<I, T> where DuplexStream<I, T>: Stream {
 			rxbuf: None,
 			may_read: true,
 			may_write: true,
+			flush_needed: false,
 			read_timeout,
 			write_timeout,
 			read_deadline: sleep(read_timeout),
@@ -226,6 +228,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I,
 		let mut write_result = Ok(());
 		if *this.may_write {
 			let mut wrote_anything = false;
+			let mut all_written = true;
 			while let Some(txbuf) = this.txsrc.get_buf() {
 				assert!(txbuf.len() > 0);
 				match Pin::new(&mut this.inner).poll_write(cx, txbuf) {
@@ -235,15 +238,18 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I,
 						// if the buffer is depleted, we will see that below during
 						// the read poll, but we first try to read to make this fair.
 						wrote_anything = true;
+						*this.flush_needed = true;
 					},
 					Poll::Ready(Err(e)) => {
 						write_result = Err(e);
 						// write failed, let's exit
+						all_written = false;
 						break
 					},
 					Poll::Pending => {
 						// if we cannot write right now, we still try to read and
 						// exit the loop.
+						all_written = false;
 						break
 					},
 				}
@@ -252,7 +258,18 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I,
 				// ensure to advance the write deadline
 				this.write_deadline.as_mut().reset(now + *this.write_timeout);
 			}
-
+			if all_written && *this.flush_needed && write_result.is_ok() {
+				match Pin::new(&mut this.inner).poll_flush(cx) {
+					Poll::Ready(Ok(())) => {
+						*this.flush_needed = false;
+					},
+					Poll::Ready(Err(e)) => {
+						write_result = Err(e);
+						// TODO: cancel flushing here?
+					},
+					Poll::Pending => (),
+				}
+			}
 			// no error during write && nothing written -> problematic
 			if !wrote_anything && write_result.is_ok() {
 				// no read result? check if we need to check the read timeout
