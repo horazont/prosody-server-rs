@@ -119,7 +119,6 @@ pub trait TxBufRead {
 
 pin_project! {
 	pub struct DuplexStream<I, T> {
-		#[pin]
 		inner: I,
 		txsrc: T,
 		rxbuf: Option<BytesMut>,
@@ -155,10 +154,6 @@ impl<I, T> DuplexStream<I, T> where DuplexStream<I, T>: Stream {
 		(self.inner, self.txsrc)
 	}
 
-	pub fn get_txsrc_mut(&self) -> &T {
-		&self.txsrc
-	}
-
 	pub fn set_read_deadline(self: Pin<&mut Self>, deadline: Instant) {
 		let this = self.project();
 		this.read_deadline.reset(deadline);
@@ -167,6 +162,16 @@ impl<I, T> DuplexStream<I, T> where DuplexStream<I, T>: Stream {
 	pub fn set_write_deadline(self: Pin<&mut Self>, deadline: Instant) {
 		let this = self.project();
 		this.write_deadline.reset(deadline);
+	}
+
+	pub fn get_pin(self: Pin<&Self>) -> (&I, &T) {
+		let this = self.project_ref();
+		(this.inner, this.txsrc)
+	}
+
+	pub fn get_pin_mut(self: Pin<&mut Self>) -> (&mut I, &mut T) {
+		let this = self.project();
+		(this.inner, this.txsrc)
 	}
 }
 
@@ -1264,7 +1269,7 @@ mod tests {
 				other => panic!("unexpected poll result: {:?}", other),
 			}
 
-			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			let txbuf = fut.as_ref().get_pin().1.get().unwrap();
 			assert_eq!(txbuf.remaining(), 2);
 		}
 
@@ -1306,7 +1311,7 @@ mod tests {
 				other => panic!("unexpected poll result: {:?}", other),
 			}
 
-			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			let txbuf = fut.as_ref().get_pin().1.get().unwrap();
 			assert_eq!(txbuf.remaining(), 6);
 		}
 
@@ -1336,7 +1341,7 @@ mod tests {
 				other => panic!("unexpected poll result: {:?}", other),
 			}
 
-			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			let txbuf = fut.as_ref().get_pin().1.get().unwrap();
 			assert_eq!(txbuf.remaining(), 6);
 		}
 
@@ -1366,7 +1371,7 @@ mod tests {
 				other => panic!("unexpected poll result: {:?}", other),
 			}
 
-			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			let txbuf = fut.as_ref().get_pin().1.get().unwrap();
 			assert_eq!(txbuf.remaining(), 0);
 		}
 
@@ -1408,7 +1413,7 @@ mod tests {
 				other => panic!("unexpected poll result: {:?}", other),
 			}
 
-			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			let txbuf = fut.as_ref().get_pin().1.get().unwrap();
 			assert_eq!(txbuf.remaining(), 6);
 		}
 
@@ -1450,7 +1455,7 @@ mod tests {
 				other => panic!("unexpected poll result: {:?}", other),
 			}
 
-			let txbuf = fut.get_txsrc_mut().get().unwrap();
+			let txbuf = fut.as_ref().get_pin().1.get().unwrap();
 			assert_eq!(txbuf.remaining(), 2);
 		}
 
