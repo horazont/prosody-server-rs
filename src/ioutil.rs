@@ -192,13 +192,22 @@ impl<I, T> DuplexStream<I, T> where DuplexStream<I, T>: Stream {
 }
 
 #[derive(Debug)]
+pub enum ReadResult {
+	NoRead,
+	Ok(Bytes),
+	Err(io::Error),
+	Eof,
+}
+
+#[derive(Debug)]
 pub struct DuplexStreamItem {
 	// Possible situations for a read:
 	// - Some data read: return buffer
 	// - Read failed: return io error
 	// - Timeout triggered: return io::ErrorKind::TimedOut
 	// - No data read (but call returned because a write error for instance): return None
-	pub read_result: Result<Option<Bytes>, io::Error>,
+	// - Read EOF
+	pub read_result: ReadResult,
 
 	// Possible situations for a write:
 	// - Did not happen because no buffer
@@ -288,36 +297,41 @@ impl<I: AsyncRead + AsyncWrite + Unpin, T: TxBufRead> Stream for DuplexStream<I,
 				let read_buf = this.inner.read_buf(rxbuf);
 				tokio::pin!(read_buf);
 				match read_buf.poll(cx) {
-					Poll::Ready(Ok(_)) => {
+					Poll::Ready(Ok(n)) => {
 						// advance read timeout
 						this.read_deadline.as_mut().reset(now + *this.read_timeout);
-						Ok(Some(this.rxbuf.take().unwrap().freeze()))
+						if n > 0 {
+							ReadResult::Ok(this.rxbuf.take().unwrap().freeze())
+						} else {
+							ReadResult::Eof
+						}
 					},
-					Poll::Ready(Err(e)) => Err(e),
-					Poll::Pending => Ok(None),
+					Poll::Ready(Err(e)) => ReadResult::Err(e),
+					Poll::Pending => ReadResult::NoRead,
 				}
 			};
 
-			if matches!(read_result.as_ref(), Ok(None)) {
+			if matches!(&read_result, &ReadResult::NoRead) {
 				// no read result? check if we need to check the read timeout
 				match this.read_deadline.poll(cx) {
 					Poll::Ready(_) => {
-						read_result = Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout elapsed"));
+						read_result = ReadResult::Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout elapsed"));
 					},
 					_ => (),
 				}
 			}
 			read_result
 		} else {
-			Ok(None)
+			ReadResult::NoRead
 		};
 
-		println!("{:?} {:?}", read_result, write_result);
-		match (read_result.as_ref(), write_result.as_ref()) {
-			// something failed, return immediately
-			(Err(_), _) | (_, Err(_)) |
-			// something was read, return immediately
-				(Ok(Some(_)), _)
+		match (&read_result, write_result.as_ref()) {
+			// anything failed, return immediately
+			(ReadResult::Err(_), _) | (_, Err(_)) |
+			// anything was read, return immediately
+				(ReadResult::Ok(_), _) |
+			// eof detected, return immediately
+				(ReadResult::Eof, _)
 			=> {
 				Poll::Ready(Some(DuplexStreamItem{
 					read_result,
@@ -1293,7 +1307,7 @@ mod tests {
 			match fut.as_mut().poll_next(&mut ctx) {
 				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
 					match read_result {
-						Ok(Some(rxbuf)) => {
+						ReadResult::Ok(rxbuf) => {
 							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
 						},
 						other => panic!("unexpected read result: {:?}", other),
@@ -1337,7 +1351,7 @@ mod tests {
 			match fut.as_mut().poll_next(&mut ctx) {
 				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
 					match read_result {
-						Ok(Some(rxbuf)) => {
+						ReadResult::Ok(rxbuf) => {
 							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
 						},
 						other => panic!("unexpected read result: {:?}", other),
@@ -1412,7 +1426,7 @@ mod tests {
 			match fut.as_mut().poll_next(&mut ctx) {
 				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
 					match read_result {
-						Ok(Some(rxbuf)) => {
+						ReadResult::Ok(rxbuf) => {
 							assert_eq!(&rxbuf[..], &SAMPLE_DATA[..4]);
 						},
 						other => panic!("unexpected read result: {:?}", other),
@@ -1514,7 +1528,7 @@ mod tests {
 			match fut.as_mut().poll_next(&mut ctx) {
 				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
 					match read_result {
-						Ok(None) => (),
+						ReadResult::NoRead => (),
 						other => panic!("unexpected read result: {:?}", other),
 					};
 
@@ -1556,7 +1570,7 @@ mod tests {
 			match fut.as_mut().poll_next(&mut ctx) {
 				Poll::Ready(Some(DuplexStreamItem{read_result, write_result})) => {
 					match read_result {
-						Err(e) => {
+						ReadResult::Err(e) => {
 							assert_eq!(e.kind(), io::ErrorKind::Other);
 						},
 						other => panic!("unexpected read result: {:?}", other),
@@ -1607,7 +1621,7 @@ mod tests {
 			let result = fut.next().await.unwrap();
 			let t1 = Instant::now();
 			match result.read_result {
-				Err(e) => {
+				ReadResult::Err(e) => {
 					assert_eq!(e.kind(), io::ErrorKind::TimedOut);
 				},
 				other => panic!("unexpected read result: {:?}", other),
@@ -1651,7 +1665,7 @@ mod tests {
 				other => panic!("unexpected read result: {:?}", other),
 			};
 			match result.read_result {
-				Ok(None) => (),
+				ReadResult::NoRead => (),
 				other => panic!("unexpected write result: {:?}", other),
 			};
 			let dt = t1 - t0;
@@ -1683,7 +1697,7 @@ mod tests {
 			let result = fut.next().await.unwrap();
 			let t1 = Instant::now();
 			match result.read_result {
-				Err(e) => {
+				ReadResult::Err(e) => {
 					assert_eq!(e.kind(), io::ErrorKind::TimedOut);
 				},
 				other => panic!("unexpected read result: {:?}", other),
@@ -1721,7 +1735,7 @@ mod tests {
 			let result = fut.next().await.unwrap();
 			let t1 = Instant::now();
 			match result.read_result {
-				Err(e) => {
+				ReadResult::Err(e) => {
 					assert_eq!(e.kind(), io::ErrorKind::TimedOut);
 				},
 				other => panic!("unexpected read result: {:?}", other),
@@ -1768,7 +1782,7 @@ mod tests {
 				other => panic!("unexpected read result: {:?}", other),
 			};
 			match result.read_result {
-				Ok(None) => (),
+				ReadResult::NoRead => (),
 				other => panic!("unexpected write result: {:?}", other),
 			};
 			let dt = t1 - t0;
