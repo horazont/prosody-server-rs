@@ -9,23 +9,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut, BufMut, Buf, buf::Limit};
+use bytes::Bytes;
 
 use tokio::select;
 use tokio::io::{
 	AsyncRead,
-	AsyncReadExt,
 	AsyncWrite,
 	AsyncWriteExt,
 	ReadBuf,
-	ReadHalf,
-	WriteHalf,
 };
 use tokio::net::{TcpStream, UnixStream};
-use tokio::net::{tcp, unix};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::time::timeout_at;
 
 use tokio_rustls::{
 	TlsAcceptor,
@@ -34,6 +29,8 @@ use tokio_rustls::{
 	client,
 	rustls,
 };
+
+use futures_util::StreamExt;
 
 use pin_project_lite::pin_project;
 
@@ -47,7 +44,9 @@ use crate::core::{
 };
 use crate::ioutil::{
 	iotimeout,
-	iodeadline,
+	DuplexStream,
+	DuplexStreamItem,
+	ReadResult,
 };
 use crate::tls;
 use crate::verify;
@@ -65,100 +64,64 @@ pin_project! {
 		Broken{e: Option<Box<dyn std::error::Error + Send + 'static>>},
 		PlainTcp{
 			#[pin]
-			rx: tcp::OwnedReadHalf,
-			#[pin]
-			tx: tcp::OwnedWriteHalf,
+			conn: TcpStream,
 		},
 		PlainUnix{
 			#[pin]
-			rx: unix::OwnedReadHalf,
-			#[pin]
-			tx: unix::OwnedWriteHalf,
+			conn: UnixStream
 		},
 		TlsTcpServer{
 			#[pin]
-			rx: ReadHalf<server::TlsStream<TcpStream>>,
-			#[pin]
-			tx: WriteHalf<server::TlsStream<TcpStream>>,
+			conn: server::TlsStream<TcpStream>,
 		},
 		TlsTcpClient{
 			#[pin]
-			rx: ReadHalf<client::TlsStream<TcpStream>>,
-			#[pin]
-			tx: WriteHalf<client::TlsStream<TcpStream>>,
+			conn: client::TlsStream<TcpStream>,
 		},
 		TlsUnixServer{
 			#[pin]
-			rx: ReadHalf<server::TlsStream<UnixStream>>,
-			#[pin]
-			tx: WriteHalf<server::TlsStream<UnixStream>>,
+			conn: server::TlsStream<UnixStream>,
 		},
 		TlsUnixClient{
 			#[pin]
-			rx: ReadHalf<client::TlsStream<UnixStream>>,
-			#[pin]
-			tx: WriteHalf<client::TlsStream<UnixStream>>,
+			conn: client::TlsStream<UnixStream>,
 		},
 	}
 }
 
 impl From<TcpStream> for Stream {
 	fn from(other: TcpStream) -> Self {
-		let (rx, tx) = other.into_split();
-		Self::PlainTcp{
-			rx,
-			tx,
-		}
+		Self::PlainTcp{conn: other}
 	}
 }
 
 impl From<UnixStream> for Stream {
 	fn from(other: UnixStream) -> Self {
-		let (rx, tx) = other.into_split();
-		Self::PlainUnix{
-			rx,
-			tx,
-		}
+		Self::PlainUnix{conn: other}
 	}
 }
 
 impl From<server::TlsStream<TcpStream>> for Stream {
 	fn from(other: server::TlsStream<TcpStream>) -> Self {
-		let (rx, tx) = tokio::io::split(other);
-		Self::TlsTcpServer{
-			rx,
-			tx,
-		}
+		Self::TlsTcpServer{conn: other}
 	}
 }
 
 impl From<client::TlsStream<TcpStream>> for Stream {
 	fn from(other: client::TlsStream<TcpStream>) -> Self {
-		let (rx, tx) = tokio::io::split(other);
-		Self::TlsTcpClient{
-			rx,
-			tx,
-		}
+		Self::TlsTcpClient{conn: other}
 	}
 }
 
 impl From<client::TlsStream<UnixStream>> for Stream {
 	fn from(other: client::TlsStream<UnixStream>) -> Self {
-		let (rx, tx) = tokio::io::split(other);
-		Self::TlsUnixClient{
-			rx,
-			tx,
-		}
+		Self::TlsUnixClient{conn: other}
 	}
 }
 
 impl From<server::TlsStream<UnixStream>> for Stream {
 	fn from(other: server::TlsStream<UnixStream>) -> Self {
-		let (rx, tx) = tokio::io::split(other);
-		Self::TlsUnixServer{
-			rx,
-			tx,
-		}
+		Self::TlsUnixServer{conn: other}
 	}
 }
 
@@ -268,14 +231,8 @@ impl Stream {
 				result
 			},
 			Self::TlsTcpServer{..} | Self::TlsTcpClient{..} | Self::TlsUnixServer{..} | Self::TlsUnixClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::PlainTcp{rx, tx} => {
-				let sock = rx.reunite(tx).unwrap();
-				self.starttls_client(sock, name, ctx.into(), recorder, handshake_timeout).await
-			},
-			Self::PlainUnix{rx, tx} => {
-				let sock = rx.reunite(tx).unwrap();
-				self.starttls_client(sock, name, ctx.into(), recorder, handshake_timeout).await
-			},
+			Self::PlainTcp{conn} => self.starttls_client(conn, name, ctx.into(), recorder, handshake_timeout).await,
+			Self::PlainUnix{conn} => self.starttls_client(conn, name, ctx.into(), recorder, handshake_timeout).await,
 		}
 	}
 
@@ -289,26 +246,8 @@ impl Stream {
 				result
 			},
 			Self::TlsTcpServer{..} | Self::TlsTcpClient{..} | Self::TlsUnixServer{..} | Self::TlsUnixClient{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "attempt to start TLS on a socket with TLS")),
-			Self::PlainTcp{rx, tx} => {
-				let sock = rx.reunite(tx).unwrap();
-				self.starttls_server(sock, ctx.into(), recorder, handshake_timeout).await
-			},
-			Self::PlainUnix{rx, tx} => {
-				let sock = rx.reunite(tx).unwrap();
-				self.starttls_server(sock, ctx.into(), recorder, handshake_timeout).await
-			},
-		}
-	}
-
-	fn as_parts_mut(&mut self) -> (&mut (dyn AsyncRead + Unpin + Send + 'static), &mut (dyn AsyncWrite + Unpin + Send + 'static)) {
-		match self {
-			Self::Broken{ref e} => panic!("broken stream: {:?}", e),
-			Self::PlainTcp{ref mut rx, ref mut tx} => (rx, tx),
-			Self::PlainUnix{ref mut rx, ref mut tx} => (rx, tx),
-			Self::TlsTcpServer{ref mut rx, ref mut tx} => (rx, tx),
-			Self::TlsTcpClient{ref mut rx, ref mut tx} => (rx, tx),
-			Self::TlsUnixServer{ref mut rx, ref mut tx} => (rx, tx),
-			Self::TlsUnixClient{ref mut rx, ref mut tx} => (rx, tx),
+			Self::PlainTcp{conn} => self.starttls_server(conn, ctx.into(), recorder, handshake_timeout).await,
+			Self::PlainUnix{conn} => self.starttls_server(conn, ctx.into(), recorder, handshake_timeout).await,
 		}
 	}
 }
@@ -318,12 +257,12 @@ impl AsyncRead for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::PlainTcp{rx, ..} => rx.poll_read(cx, buf),
-            StreamProj::PlainUnix{rx, ..} => rx.poll_read(cx, buf),
-            StreamProj::TlsTcpServer{rx, ..} => rx.poll_read(cx, buf),
-            StreamProj::TlsTcpClient{rx, ..} => rx.poll_read(cx, buf),
-            StreamProj::TlsUnixServer{rx, ..} => rx.poll_read(cx, buf),
-            StreamProj::TlsUnixClient{rx, ..} => rx.poll_read(cx, buf),
+            StreamProj::PlainTcp{conn, ..} => conn.poll_read(cx, buf),
+            StreamProj::PlainUnix{conn, ..} => conn.poll_read(cx, buf),
+            StreamProj::TlsTcpServer{conn, ..} => conn.poll_read(cx, buf),
+            StreamProj::TlsTcpClient{conn, ..} => conn.poll_read(cx, buf),
+            StreamProj::TlsUnixServer{conn, ..} => conn.poll_read(cx, buf),
+            StreamProj::TlsUnixClient{conn, ..} => conn.poll_read(cx, buf),
 		}
 	}
 }
@@ -333,12 +272,12 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::PlainTcp{tx, ..} => tx.poll_write(cx, buf),
-            StreamProj::PlainUnix{tx, ..} => tx.poll_write(cx, buf),
-            StreamProj::TlsTcpServer{tx, ..} => tx.poll_write(cx, buf),
-            StreamProj::TlsTcpClient{tx, ..} => tx.poll_write(cx, buf),
-            StreamProj::TlsUnixServer{tx, ..} => tx.poll_write(cx, buf),
-            StreamProj::TlsUnixClient{tx, ..} => tx.poll_write(cx, buf),
+            StreamProj::PlainTcp{conn, ..} => conn.poll_write(cx, buf),
+            StreamProj::PlainUnix{conn, ..} => conn.poll_write(cx, buf),
+            StreamProj::TlsTcpServer{conn, ..} => conn.poll_write(cx, buf),
+            StreamProj::TlsTcpClient{conn, ..} => conn.poll_write(cx, buf),
+            StreamProj::TlsUnixServer{conn, ..} => conn.poll_write(cx, buf),
+            StreamProj::TlsUnixClient{conn, ..} => conn.poll_write(cx, buf),
         }
     }
 
@@ -346,12 +285,12 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::PlainTcp{tx, ..} => tx.poll_write_vectored(cx, bufs),
-            StreamProj::PlainUnix{tx, ..} => tx.poll_write_vectored(cx, bufs),
-            StreamProj::TlsTcpServer{tx, ..} => tx.poll_write_vectored(cx, bufs),
-            StreamProj::TlsTcpClient{tx, ..} => tx.poll_write_vectored(cx, bufs),
-            StreamProj::TlsUnixServer{tx, ..} => tx.poll_write_vectored(cx, bufs),
-            StreamProj::TlsUnixClient{tx, ..} => tx.poll_write_vectored(cx, bufs),
+            StreamProj::PlainTcp{conn, ..} => conn.poll_write_vectored(cx, bufs),
+            StreamProj::PlainUnix{conn, ..} => conn.poll_write_vectored(cx, bufs),
+            StreamProj::TlsTcpServer{conn, ..} => conn.poll_write_vectored(cx, bufs),
+            StreamProj::TlsTcpClient{conn, ..} => conn.poll_write_vectored(cx, bufs),
+            StreamProj::TlsUnixServer{conn, ..} => conn.poll_write_vectored(cx, bufs),
+            StreamProj::TlsUnixClient{conn, ..} => conn.poll_write_vectored(cx, bufs),
         }
     }
 
@@ -359,12 +298,12 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::PlainTcp{tx, ..} => tx.poll_flush(cx),
-            StreamProj::PlainUnix{tx, ..} => tx.poll_flush(cx),
-            StreamProj::TlsTcpServer{tx, ..} => tx.poll_flush(cx),
-            StreamProj::TlsTcpClient{tx, ..} => tx.poll_flush(cx),
-            StreamProj::TlsUnixServer{tx, ..} => tx.poll_flush(cx),
-            StreamProj::TlsUnixClient{tx, ..} => tx.poll_flush(cx),
+            StreamProj::PlainTcp{conn, ..} => conn.poll_flush(cx),
+            StreamProj::PlainUnix{conn, ..} => conn.poll_flush(cx),
+            StreamProj::TlsTcpServer{conn, ..} => conn.poll_flush(cx),
+            StreamProj::TlsTcpClient{conn, ..} => conn.poll_flush(cx),
+            StreamProj::TlsUnixServer{conn, ..} => conn.poll_flush(cx),
+            StreamProj::TlsUnixClient{conn, ..} => conn.poll_flush(cx),
         }
     }
 
@@ -372,24 +311,24 @@ impl AsyncWrite for Stream {
         let this = self.project();
         match this {
             StreamProj::Broken{ref e} => Poll::Ready(Err(Self::broken_err(e))),
-            StreamProj::PlainTcp{tx, ..} => tx.poll_shutdown(cx),
-            StreamProj::PlainUnix{tx, ..} => tx.poll_shutdown(cx),
-            StreamProj::TlsTcpServer{tx, ..} => tx.poll_shutdown(cx),
-            StreamProj::TlsTcpClient{tx, ..} => tx.poll_shutdown(cx),
-            StreamProj::TlsUnixServer{tx, ..} => tx.poll_shutdown(cx),
-            StreamProj::TlsUnixClient{tx, ..} => tx.poll_shutdown(cx),
+            StreamProj::PlainTcp{conn, ..} => conn.poll_shutdown(cx),
+            StreamProj::PlainUnix{conn, ..} => conn.poll_shutdown(cx),
+            StreamProj::TlsTcpServer{conn, ..} => conn.poll_shutdown(cx),
+            StreamProj::TlsTcpClient{conn, ..} => conn.poll_shutdown(cx),
+            StreamProj::TlsUnixServer{conn, ..} => conn.poll_shutdown(cx),
+            StreamProj::TlsUnixClient{conn, ..} => conn.poll_shutdown(cx),
         }
     }
 
     fn is_write_vectored(&self) -> bool {
         match self {
             Self::Broken{..} => false,
-            Self::PlainTcp{tx, ..} => tx.is_write_vectored(),
-            Self::PlainUnix{tx, ..} => tx.is_write_vectored(),
-            Self::TlsTcpServer{tx, ..} => tx.is_write_vectored(),
-            Self::TlsTcpClient{tx, ..} => tx.is_write_vectored(),
-            Self::TlsUnixServer{tx, ..} => tx.is_write_vectored(),
-            Self::TlsUnixClient{tx, ..} => tx.is_write_vectored(),
+            Self::PlainTcp{conn, ..} => conn.is_write_vectored(),
+            Self::PlainUnix{conn, ..} => conn.is_write_vectored(),
+            Self::TlsTcpServer{conn, ..} => conn.is_write_vectored(),
+            Self::TlsTcpClient{conn, ..} => conn.is_write_vectored(),
+            Self::TlsUnixServer{conn, ..} => conn.is_write_vectored(),
+            Self::TlsUnixClient{conn, ..} => conn.is_write_vectored(),
         }
     }
 }
@@ -517,6 +456,39 @@ impl DerefMut for FdStream {
 	}
 }
 
+impl AsyncRead for FdStream {
+	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+		let this = self.project();
+		this.inner.poll_read(cx, buf)
+	}
+}
+
+impl AsyncWrite for FdStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.project();
+        this.inner.poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        let this = self.project();
+        this.inner.poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.project();
+        this.inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.project();
+        this.inner.poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+		self.inner.is_write_vectored()
+    }
+}
+
 enum MsgResult {
 	Continue,
 	Exit,
@@ -559,39 +531,27 @@ impl DirectionMode {
 	}
 }
 
-pub(super) struct StreamWorker {
-	rx: mpsc::UnboundedReceiver<ControlMessage>,
-	conn: FdStream,
-	cfg: config::StreamConfig,
-	buf: Option<Limit<BytesMut>>,
-	rx_mode: DirectionMode,
-	tx_mode: DirectionMode,
-	txq: VecDeque<Bytes>,
-	handle: LuaRegistryHandle,
+pin_project! {
+	#[project = StreamWorkerProj]
+	pub(super) struct StreamWorker {
+		rx: mpsc::UnboundedReceiver<ControlMessage>,
+		cfg: config::StreamConfig,
+		#[pin]
+		stream: DuplexStream<FdStream, VecDeque<Bytes>>,
+		rx_mode: DirectionMode,
+		tx_mode: DirectionMode,
+		handle: LuaRegistryHandle,
+	}
 }
 
-impl StreamWorker {
-	pub(super) fn new(
-			rx: mpsc::UnboundedReceiver<ControlMessage>,
-			conn: FdStream,
-			cfg: config::StreamConfig,
-			handle: LuaRegistryHandle
-	) -> Self {
-		Self{
-			rx,
-			conn,
-			cfg,
-			handle,
-			tx_mode: DirectionMode::Open,
-			rx_mode: DirectionMode::Open,
-			txq: VecDeque::new(),
-			buf: None,
-		}
+impl StreamWorkerProj<'_> {
+	fn get_fdstream_mut(&mut self) -> &mut FdStream {
+		self.stream.as_mut().get_pin_mut().0
 	}
 
 	fn set_keepalive(&self, enabled: bool) -> Result<(), io::Error> {
 		nix::sys::socket::setsockopt(
-			self.conn.as_raw_fd(),
+			self.stream.as_ref().get_pin().0.as_raw_fd(),
 			nix::sys::socket::sockopt::KeepAlive,
 			&enabled,
 		)?;
@@ -599,10 +559,11 @@ impl StreamWorker {
 	}
 
 	async fn force_flush(&mut self) -> io::Result<()> {
-		for mut buf in self.txq.drain(..) {
-			iotimeout(self.cfg.send_timeout, self.conn.write_all_buf(&mut buf), "write timed out").await?;
+		let (stream, q) = self.stream.as_mut().get_pin_mut();
+		for mut buf in q.drain(..) {
+			iotimeout(self.cfg.send_timeout, stream.write_all_buf(&mut buf), "write timed out").await?;
 		}
-		iotimeout(self.cfg.send_timeout, self.conn.flush(), "flush timed out").await?;
+		iotimeout(self.cfg.send_timeout, stream.flush(), "flush timed out").await?;
 		Ok(())
 	}
 
@@ -612,10 +573,13 @@ impl StreamWorker {
 			// effort.
 			Ok(..) | Err(..) => (),
 		};
-		self.conn.shutdown().await
+		self.get_fdstream_mut().shutdown().await
 	}
 
-	async fn clean_shutdown_with_msg(&mut self, err: Option<Box<dyn std::error::Error + Send + 'static>>) {
+	async fn clean_shutdown_with_msg(
+		&mut self,
+		err: Option<Box<dyn std::error::Error + Send + 'static>>,
+	) {
 		let shutdown_err = self.clean_shutdown().await.err();
 		let err = err.or(match shutdown_err {
 			Some(x) => Some(Box::new(x)),
@@ -630,7 +594,10 @@ impl StreamWorker {
 	}
 
 	#[inline]
-	async fn proc_msg(&mut self, msg: ControlMessage) -> io::Result<MsgResult> {
+	async fn proc_msg(
+		&mut self,
+		msg: ControlMessage,
+	) -> io::Result<MsgResult> {
 		match msg {
 			ControlMessage::Close => {
 				self.clean_shutdown_with_msg(None).await;
@@ -644,189 +611,179 @@ impl StreamWorker {
 			},
 			ControlMessage::AcceptTls(ctx, recorder) => {
 				self.force_flush().await?;
-				let tls_info = self.conn.starttls_accept(ctx, &recorder, self.cfg.ssl_handshake_timeout).await?;
-				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), tls_info}).await {
+				let timeout = self.cfg.ssl_handshake_timeout;
+				let tls_info = self.get_fdstream_mut().starttls_accept(
+					ctx,
+					&recorder,
+					timeout,
+				).await?;
+				match MAIN_CHANNEL.send(
+					Message::TlsStarted{handle: self.handle.clone(), tls_info},
+				).await {
 					Ok(_) => {
-						self.rx_mode = self.rx_mode.unblock();
-						self.tx_mode = self.tx_mode.unblock();
+						*self.rx_mode = self.rx_mode.unblock();
+						*self.tx_mode = self.tx_mode.unblock();
 						Ok(MsgResult::Continue)
 					},
 					Err(_) => Ok(MsgResult::Exit),
 				}
 			},
 			ControlMessage::ConnectTls(name, ctx, recorder) => {
-				let tls_info = self.conn.starttls_connect(name, ctx, &*recorder, self.cfg.ssl_handshake_timeout).await?;
-				match MAIN_CHANNEL.send(Message::TlsStarted{handle: self.handle.clone(), tls_info}).await {
+				let timeout = self.cfg.ssl_handshake_timeout;
+				let tls_info = self.get_fdstream_mut().starttls_connect(
+					name,
+					ctx,
+					&*recorder,
+					timeout,
+				).await?;
+				match MAIN_CHANNEL.send(
+					Message::TlsStarted{handle: self.handle.clone(), tls_info},
+				).await {
 					Ok(_) => {
-						self.rx_mode = self.rx_mode.unblock();
-						self.tx_mode = self.tx_mode.unblock();
+						*self.rx_mode = self.rx_mode.unblock();
+						*self.tx_mode = self.tx_mode.unblock();
 						Ok(MsgResult::Continue)
 					},
 					Err(_) => Ok(MsgResult::Exit),
 				}
 			},
 			ControlMessage::Write(buf) => if self.tx_mode.may_ever() {
-				self.txq.push_back(buf);
+				self.stream.as_mut().get_pin_mut().1.push_back(buf);
 				Ok(MsgResult::Continue)
 			} else {
 				// should this instead be a write error or something?!
 				Ok(MsgResult::Continue)
 			},
 			ControlMessage::BlockReads => {
-				self.rx_mode = self.rx_mode.block();
+				*self.rx_mode = self.rx_mode.block();
 				Ok(MsgResult::Continue)
 			}
 			ControlMessage::BlockWrites => {
-				self.tx_mode = self.tx_mode.block();
+				*self.tx_mode = self.tx_mode.block();
 				Ok(MsgResult::Continue)
 			},
 			ControlMessage::UnblockWrites => {
-				self.tx_mode = self.tx_mode.unblock();
+				*self.tx_mode = self.tx_mode.unblock();
 				Ok(MsgResult::Continue)
 			},
 		}
 	}
+}
 
-	async fn run(mut self) {
-		let mut read_deadline = Instant::now() + self.cfg.read_timeout;
-		let mut write_deadline = Instant::now() + self.cfg.send_timeout;
-		let mut txdummy = Bytes::new();
-		let mut rxdummy = BytesMut::new().limit(0);
-		let mut has_pending_write = false;
+impl StreamWorker {
+	pub(super) fn new(
+			rx: mpsc::UnboundedReceiver<ControlMessage>,
+			conn: FdStream,
+			cfg: config::StreamConfig,
+			handle: LuaRegistryHandle
+	) -> Self {
+		Self{
+			rx,
+			cfg,
+			handle,
+			stream: DuplexStream::new(conn, VecDeque::new(), cfg.read_timeout, cfg.send_timeout),
+			tx_mode: DirectionMode::Open,
+			rx_mode: DirectionMode::Open,
+		}
+	}
+
+	async fn run(self: Pin<&mut Self>) {
+		let mut this = self.project();
 		loop {
-			if !self.rx_mode.may_ever() && !self.tx_mode.may_ever() {
+			if !this.rx_mode.may_ever() && !this.tx_mode.may_ever() {
 				// if the connection can neither read nor write ever again, we only shutdown and then bail out
-				self.buf = None;
 				select! {
-					_ = self.conn.shutdown() => return,
+					_ = this.stream.as_mut().get_pin_mut().0.shutdown() => return,
 					_ = MAIN_CHANNEL.closed() => return,
 				}
 			}
-
-			let rxbuf = if self.rx_mode.may() {
-				let read_size = self.cfg.read_size;
-				self.buf.get_or_insert_with(|| { BytesMut::with_capacity(read_size).limit(read_size) })
-			} else {
-				&mut rxdummy
-			};
-
-			let txbuf = if self.tx_mode.may() {
-				match self.txq.front_mut() {
-					Some(buf) => {
-						if !has_pending_write {
-							// this is the first time we're seeing a buffer since the last successful write -> we can advance the write deadline
-							write_deadline = Instant::now() + self.cfg.send_timeout;
-						}
-						has_pending_write = true;
-						buf
-					},
-					None => {
-						has_pending_write = false;
-						&mut txdummy
-					}
-				}
-			} else {
-				&mut txdummy
-			};
-
-			let (rx, tx) = self.conn.as_parts_mut();
-			tokio::pin!(rx);
-			tokio::pin!(tx);
-
+			this.stream.as_mut().set_may_read(this.rx_mode.may());
+			this.stream.as_mut().set_may_write(this.tx_mode.may());
 			select! {
-				result = timeout_at(read_deadline.into(), rx.read_buf(rxbuf)), if self.rx_mode.may() => match result {
-					Ok(Ok(0)) => {
-						debug_assert!(rxbuf.get_ref().has_remaining_mut());
-						// at eof
-						self.buf = None;
-						self.rx_mode = DirectionMode::Closed;
-						// we flush our current buffers and then we exit
-						self.clean_shutdown_with_msg(None).await;
-						return;
-					},
-					Ok(Ok(n)) => {
-						// This is very efficient especially on small reads:
-						// instead of resizing the buffer, we keep the existing
-						// buffer to avoid fragmentation, at least a little.
-						let buf = {
-							let inner = rxbuf.get_mut();
-							let buf = Bytes::copy_from_slice(&inner[..]);
-							inner.truncate(0);
-							inner.reserve(self.cfg.read_size);
-							drop(inner);
-							rxbuf.set_limit(self.cfg.read_size);
-							buf
-						};
-						debug_assert!(buf.len() == n);
-						match MAIN_CHANNEL.send(Message::Incoming{
-							handle: self.handle.clone(),
-							data: buf,
-						}).await {
-							Ok(_) => (),
-							// again, only during shutdown
-							Err(_) => return,
-						};
-						// successful read? -> advance deadline
-						read_deadline = Instant::now() + self.cfg.read_timeout;
-					},
-					Ok(Err(e)) => {
-						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
-						return;
-					},
-					// read timeout
-					Err(_) => {
-						let (reply_tx, reply_rx) = oneshot::channel();
-						// if it does not really get sent, the reply_rx will
-						// complete immediately because the tx got dropped and
-						// thus the connection will be closed because of the
-						// read timeout. perfect.
-						MAIN_CHANNEL.fire_and_forget(Message::ReadTimeout{
-							handle: self.handle.clone(),
-							keepalive: reply_tx,
-						}).await;
+				result = this.stream.next() => {
+					let DuplexStreamItem{
+						read_result,
+						write_result,
+					} = result.expect("DuplexStream always returns something");
+					match read_result {
+						// some data received
+						ReadResult::Ok(buf) => {
+							match MAIN_CHANNEL.send(Message::Incoming{
+								handle: this.handle.clone(),
+								data: buf,
+							}).await {
+								Ok(_) => (),
+								// again, only during shutdown
+								Err(_) => return,
+							};
+						},
+						ReadResult::Eof => {
+							*this.rx_mode = DirectionMode::Closed;
+							// we flush our current buffers and then we exit
+							this.clean_shutdown_with_msg(None).await;
+							return;
+						},
+						// other reason for the return, we don't care
+						ReadResult::NoRead => (),
+						// read timeout
+						ReadResult::Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
+							let (reply_tx, reply_rx) = oneshot::channel();
+							// if it does not really get sent, the reply_rx will
+							// complete immediately because the tx got dropped and
+							// thus the connection will be closed because of the
+							// read timeout. perfect.
+							MAIN_CHANNEL.fire_and_forget(Message::ReadTimeout{
+								handle: this.handle.clone(),
+								keepalive: reply_tx,
+							}).await;
 
-						match reply_rx.await {
-							Ok(true) => {
-								// XXX: this prohibits changing the read timeout from the callback... Might want to return a duration instead.
-								read_deadline = Instant::now() + self.cfg.read_timeout;
-							},
-							Ok(false) | Err(_) => {
-								MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
-									handle: self.handle.clone(),
-									error: Some(Box::new(io::Error::new(
-										io::ErrorKind::TimedOut,
-										"read timeout",
-									))),
-								}).await;
-								// it's dead jim.
-								return;
-							},
-						}
-					},
+							match reply_rx.await {
+								Ok(true) => {
+									// XXX: this prohibits changing the read timeout from the callback... Might want to return a duration instead.
+									let read_deadline = Instant::now() + this.cfg.read_timeout;
+									this.stream.as_mut().set_read_deadline(read_deadline.into());
+								},
+								Ok(false) | Err(_) => {
+									MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
+										handle: this.handle.clone(),
+										error: Some(Box::new(io::Error::new(
+											io::ErrorKind::TimedOut,
+											"read timeout",
+										))),
+									}).await;
+									// it's dead jim.
+									return;
+								},
+							}
+						},
+						// other read error
+						ReadResult::Err(e) => {
+							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
+								handle: this.handle.clone(),
+								error: Some(Box::new(e)),
+							}).await;
+							return;
+						},
+					};
+					match write_result {
+						// other reason for return
+						Ok(()) => (),
+						// write error
+						Err(e) => {
+							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{
+								handle: this.handle.clone(),
+								error: Some(Box::new(e)),
+							}).await;
+							return;
+						},
+					};
 				},
-				result = iodeadline(write_deadline.into(), tx.write_all_buf(txbuf), "write timed out"), if self.tx_mode.may() && txbuf.has_remaining() => match result {
-					Ok(()) => {
-						// set to false because we cleared the buffer. if this
-						// is false, the write deadline will be advanced on
-						// the next write.
-						// advancing the deadline now would be incorrect
-						// because this might be the last thing to write for a
-						// long time: it needs to be advanced when the next
-						// buffer is selected for writing.
-						has_pending_write = false;
-						self.txq.pop_front();
-					},
-					Err(e) => {
-						MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
-						return;
-					},
-				},
-				msg = self.rx.recv() => match msg {
-					Some(msg) => match self.proc_msg(msg).await {
+				msg = this.rx.recv() => match msg {
+					Some(msg) => match this.proc_msg(msg).await {
 						Ok(MsgResult::Exit) => return,
 						Ok(MsgResult::Continue) => (),
 						Err(e) => {
-							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: self.handle.clone(), error: Some(Box::new(e))}).await;
+							MAIN_CHANNEL.fire_and_forget(Message::Disconnect{handle: this.handle.clone(), error: Some(Box::new(e))}).await;
 							return
 						},
 					},
@@ -840,6 +797,7 @@ impl StreamWorker {
 
 impl Spawn for StreamWorker {
 	fn spawn(self) {
-		tokio::spawn(self.run());
+		let mut this = Box::pin(self);
+		tokio::spawn(async move { this.as_mut().run().await });
 	}
 }

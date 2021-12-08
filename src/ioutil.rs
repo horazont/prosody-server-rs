@@ -1,6 +1,7 @@
 /*!
 # Utilites for I/O via Tokio
 */
+use std::collections::VecDeque;
 use std::error;
 use std::fmt;
 use std::future::Future;
@@ -18,7 +19,7 @@ use futures_util::stream::Stream;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::time::{timeout, timeout_at, Sleep, sleep, Instant};
+use tokio::time::{timeout, Sleep, sleep, Instant};
 
 
 pub trait AsyncReadable {
@@ -86,22 +87,6 @@ pub(crate) async fn iotimeout<T, F: std::future::Future<Output = io::Result<T>>>
 }
 
 
-/// Attempt an I/O operation, returning a timeout if it does not complete
-/// until the given instant.
-///
-/// This is mere a shim wrapper around [`tokio::time::timeout_at`] which
-/// converts the [`tokio::time::error::Elapsed`] into a [`std::io::Error`] of
-/// kind [`std::io::ErrorKind::TimedOut`], with the given `msg` as error
-/// message.
-#[inline]
-pub(crate) async fn iodeadline<T, F: std::future::Future<Output = io::Result<T>>>(t: Instant, f: F, msg: &'static str) -> io::Result<T> {
-	match timeout_at(t.into(), f).await {
-		Ok(r) => r,
-		Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, msg)),
-	}
-}
-
-
 pub trait TxBufRead {
 	/// Return the current buffer if one is available, otherwise return None.
 	///
@@ -114,6 +99,32 @@ pub trait TxBufRead {
 	///
 	/// Calling this with a value larger than the length of the buffer currently returned by get_buf causes a panic.
 	fn advance(&mut self, by: usize);
+}
+
+impl<T: Buf> TxBufRead for VecDeque<T> {
+	fn get_buf(&mut self) -> Option<&[u8]> {
+		while let Some(buf) = self.front() {
+			if buf.remaining() == 0 {
+				self.pop_front();
+			} else {
+				break
+			}
+		}
+		Some(self.front()?.chunk())
+	}
+
+	fn advance(&mut self, by: usize) {
+		let buf = self.front_mut();
+		match buf {
+			Some(v) => {
+				v.advance(by);
+				if v.remaining() == 0 {
+					self.pop_front();
+				}
+			},
+			None => panic!("advance() without buffer"),
+		}
+	}
 }
 
 
