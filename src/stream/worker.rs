@@ -21,6 +21,7 @@ use tokio::io::{
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::time::sleep_until;
 
 use tokio_rustls::{
 	TlsAcceptor,
@@ -713,9 +714,20 @@ impl StreamWorker {
 		loop {
 			if !this.rx_mode.may_ever() && !this.tx_mode.may_ever() {
 				// if the connection can neither read nor write ever again, we only shutdown and then bail out
-				select! {
-					_ = this.stream.as_mut().get_pin_mut().0.shutdown() => return,
-					_ = MAIN_CHANNEL.closed() => return,
+				let deadline = {
+					let now = tokio::time::Instant::now() + this.cfg.send_timeout;
+					sleep_until(now)
+				};
+				tokio::pin!(deadline);
+				loop {
+					select! {
+						_ = this.stream.as_mut().get_pin_mut().0.shutdown() => return,
+						// send deadline exceeded, let's give up
+						_ = &mut deadline => return,
+						_ = MAIN_CHANNEL.closed() => return,
+						// drop all inbound messages to avoid DoS
+						_ = this.rx.recv() => continue,
+					}
 				}
 			}
 			this.stream.as_mut().set_may_read(this.rx_mode.may());
