@@ -400,6 +400,9 @@ fn protocol_str(p: rustls::ProtocolVersion) -> &'static str {
 		rustls::ProtocolVersion::TLSv1_1 => "TLSv1.1",
 		rustls::ProtocolVersion::TLSv1_2 => "TLSv1.2",
 		rustls::ProtocolVersion::TLSv1_3 => "TLSv1.3",
+		rustls::ProtocolVersion::DTLSv1_0 => "DTLSv1.0",
+		rustls::ProtocolVersion::DTLSv1_2 => "DTLSv1.2",
+		rustls::ProtocolVersion::DTLSv1_3 => "DTLSv1.3",
 		rustls::ProtocolVersion::Unknown(_) => "unknown"
 	}
 }
