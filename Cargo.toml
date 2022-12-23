@@ -29,7 +29,7 @@ lua51 = ["mlua/lua51"]
 lua52 = ["mlua/lua52"]
 lua53 = ["mlua/lua53"]
 lua54 = ["mlua/lua54"]
-default = ["prosody-log", "lua52"]
+default = ["prosody-log", "lua54"]
 
 [profile.release]
 debug = true
