@@ -98,24 +98,16 @@ impl TlsConfig {
 			Self::Server { resolver, .. } => {
 				let hostname = hostname.as_ref();
 				let (certs, key) = read_keypair(cert, key)?;
-				let key = match rustls::sign::RsaSigningKey::new(&key) {
+				let key = match rustls::sign::any_supported_type(&key) {
 					Ok(v) => v,
-					Err(_) => {
-						return Err(io::Error::new(
-							io::ErrorKind::InvalidData,
-							"invalid RSA key encountered",
-						))
-					}
+					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid private key encountered")),
 				};
-				resolver.set_keypair(
-					hostname,
-					Arc::new(rustls::sign::CertifiedKey {
-						cert: certs,
-						key: Arc::new(key),
-						ocsp: None,
-						sct_list: None,
-					}),
-				);
+				resolver.set_keypair(hostname, Arc::new(rustls::sign::CertifiedKey{
+					cert: certs,
+					key: key,
+					ocsp: None,
+					sct_list: None,
+				}));
 				Ok(())
 			}
 			Self::Client { .. } => Err(io::Error::new(
@@ -177,10 +169,7 @@ fn read_certs<P: AsRef<Path>>(fname: P) -> io::Result<Vec<rustls::Certificate>> 
 fn read_keys<P: AsRef<Path>>(fname: P) -> io::Result<Vec<rustls::PrivateKey>> {
 	let f = File::open(fname)?;
 	let mut f = io::BufReader::new(f);
-	Ok(rustls_pemfile::rsa_private_keys(&mut f)?
-		.drain(..)
-		.map(|x| rustls::PrivateKey(x))
-		.collect())
+	Ok(rustls_pemfile::pkcs8_private_keys(&mut f)?.drain(..).map(|x| { rustls::PrivateKey(x) }).collect())
 }
 
 fn read_first_key<P: AsRef<Path>>(fname: P) -> io::Result<rustls::PrivateKey> {
@@ -238,13 +227,13 @@ fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::si
 		Some(v) => v,
 		None => return Ok(None),
 	};
-	let key = match rustls::sign::RsaSigningKey::new(&key) {
+	let key = match rustls::sign::any_supported_type(&key) {
 		Ok(v) => v,
 		Err(_) => return Err(opaque("invalid RSA key encountered").into()),
 	};
 	Ok(Some(rustls::sign::CertifiedKey {
 		cert: certs,
-		key: Arc::new(key),
+		key: key,
 		ocsp: None,
 		sct_list: None,
 	}))
