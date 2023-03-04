@@ -167,7 +167,6 @@ impl<T> MpscChannel<T> {
 	}
 
 	#[inline]
-	#[must_use]
 	pub(crate) async fn send(&self, msg: T) -> Result<(), mpsc::error::SendError<T>> {
 		self.tx.send(msg).await
 	}
