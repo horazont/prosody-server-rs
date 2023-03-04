@@ -85,8 +85,8 @@ return {
 	end;
 
 	-- TLS FUNCTIONS
-	tls_builder = function()
-		return sslconfig._new(server_impl.new_tls_config);
+	tls_builder = function(basedir)
+		return sslconfig._new(server_impl.new_tls_config, basedir);
 	end,
 
 	-- BARE FD FUNCTIONS
