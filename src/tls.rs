@@ -100,14 +100,22 @@ impl TlsConfig {
 				let (certs, key) = read_keypair(cert, key)?;
 				let key = match rustls::sign::any_supported_type(&key) {
 					Ok(v) => v,
-					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid private key encountered")),
+					Err(_) => {
+						return Err(io::Error::new(
+							io::ErrorKind::InvalidData,
+							"invalid private key encountered",
+						))
+					}
 				};
-				resolver.set_keypair(hostname, Arc::new(rustls::sign::CertifiedKey{
-					cert: certs,
-					key: key,
-					ocsp: None,
-					sct_list: None,
-				}));
+				resolver.set_keypair(
+					hostname,
+					Arc::new(rustls::sign::CertifiedKey {
+						cert: certs,
+						key: key,
+						ocsp: None,
+						sct_list: None,
+					}),
+				);
 				Ok(())
 			}
 			Self::Client { .. } => Err(io::Error::new(
@@ -169,7 +177,17 @@ fn read_certs<P: AsRef<Path>>(fname: P) -> io::Result<Vec<rustls::Certificate>> 
 fn read_keys<P: AsRef<Path>>(fname: P) -> io::Result<Vec<rustls::PrivateKey>> {
 	let f = File::open(fname)?;
 	let mut f = io::BufReader::new(f);
-	Ok(rustls_pemfile::pkcs8_private_keys(&mut f)?.drain(..).map(|x| { rustls::PrivateKey(x) }).collect())
+	let mut result = Vec::new();
+	for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut f).transpose()) {
+		match item? {
+			rustls_pemfile::Item::X509Certificate(_) => (),
+			rustls_pemfile::Item::RSAKey(v)
+			| rustls_pemfile::Item::PKCS8Key(v)
+			| rustls_pemfile::Item::ECKey(v) => result.push(rustls::PrivateKey(v)),
+			_ => (),
+		}
+	}
+	Ok(result)
 }
 
 fn read_first_key<P: AsRef<Path>>(fname: P) -> io::Result<rustls::PrivateKey> {
