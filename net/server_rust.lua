@@ -59,7 +59,8 @@ return {
 	listen = function(addr, port, listeners, config)
 		if config.tls_ctx then
 			local tls_ctx, err = convert_tls_ctx(config.tls_ctx);
-			if not tls_ctx then
+			-- config.tls_ctx may be nil correctly, so we cannot check for if not tls_ctx here
+			if err then
 				return nil, err
 			end
 			config.tls_ctx = tls_ctx;
@@ -70,14 +71,16 @@ return {
 	-- CLIENT FUNCTIONS
 	addclient = function(addr, port, listeners, read_size, tls_ctx, typ, extra)
 		local tls_ctx, err = convert_tls_ctx(tls_ctx);
-		if not tls_ctx then
+		-- tls_ctx may be nil correctly, so we cannot check for if not tls_ctx here
+		if err then
 			return nil, err
 		end
 		return server_impl.addclient(addr, port, listeners, convert_read_size(read_size), tls_ctx, typ, extra);
 	end;
 	wrapclient = function(sock, addr, port, listeners, read_size, tls_ctx, extra)
 		local tls_ctx, err = convert_tls_ctx(tls_ctx);
-		if not tls_ctx then
+		-- tls_ctx may be nil correctly, so we cannot check for if not tls_ctx here
+		if err then
 			return nil, err
 		end
 		local fd = sock_to_fd(sock);
