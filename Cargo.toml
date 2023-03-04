@@ -10,7 +10,7 @@ name = "rserver"
 crate-type = ["cdylib"]
 
 [dependencies]
-mlua = { version = "^0.6", features = ["async", "vendored", "module"] }
+mlua = { version = "^0.8", features = ["async", "vendored", "module"] }
 tokio = { version = "^1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 lazy_static = { version ="^1" }
 tokio-rustls = { version = "^0.23", features = ["dangerous_configuration"] }
