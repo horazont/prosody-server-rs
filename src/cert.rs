@@ -5,7 +5,6 @@ use mlua::prelude::*;
 
 use std::borrow::Cow;
 use std::io;
-use std::sync::Arc;
 
 use x509_parser::{
 	certificate::X509Certificate,
@@ -18,13 +17,14 @@ use crate::conversion::opaque;
 
 #[derive(Clone)]
 pub(crate) struct ParsedCertificate {
-	lifetime_bound: Arc<Vec<u8>>,
+	#[allow(dead_code)]
+	lifetime_bound: Box<Vec<u8>>,
 	parsed: X509Certificate<'static>,
 }
 
 impl ParsedCertificate {
 	pub(crate) fn from_der(der: Cow<'_, Vec<u8>>) -> io::Result<Self> {
-		let lifetime_bound = Arc::new(der.into_owned());
+		let lifetime_bound = Box::new(der.into_owned());
 		// this type annotation is important to avoid accidentally transmuting something other than just the lifetime in the unsafe block below
 		let parsed: X509Certificate<'_> = match X509Certificate::from_der(&lifetime_bound[..]) {
 			Ok((_, parsed)) => parsed,
