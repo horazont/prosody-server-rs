@@ -33,6 +33,15 @@ local function sock_to_fd(sock)
 	return sock:getfd()
 end
 
+local function convert_tls_ctx(tls_ctx)
+	if type(tls_ctx) == "table" then
+		-- compat: luasec accepts un-built configs everywhere, so we have to compile it here
+		return server_impl.new_tls_config(tls_ctx);
+	else
+		return tls_ctx
+	end
+end
+
 return {
 	-- TIMER FUNCTIONS
 	add_task = add_task;
@@ -47,13 +56,30 @@ return {
 	};
 
 	-- SERVER FUNCTIONS
-	listen = server_impl.listen;
+	listen = function(addr, port, listeners, config)
+		if config.tls_ctx then
+			local tls_ctx, err = convert_tls_ctx(config.tls_ctx);
+			if not tls_ctx then
+				return nil, err
+			end
+			config.tls_ctx = tls_ctx;
+		end
+		return server_impl.listen(addr, port, listeners, config);
+	end;
 
 	-- CLIENT FUNCTIONS
 	addclient = function(addr, port, listeners, read_size, tls_ctx, typ, extra)
+		local tls_ctx, err = convert_tls_ctx(tls_ctx);
+		if not tls_ctx then
+			return nil, err
+		end
 		return server_impl.addclient(addr, port, listeners, convert_read_size(read_size), tls_ctx, typ, extra);
 	end;
 	wrapclient = function(sock, addr, port, listeners, read_size, tls_ctx, extra)
+		local tls_ctx, err = convert_tls_ctx(tls_ctx);
+		if not tls_ctx then
+			return nil, err
+		end
 		local fd = sock_to_fd(sock);
 		return server_impl.wrapclient(fd, addr or "<unknown>", port or 0, listeners, convert_read_size(read_size), tls_ctx, extra);
 	end;
