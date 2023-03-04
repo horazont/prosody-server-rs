@@ -11,7 +11,7 @@ use x509_parser::{
 	certificate::X509Certificate,
 	extensions::{GeneralName, ParsedExtension, SubjectAlternativeName},
 	nom, oid_registry,
-	traits::FromDer,
+	prelude::FromDer,
 };
 
 use crate::conversion::opaque;
