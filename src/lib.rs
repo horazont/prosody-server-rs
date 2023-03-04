@@ -49,19 +49,19 @@ use mlua::prelude::*;
 
 pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-mod conversion;
-mod core;
-mod mainloop;
-mod timer;
-mod server;
-mod stream;
-mod tls;
-mod signal;
-mod fd;
-mod verify;
 mod cert;
 mod config;
+mod conversion;
+mod core;
+mod fd;
 pub mod ioutil;
+mod mainloop;
+mod server;
+mod signal;
+mod stream;
+mod timer;
+mod tls;
+mod verify;
 
 /**
 Entrypoint for for loading this crate as a Lua module.
@@ -76,31 +76,43 @@ fn librserver(lua: &Lua) -> LuaResult<LuaTable> {
 
 	// We don't care about the result, only that it's successful, so the
 	// safety concerns do not apply to us.
-	unsafe { nix::sys::signal::signal(
-		nix::sys::signal::Signal::SIGPIPE,
-		nix::sys::signal::SigHandler::SigIgn,
-	).unwrap() };
+	unsafe {
+		nix::sys::signal::signal(
+			nix::sys::signal::Signal::SIGPIPE,
+			nix::sys::signal::SigHandler::SigIgn,
+		)
+		.unwrap()
+	};
 
 	// And we do another evil bit… Lua hooks SIGTERM and others... And that's
 	// a total buzzkill because the signal handling library used by tokio
 	// tries to be smart and will call those signal handlers. They will,
 	// however, inject a fault into the lua state, which we really can't have,
 	// so we remove those now. Sorry.
-	unsafe { nix::sys::signal::signal(
-		nix::sys::signal::Signal::SIGTERM,
-		nix::sys::signal::SigHandler::SigDfl,
-	).unwrap() };
-	unsafe { nix::sys::signal::signal(
-		nix::sys::signal::Signal::SIGINT,
-		nix::sys::signal::SigHandler::SigDfl,
-	).unwrap() };
+	unsafe {
+		nix::sys::signal::signal(
+			nix::sys::signal::Signal::SIGTERM,
+			nix::sys::signal::SigHandler::SigDfl,
+		)
+		.unwrap()
+	};
+	unsafe {
+		nix::sys::signal::signal(
+			nix::sys::signal::Signal::SIGINT,
+			nix::sys::signal::SigHandler::SigDfl,
+		)
+		.unwrap()
+	};
 
 	let exports = lua.create_table()?;
 
 	let server = lua.create_table()?;
 	server.set("loop", lua.create_function(mainloop::mainloop)?)?;
 	server.set("shutdown", lua.create_function(mainloop::shutdown)?)?;
-	server.set("set_log_function", lua.create_function(mainloop::set_log_function)?)?;
+	server.set(
+		"set_log_function",
+		lua.create_function(mainloop::set_log_function)?,
+	)?;
 	server.set("_add_task", lua.create_function(timer::add_task)?)?;
 	server.set("listen", lua.create_function(server::listen)?)?;
 	server.set("addclient", lua.create_function(stream::addclient)?)?;

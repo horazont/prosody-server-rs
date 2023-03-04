@@ -6,7 +6,6 @@ use tokio_rustls::rustls;
 
 use crate::verify;
 
-
 pub(super) enum SocketOption {
 	KeepAlive(bool),
 }
@@ -18,6 +17,13 @@ pub(super) enum ControlMessage {
 	UnblockWrites,
 	Write(Bytes),
 	SetOption(SocketOption),
-	AcceptTls(Arc<rustls::ServerConfig>, Arc<verify::RecordingClientVerifier>),
-	ConnectTls(rustls::ServerName, Arc<rustls::ClientConfig>, Arc<verify::RecordingVerifier>),
+	AcceptTls(
+		Arc<rustls::ServerConfig>,
+		Arc<verify::RecordingClientVerifier>,
+	),
+	ConnectTls(
+		rustls::ServerName,
+		Arc<rustls::ClientConfig>,
+		Arc<verify::RecordingVerifier>,
+	),
 }

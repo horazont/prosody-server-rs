@@ -8,15 +8,14 @@ On the tokio side, the timer is implemented via the [`TimerWorker`] struct.
 use mlua::prelude::*;
 
 use std::sync::Arc;
-use std::time::{SystemTime, Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::select;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+use super::core::{LuaRegistryHandle, Message, MAIN_CHANNEL};
 use crate::with_runtime_lua;
-use super::core::{Message, MAIN_CHANNEL, LuaRegistryHandle};
-
 
 /**
 Handle on a rust-based timer.
@@ -51,14 +50,20 @@ impl LuaUserData for TimerHandle {
 
 		methods.add_method("reschedule", |_, this: &Self, t: f64| -> LuaResult<()> {
 			// we do not care about the result: either the receiver is gone already (then there's also no task triggering the timer) or it will receive this eventually.
-			let _ = this.schedule.send(Instant::now() + Duration::from_secs_f64(t));
+			let _ = this
+				.schedule
+				.send(Instant::now() + Duration::from_secs_f64(t));
 			Ok(())
 		});
 	}
 }
 
 impl TimerHandle {
-	fn new<'lua>(lua: &'lua Lua, timeout: Duration, func: LuaFunction) -> LuaResult<LuaAnyUserData<'lua>> {
+	fn new<'lua>(
+		lua: &'lua Lua,
+		timeout: Duration,
+		func: LuaFunction,
+	) -> LuaResult<LuaAnyUserData<'lua>> {
 		let (schedule_tx, schedule_rx) = watch::channel(Instant::now() + timeout);
 		let (close_tx, close_rx) = oneshot::channel();
 		// We need to keep the transmission side of the schedule watch in an Arc, because both the Lua and the tokio side need to be able to write to it.
@@ -69,7 +74,7 @@ impl TimerHandle {
 		// Speaking of registry slots: We keep the TimerHandle in a registry slot. This may seem a bit odd, but we need to be able to produce a reference to it at any time from Rust code (when a timer expires), so it needs to live at least as long as the timer worker.
 		//
 		// The timer worker will generally be the only entity keeping a reference to the LuaRegistryKey under which the TimerHandle is stored, so when the worker is dropped, the timer handle will eventually be expired. The main loop is responsible for triggering the drop of expired registry keys via the corresponding Lua method.
-		let v: LuaAnyUserData = lua.create_userdata(Self{
+		let v: LuaAnyUserData = lua.create_userdata(Self {
 			schedule: schedule_tx.clone(),
 			close: Some(close_tx),
 		})?;
@@ -77,12 +82,13 @@ impl TimerHandle {
 		let handle = lua.create_registry_value(v.clone())?.into();
 
 		// The timer worker will infrom the main (Lua) loop about expired timers via the global event channel. If the channel is full, the timer event will be delivered late, however.
-		TimerWorker{
+		TimerWorker {
 			self_schedule: schedule_tx,
 			schedule: schedule_rx,
 			close: close_rx,
 			handle,
-		}.spawn();
+		}
+		.spawn();
 		Ok(v)
 	}
 }
@@ -105,11 +111,14 @@ impl TimerWorker {
 	async fn elapsed(&mut self) -> Option<Instant> {
 		let (reply_tx, reply_rx) = oneshot::channel();
 		let timestamp = SystemTime::now();
-		match MAIN_CHANNEL.send(Message::TimerElapsed{
-			handle: self.handle.clone(),
-			timestamp,
-			reply: reply_tx
-		}).await {
+		match MAIN_CHANNEL
+			.send(Message::TimerElapsed {
+				handle: self.handle.clone(),
+				timestamp,
+				reply: reply_tx,
+			})
+			.await
+		{
 			Ok(_) => (),
 			Err(_) => return None,
 		};
@@ -161,9 +170,12 @@ end);
 
 See [`TimerHandle`] for the lua methods offered on `handle`.
 */
-pub(crate) fn add_task<'l>(lua: &'l Lua, (timeout, func): (f64, LuaFunction)) -> LuaResult<LuaAnyUserData<'l>> {
+pub(crate) fn add_task<'l>(
+	lua: &'l Lua,
+	(timeout, func): (f64, LuaFunction),
+) -> LuaResult<LuaAnyUserData<'l>> {
 	let timeout = std::time::Duration::from_secs_f64(timeout);
-	with_runtime_lua!{
+	with_runtime_lua! {
 		let result = TimerHandle::new(lua, timeout, func);
 		result
 	}

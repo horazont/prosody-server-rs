@@ -5,14 +5,13 @@ use mlua::prelude::*;
 
 use std::os::unix::io::RawFd;
 
-use tokio::select;
-use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
+use tokio::select;
 use tokio::sync::oneshot;
 
-use crate::{with_runtime_lua, send_log};
-use crate::core::{Message, LuaRegistryHandle, MAIN_CHANNEL, Spawn};
-
+use crate::core::{LuaRegistryHandle, Message, Spawn, MAIN_CHANNEL};
+use crate::{send_log, with_runtime_lua};
 
 struct WatchHandle {
 	guard: Option<oneshot::Sender<()>>,
@@ -20,30 +19,33 @@ struct WatchHandle {
 }
 
 impl WatchHandle {
-	fn new<'l>(lua: &'l Lua, fd: RawFd, interest: Interest, listeners: LuaTable) -> LuaResult<LuaAnyUserData<'l>> {
+	fn new<'l>(
+		lua: &'l Lua,
+		fd: RawFd,
+		interest: Interest,
+		listeners: LuaTable,
+	) -> LuaResult<LuaAnyUserData<'l>> {
 		let (guard_tx, guard_rx) = oneshot::channel();
 
-		let v = lua.create_userdata(WatchHandle{
+		let v = lua.create_userdata(WatchHandle {
 			guard: Some(guard_tx),
 			fd: fd,
 		})?;
 		v.set_user_value(listeners)?;
 		let handle: LuaRegistryHandle = lua.create_registry_value(v.clone())?.into();
 
-		WatchWorker{
+		WatchWorker {
 			guard: guard_rx,
 			fd: AsyncFd::new(fd)?,
 			interest,
 			handle,
-		}.spawn();
+		}
+		.spawn();
 		Ok(v)
 	}
 
 	fn empty<'l>(lua: &'l Lua, fd: RawFd) -> LuaResult<LuaAnyUserData<'l>> {
-		let v = lua.create_userdata(WatchHandle{
-			guard: None,
-			fd,
-		})?;
+		let v = lua.create_userdata(WatchHandle { guard: None, fd })?;
 		Ok(v)
 	}
 }
@@ -54,7 +56,7 @@ impl LuaUserData for WatchHandle {
 			match this.guard.take() {
 				Some(ch) => {
 					let _ = ch.send(());
-				},
+				}
 				None => (),
 			};
 			Ok(())
@@ -62,9 +64,7 @@ impl LuaUserData for WatchHandle {
 	}
 
 	fn add_fields<'lua, F: LuaUserDataFields<'lua, Self>>(fields: &mut F) {
-		fields.add_field_method_get("conn", |_, this| -> LuaResult<RawFd> {
-			Ok(this.fd)
-		});
+		fields.add_field_method_get("conn", |_, this| -> LuaResult<RawFd> { Ok(this.fd) });
 	}
 }
 
@@ -130,8 +130,10 @@ impl Spawn for WatchWorker {
 	}
 }
 
-
-pub(crate) fn watchfd<'l>(lua: &'l Lua, (fd, readcb, writecb): (RawFd, Option<LuaFunction>, Option<LuaFunction>)) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+pub(crate) fn watchfd<'l>(
+	lua: &'l Lua,
+	(fd, readcb, writecb): (RawFd, Option<LuaFunction>, Option<LuaFunction>),
+) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let listeners = lua.create_table_with_capacity(0, 2)?;
 	let interest = match (readcb.is_some(), writecb.is_some()) {
 		(false, false) => return Ok(Ok(WatchHandle::empty(lua, fd)?)),

@@ -11,22 +11,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::select;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
 use tokio::sync::mpsc;
 
 use tokio_rustls::TlsAcceptor;
 
-use crate::{with_runtime_lua, strerror_ok, send_log};
-use crate::core::{MAIN_CHANNEL, Message, Spawn, LuaRegistryHandle};
-use crate::conversion;
-use crate::conversion::opaque;
-use crate::tls;
 use crate::config;
 use crate::config::CONFIG;
+use crate::conversion;
+use crate::conversion::opaque;
+use crate::core::{LuaRegistryHandle, Message, Spawn, MAIN_CHANNEL};
 use crate::ioutil::iotimeout;
+use crate::tls;
 use crate::verify;
-
+use crate::{send_log, strerror_ok, with_runtime_lua};
 
 type ServerTlsCfg = (TlsAcceptor, Arc<verify::RecordingClientVerifier>);
 
@@ -36,19 +35,13 @@ Control if and how TLS is accepted on listener sockets.
 #[derive(Clone)]
 enum TlsMode {
 	/// TLS is never established, but if the `tls_config` is given, it will be forwarded to any created connections for later use with STARTTLS.
-	Plain{
-		tls_config: Option<ServerTlsCfg>,
-	},
+	Plain { tls_config: Option<ServerTlsCfg> },
 	/// TLS will always attempted and if it fails, the Lua side will never see the connection.
-	DirectTls{
-		tls_config: ServerTlsCfg,
-	},
+	DirectTls { tls_config: ServerTlsCfg },
 	/// TLS is established if the first byte on the connection is 0x16 (the TLS handshake start). Otherwise, the connection is handled as plaintext connection.
 	///
 	/// In case of a plaintext connection, the TLS config is forwarded to the connection socket for later use with STARTTLS.
-	Multiplex{
-		tls_config: ServerTlsCfg,
-	},
+	Multiplex { tls_config: ServerTlsCfg },
 }
 
 struct UnquotedStr(&'static str);
@@ -62,24 +55,18 @@ impl fmt::Debug for UnquotedStr {
 impl fmt::Debug for TlsMode {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
-			Self::Plain{tls_config: Some(_)} => {
-				f.debug_struct("TlsMode::Plain")
-					.field("tls_config", &UnquotedStr("Some(tls_config)"))
-					.finish()
-			},
-			Self::Plain{tls_config: None} => {
-				f.debug_struct("TlsMode::Plain")
-					.field("tls_config", &UnquotedStr("None"))
-					.finish()
-			},
-			Self::DirectTls{..} => {
-				f.debug_struct("TlsMode::DirectTls")
-					.finish_non_exhaustive()
-			},
-			Self::Multiplex{..} => {
-				f.debug_struct("TlsMode::Multiplex")
-					.finish_non_exhaustive()
-			},
+			Self::Plain {
+				tls_config: Some(_),
+			} => f
+				.debug_struct("TlsMode::Plain")
+				.field("tls_config", &UnquotedStr("Some(tls_config)"))
+				.finish(),
+			Self::Plain { tls_config: None } => f
+				.debug_struct("TlsMode::Plain")
+				.field("tls_config", &UnquotedStr("None"))
+				.finish(),
+			Self::DirectTls { .. } => f.debug_struct("TlsMode::DirectTls").finish_non_exhaustive(),
+			Self::Multiplex { .. } => f.debug_struct("TlsMode::Multiplex").finish_non_exhaustive(),
 		}
 	}
 }
@@ -87,71 +74,75 @@ impl fmt::Debug for TlsMode {
 impl TlsMode {
 	fn set_config(&mut self, cfg: TlsAcceptor, recorder: Arc<verify::RecordingClientVerifier>) {
 		match self {
-			Self::Plain{tls_config} => *tls_config = Some((cfg, recorder)),
-			Self::DirectTls{tls_config} => *tls_config = (cfg, recorder),
-			Self::Multiplex{tls_config} => *tls_config = (cfg, recorder),
+			Self::Plain { tls_config } => *tls_config = Some((cfg, recorder)),
+			Self::DirectTls { tls_config } => *tls_config = (cfg, recorder),
+			Self::Multiplex { tls_config } => *tls_config = (cfg, recorder),
 		}
 	}
 
-	async fn accept(&self, handle: &'_ LuaRegistryHandle, conn: TcpStream, addr: SocketAddr, ssl_handshake_timeout: Duration) -> io::Result<Message> {
+	async fn accept(
+		&self,
+		handle: &'_ LuaRegistryHandle,
+		conn: TcpStream,
+		addr: SocketAddr,
+		ssl_handshake_timeout: Duration,
+	) -> io::Result<Message> {
 		match self {
-			Self::Plain{..} => {
-				Ok(Message::TcpAccept{
-					handle: handle.clone(),
-					stream: conn,
-					addr,
-				})
-			},
-			Self::DirectTls{tls_config: (acceptor, recorder)} => {
-				let (verify, conn) = recorder.scope(iotimeout(
-					ssl_handshake_timeout,
-					acceptor.accept(conn),
-					"TLS handshake timed out"),
-				).await;
+			Self::Plain { .. } => Ok(Message::TcpAccept {
+				handle: handle.clone(),
+				stream: conn,
+				addr,
+			}),
+			Self::DirectTls {
+				tls_config: (acceptor, recorder),
+			} => {
+				let (verify, conn) = recorder
+					.scope(iotimeout(
+						ssl_handshake_timeout,
+						acceptor.accept(conn),
+						"TLS handshake timed out",
+					))
+					.await;
 				let conn = conn?;
 				let handshake = conn.get_ref().1.into();
-				Ok(Message::TlsAccept{
+				Ok(Message::TlsAccept {
 					handle: handle.clone(),
 					stream: conn,
 					addr,
-					tls_info: tls::Info{
-						verify,
-						handshake,
-					},
+					tls_info: tls::Info { verify, handshake },
 				})
-			},
-			Self::Multiplex{tls_config: (acceptor, recorder)} => {
+			}
+			Self::Multiplex {
+				tls_config: (acceptor, recorder),
+			} => {
 				let mut buf = [0u8; 1];
 				match conn.peek(&mut buf).await? {
 					// first byte of the TLS handshake
 					1 if buf[0] == 0x16 => {
-						let (verify, conn) = recorder.scope(iotimeout(
-							ssl_handshake_timeout,
-							acceptor.accept(conn),
-							"TLS handshake timed out",
-						)).await;
+						let (verify, conn) = recorder
+							.scope(iotimeout(
+								ssl_handshake_timeout,
+								acceptor.accept(conn),
+								"TLS handshake timed out",
+							))
+							.await;
 						let conn = conn?;
 						let handshake = conn.get_ref().1.into();
-						Ok(Message::TlsAccept{
+						Ok(Message::TlsAccept {
 							handle: handle.clone(),
 							stream: conn,
 							addr,
-							tls_info: tls::Info{
-								verify,
-								handshake,
-							},
+							tls_info: tls::Info { verify, handshake },
 						})
-					},
+					}
 					// if no byte is read or if it doesn't match -> assume plaintext
-					_ => {
-						Ok(Message::TcpAccept{
-							handle: handle.clone(),
-							stream: conn,
-							addr,
-						})
-					},
+					_ => Ok(Message::TcpAccept {
+						handle: handle.clone(),
+						stream: conn,
+						addr,
+					}),
 				}
-			},
+			}
 		}
 	}
 }
@@ -185,7 +176,12 @@ impl ListenerWorker {
 				},
 				conn = self.sock.accept() => match conn {
 					Ok((conn, addr)) => {
-						let msg = match self.tls_mode.accept(&self.handle, conn, addr, self.stream_cfg.ssl_handshake_timeout).await {
+						let msg = match self.tls_mode.accept(
+							&self.handle,
+							conn,
+							addr,
+							self.stream_cfg.ssl_handshake_timeout,
+						).await {
 							Ok(msg) => msg,
 							Err(e) => {
 								send_log!("debug", "failed to handshake with peer", Some(e));
@@ -239,22 +235,42 @@ impl LuaUserData for ListenerHandle {
 			Ok(this.sockport)
 		});
 
-		methods.add_method("sslctx", |_, this: &Self, _: ()| -> LuaResult<Option<tls::TlsConfigHandle>> {
-			Ok(this.tls_config.as_ref().map(|x| { tls::TlsConfigHandle(x.clone()) }))
-		});
+		methods.add_method(
+			"sslctx",
+			|_, this: &Self, _: ()| -> LuaResult<Option<tls::TlsConfigHandle>> {
+				Ok(this
+					.tls_config
+					.as_ref()
+					.map(|x| tls::TlsConfigHandle(x.clone())))
+			},
+		);
 
-		methods.add_method_mut("set_sslctx", |_, this: &mut Self, cfg: tls::TlsConfigHandle| -> LuaResult<()> {
-			let (acceptor, recorder): (TlsAcceptor, _) = match cfg.as_ref() {
-				tls::TlsConfig::Server{cfg, recorder, ..} => (cfg.clone().into(), recorder.clone()),
-				tls::TlsConfig::Client{..} => return Err(opaque("attempt to set a client context for a server socket").into()),
-			};
-			match this.tx.send(ControlMessage::UpdateTlsConfig(acceptor, recorder)) {
-				Ok(()) => (),
-				Err(_) => return Err(opaque("attempt to change tls settings on closed socked").into())
-			};
-			this.tls_config = Some(cfg.0.clone());
-			Ok(())
-		});
+		methods.add_method_mut(
+			"set_sslctx",
+			|_, this: &mut Self, cfg: tls::TlsConfigHandle| -> LuaResult<()> {
+				let (acceptor, recorder): (TlsAcceptor, _) = match cfg.as_ref() {
+					tls::TlsConfig::Server { cfg, recorder, .. } => {
+						(cfg.clone().into(), recorder.clone())
+					}
+					tls::TlsConfig::Client { .. } => {
+						return Err(
+							opaque("attempt to set a client context for a server socket").into(),
+						)
+					}
+				};
+				match this
+					.tx
+					.send(ControlMessage::UpdateTlsConfig(acceptor, recorder))
+				{
+					Ok(()) => (),
+					Err(_) => {
+						return Err(opaque("attempt to change tls settings on closed socked").into())
+					}
+				};
+				this.tls_config = Some(cfg.0.clone());
+				Ok(())
+			},
+		);
 
 		methods.add_method("close", |_, this: &Self, _: ()| -> LuaResult<()> {
 			// this can only fail when the socket is already dead
@@ -266,18 +282,18 @@ impl LuaUserData for ListenerHandle {
 
 impl ListenerHandle {
 	fn new_lua<'l>(
-			lua: &'l Lua,
-			sock: TcpListener,
-			listeners: LuaTable,
-			tls_config: Option<Arc<tls::TlsConfig>>,
-			tls_mode: TlsMode,
-			server_cfg: config::ServerConfig,
-			stream_cfg: config::StreamConfig,
+		lua: &'l Lua,
+		sock: TcpListener,
+		listeners: LuaTable,
+		tls_config: Option<Arc<tls::TlsConfig>>,
+		tls_mode: TlsMode,
+		server_cfg: config::ServerConfig,
+		stream_cfg: config::StreamConfig,
 	) -> LuaResult<LuaAnyUserData<'l>> {
 		let addr = sock.local_addr()?;
 		let (tx, rx) = mpsc::unbounded_channel();
 
-		let v: LuaAnyUserData = lua.create_userdata(Self{
+		let v: LuaAnyUserData = lua.create_userdata(Self {
 			tx,
 			sockaddr: format!("{}", addr.ip()),
 			sockport: addr.port(),
@@ -286,14 +302,15 @@ impl ListenerHandle {
 		v.set_user_value(listeners)?;
 		let handle = lua.create_registry_value(v.clone())?.into();
 
-		ListenerWorker{
+		ListenerWorker {
 			rx,
 			sock,
 			tls_mode,
 			handle,
 			cfg: server_cfg,
 			stream_cfg,
-		}.spawn();
+		}
+		.spawn();
 		Ok(v)
 	}
 }
@@ -312,7 +329,10 @@ fn mk_listen_socket(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 	Ok(sock.into())
 }
 
-pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValue, u16, LuaTable, Option<LuaTable>)) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+pub(crate) fn listen<'l>(
+	lua: &'l Lua,
+	(addr, port, listeners, config): (LuaValue, u16, LuaTable, Option<LuaTable>),
+) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let addr = strerror_ok!(conversion::to_ipaddr(&addr));
 	let addr = SocketAddr::new(addr, port);
 	let sock = match mk_listen_socket(addr) {
@@ -321,30 +341,50 @@ pub(crate) fn listen<'l>(lua: &'l Lua, (addr, port, listeners, config): (LuaValu
 	};
 
 	let (tls_config, tls_mode) = match config {
-		None => (None, TlsMode::Plain{tls_config: None}),
+		None => (None, TlsMode::Plain { tls_config: None }),
 		Some(config) => {
 			let outer_tls_config = match config.get::<_, Option<LuaAnyUserData>>("tls_ctx")? {
 				Some(v) => Some((*tls::TlsConfigHandle::get_ref_from_lua(&v)?).clone()),
 				None => None,
 			};
 
-			let tls_config = match outer_tls_config.as_ref().map(|x| { x.as_ref() }) {
-				Some(tls::TlsConfig::Server{ref cfg, ref recorder, ..}) => Some((cfg.clone(), recorder.clone())),
-				Some(_) => return Err(opaque("attempt to use non-server config with server socket").into()),
+			let tls_config = match outer_tls_config.as_ref().map(|x| x.as_ref()) {
+				Some(tls::TlsConfig::Server {
+					ref cfg,
+					ref recorder,
+					..
+				}) => Some((cfg.clone(), recorder.clone())),
+				Some(_) => {
+					return Err(
+						opaque("attempt to use non-server config with server socket").into(),
+					)
+				}
 				None => None,
 			};
 
-			(outer_tls_config.map(|x| { x.0 }), match tls_config {
-				Some((tls_config, recorder)) => match config.get::<_, Option<bool>>("tls_direct")?.unwrap_or(false) {
-					true => match config.get::<_, Option<bool>>("tls_auto")?.unwrap_or(false) {
-						true => TlsMode::Multiplex{tls_config: (tls_config.into(), recorder)},
-						false => TlsMode::DirectTls{tls_config: (tls_config.into(), recorder)},
+			(
+				outer_tls_config.map(|x| x.0),
+				match tls_config {
+					Some((tls_config, recorder)) => match config
+						.get::<_, Option<bool>>("tls_direct")?
+						.unwrap_or(false)
+					{
+						true => match config.get::<_, Option<bool>>("tls_auto")?.unwrap_or(false) {
+							true => TlsMode::Multiplex {
+								tls_config: (tls_config.into(), recorder),
+							},
+							false => TlsMode::DirectTls {
+								tls_config: (tls_config.into(), recorder),
+							},
+						},
+						false => TlsMode::Plain {
+							tls_config: Some((tls_config.into(), recorder)),
+						},
 					},
-					false => TlsMode::Plain{tls_config: Some((tls_config.into(), recorder))},
+					None => TlsMode::Plain { tls_config: None },
 				},
-				None => TlsMode::Plain{tls_config: None},
-			})
-		},
+			)
+		}
 	};
 
 	let (server_cfg, stream_cfg) = {

@@ -8,9 +8,8 @@ use std::os::raw::c_int;
 use tokio::select;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
+use crate::core::{LuaRegistryHandle, Message, Spawn, MAIN_CHANNEL};
 use crate::{prosody_log_g, with_runtime_lua};
-use crate::core::{Message, LuaRegistryHandle, Spawn, MAIN_CHANNEL};
-
 
 struct SignalWorker {
 	signal: Signal,
@@ -42,9 +41,11 @@ impl Spawn for SignalWorker {
 	}
 }
 
-
 /// CAVEAT: The signal handling stuff used by tokio has the issue that it does keep the old installed signal handler and invokes it after its own signal handler. That means that we cannot overwrite the SIGINT handler installed by lua just like that. That needs fixing later on.
-pub(crate) fn hook_signal<'l>(lua: &'l Lua, (kind_raw, callback): (c_int, LuaFunction)) -> LuaResult<Result<bool, String>> {
+pub(crate) fn hook_signal<'l>(
+	lua: &'l Lua,
+	(kind_raw, callback): (c_int, LuaFunction),
+) -> LuaResult<Result<bool, String>> {
 	let kind = match kind_raw {
 		14 => SignalKind::alarm(),
 		1 => SignalKind::hangup(),

@@ -3,26 +3,19 @@
 */
 use mlua::prelude::*;
 
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, Instant};
+use std::sync::{Arc, RwLock};
+use std::time::{Instant, SystemTime};
 
 use lazy_static::lazy_static;
 
 use tokio::select;
 
 use super::core::{
-	Message,
-	RUNTIME,
-	MAIN_CHANNEL,
-	GC_FLAG,
-	WAKEUP,
-	call_listener,
-	may_call_listener,
+	call_listener, may_call_listener, Message, GC_FLAG, MAIN_CHANNEL, RUNTIME, WAKEUP,
 };
-use crate::stream;
 use crate::config::CONFIG;
-
+use crate::stream;
 
 lazy_static! {
 	static ref SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
@@ -137,24 +130,38 @@ fn call_starttls<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>) ->
 
 #[must_use]
 #[inline]
-fn call_disconnect<'l>(listeners: &'l LuaTable<'l>, handle: LuaAnyUserData<'l>, err: Option<String>) -> LuaResult<()> {
-	let err = err.unwrap_or_else(|| { "closed".into() });
+fn call_disconnect<'l>(
+	listeners: &'l LuaTable<'l>,
+	handle: LuaAnyUserData<'l>,
+	err: Option<String>,
+) -> LuaResult<()> {
+	let err = err.unwrap_or_else(|| "closed".into());
 	may_call_listener(listeners, "ondisconnect", (handle, err))
 }
 
 fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message) -> LuaResult<()> {
 	match msg {
-		Message::TimerElapsed{handle, timestamp, reply} => {
+		Message::TimerElapsed {
+			handle,
+			timestamp,
+			reply,
+		} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let func = handle.get_user_value::<LuaFunction>()?;
-			match func.call::<_, Option<f64>>((timestamp.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64(), handle))? {
+			match func.call::<_, Option<f64>>((
+				timestamp
+					.duration_since(SystemTime::UNIX_EPOCH)
+					.unwrap()
+					.as_secs_f64(),
+				handle,
+			))? {
 				Some(v) => {
 					let _ = reply.send(Instant::now() + std::time::Duration::from_secs_f64(v));
-				},
+				}
 				None => (),
 			};
-		},
-		Message::Connect{handle} => {
+		}
+		Message::Connect { handle } => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
@@ -164,21 +171,25 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			if should_call {
 				call_connect(&listeners, handle)?;
 			}
-		},
-		Message::TcpAccept{handle, stream, addr} => {
+		}
+		Message::TcpAccept {
+			handle,
+			stream,
+			addr,
+		} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
-			let handle = stream::spawn_accepted_tcp_worker(
-				lua,
-				stream,
-				listeners.clone(),
-				Some(addr),
-				cfg,
-			)?;
+			let handle =
+				stream::spawn_accepted_tcp_worker(lua, stream, listeners.clone(), Some(addr), cfg)?;
 			call_connect(&listeners, handle)?;
-		},
-		Message::TlsAccept{handle, stream, addr, tls_info} => {
+		}
+		Message::TlsAccept {
+			handle,
+			stream,
+			addr,
+			tls_info,
+		} => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			let cfg = CONFIG.read().unwrap().stream;
@@ -188,13 +199,13 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 				listeners.clone(),
 				Some(addr),
 				tls_info,
-				cfg
+				cfg,
 			)?;
 			call_starttls(&listeners, handle.clone())?;
 			call_tls_confirm(&listeners, handle.clone())?;
 			call_connect(&listeners, handle.clone())?;
-		},
-		Message::TlsStarted{handle, tls_info} => {
+		}
+		Message::TlsStarted { handle, tls_info } => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			let should_call_connect = {
@@ -205,13 +216,17 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 			if should_call_connect {
 				call_connect(&listeners, handle.clone())?;
 			}
-		},
-		Message::Incoming{handle, data} => {
+		}
+		Message::Incoming { handle, data } => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
-			may_call_listener(&listeners, "onincoming", (handle, lua.create_string(&data)?))?;
-		},
-		Message::ReadTimeout{handle, keepalive} => {
+			may_call_listener(
+				&listeners,
+				"onincoming",
+				(handle, lua.create_string(&data)?),
+			)?;
+		}
+		Message::ReadTimeout { handle, keepalive } => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			match call_listener::<_, bool>(&listeners, "onreadtimeout", handle) {
@@ -222,8 +237,8 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 					Ok(_) | Err(_) => (),
 				},
 			}
-		},
-		Message::Disconnect{handle, error} => {
+		}
+		Message::Disconnect { handle, error } => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = stream::get_listeners(&handle)?;
 			let should_call = {
@@ -231,34 +246,42 @@ fn proc_message<'l>(lua: &'l Lua, log_fn: Option<&'l LuaFunction>, msg: Message)
 				check_transition(handle.state_mut().disconnect())?
 			};
 			if should_call {
-				let error = error.map(|x| { x.to_string() });
+				let error = error.map(|x| x.to_string());
 				call_disconnect(&listeners, handle, error)?;
 			}
-		},
-		Message::Signal{handle} => {
+		}
+		Message::Signal { handle } => {
 			let func = lua.registry_value::<LuaFunction>(&*handle)?;
 			func.call::<_, ()>(())?;
-		},
-		Message::Readable{handle, confirm} => {
+		}
+		Message::Readable { handle, confirm } => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			may_call_listener(&listeners, "onreadable", handle)?;
 			// we can just let confirm drop, that's good enough
 			drop(confirm);
-		},
-		Message::Writable{handle, confirm} => {
+		}
+		Message::Writable { handle, confirm } => {
 			let handle = lua.registry_value::<LuaAnyUserData>(&*handle)?;
 			let listeners = handle.get_user_value::<LuaTable>()?;
 			may_call_listener(&listeners, "onwritable", handle)?;
 			// we can just let confirm drop, that's good enough
 			drop(confirm);
-		},
+		}
 		#[cfg(feature = "prosody-log")]
-		Message::Log{level, message, error} => {
-			match error {
-				Some(error) => prosody_log!(log_fn, level, "%s (caused by %s)", message, error.to_string()),
-				None => prosody_log!(log_fn, level, "%s", message),
-			}
+		Message::Log {
+			level,
+			message,
+			error,
+		} => match error {
+			Some(error) => prosody_log!(
+				log_fn,
+				level,
+				"%s (caused by %s)",
+				message,
+				error.to_string()
+			),
+			None => prosody_log!(log_fn, level, "%s", message),
 		},
 	};
 	Ok(())
@@ -355,14 +378,16 @@ pub(crate) fn mainloop<'l>(lua: &'l Lua, _: ()) -> LuaResult<String> {
 				// iterate the loop once to trigger GC if necessary
 				_ = WAKEUP.notified() => (),
 			}
-			if let Ok(_) = SHUTDOWN_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
-				break
+			if let Ok(_) =
+				SHUTDOWN_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+			{
+				break;
 			}
-			if let Ok(_) = GC_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst) {
+			if let Ok(_) = GC_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+			{
 				lua.expire_registry_values();
 			}
-		};
+		}
 		Ok("quitting".into())
 	})
 }
-

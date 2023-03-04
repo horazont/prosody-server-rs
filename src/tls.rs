@@ -6,7 +6,7 @@ use mlua::prelude::*;
 use std::cell::Ref;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::{File, read_dir};
+use std::fs::{read_dir, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -16,11 +16,10 @@ use tokio_rustls::rustls;
 
 use rustls_pemfile;
 
-use crate::strerror_ok;
 use crate::conversion;
 use crate::conversion::opaque;
+use crate::strerror_ok;
 use crate::verify;
-
 
 pub(crate) struct DefaultingSNIResolver {
 	default_keypair: RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
@@ -29,7 +28,7 @@ pub(crate) struct DefaultingSNIResolver {
 
 impl DefaultingSNIResolver {
 	fn new() -> Self {
-		Self{
+		Self {
 			default_keypair: RwLock::new(None),
 			named_keypairs: RwLock::new(HashMap::new()),
 		}
@@ -64,7 +63,10 @@ impl DefaultingSNIResolver {
 }
 
 impl rustls::server::ResolvesServerCert for DefaultingSNIResolver {
-	fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+	fn resolve(
+		&self,
+		client_hello: rustls::server::ClientHello<'_>,
+	) -> Option<Arc<rustls::sign::CertifiedKey>> {
 		match client_hello.server_name() {
 			Some(name) => self.get_by_name(name.into()),
 			None => self.get_default(),
@@ -74,36 +76,52 @@ impl rustls::server::ResolvesServerCert for DefaultingSNIResolver {
 
 #[derive(Clone)]
 pub(crate) enum TlsConfig {
-	Server{
+	Server {
 		cfg: Arc<rustls::ServerConfig>,
 		resolver: Arc<DefaultingSNIResolver>,
 		recorder: Arc<verify::RecordingClientVerifier>,
 	},
-	Client{
+	Client {
 		cfg: Arc<rustls::ClientConfig>,
 		recorder: Arc<verify::RecordingVerifier>,
 	},
 }
 
 impl TlsConfig {
-	fn set_sni_host<H: AsRef<str>, C: AsRef<Path>, K: AsRef<Path>>(&self, hostname: H, cert: C, key: K) -> io::Result<()> {
+	fn set_sni_host<H: AsRef<str>, C: AsRef<Path>, K: AsRef<Path>>(
+		&self,
+		hostname: H,
+		cert: C,
+		key: K,
+	) -> io::Result<()> {
 		match self {
-			Self::Server{resolver, ..} => {
+			Self::Server { resolver, .. } => {
 				let hostname = hostname.as_ref();
 				let (certs, key) = read_keypair(cert, key)?;
 				let key = match rustls::sign::RsaSigningKey::new(&key) {
 					Ok(v) => v,
-					Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RSA key encountered")),
+					Err(_) => {
+						return Err(io::Error::new(
+							io::ErrorKind::InvalidData,
+							"invalid RSA key encountered",
+						))
+					}
 				};
-				resolver.set_keypair(hostname, Arc::new(rustls::sign::CertifiedKey{
-					cert: certs,
-					key: Arc::new(key),
-					ocsp: None,
-					sct_list: None,
-				}));
+				resolver.set_keypair(
+					hostname,
+					Arc::new(rustls::sign::CertifiedKey {
+						cert: certs,
+						key: Arc::new(key),
+						ocsp: None,
+						sct_list: None,
+					}),
+				);
 				Ok(())
-			},
-			Self::Client{..} => Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot add SNI host to client context")),
+			}
+			Self::Client { .. } => Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"cannot add SNI host to client context",
+			)),
 		}
 	}
 }
@@ -123,78 +141,108 @@ impl TlsConfigHandle {
 
 impl LuaUserData for TlsConfigHandle {
 	fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
-		methods.add_method("set_sni_host", |_, this: &Self, (hostname, cert, key): (LuaString, LuaString, LuaString)| -> LuaResult<Result<bool, String>> {
-			match this.0.set_sni_host(
+		methods.add_method(
+			"set_sni_host",
+			|_,
+			 this: &Self,
+			 (hostname, cert, key): (LuaString, LuaString, LuaString)|
+			 -> LuaResult<Result<bool, String>> {
+				match this.0.set_sni_host(
 					hostname.to_str()?,
 					OsStr::from_bytes(cert.as_bytes()),
-					OsStr::from_bytes(key.as_bytes())
-			) {
-				Ok(()) => Ok(Ok(true)),
-				Err(e) => Ok(Err(format!("failed to add SNI host with certificate {} and key {}: {}", cert.to_string_lossy(), key.to_string_lossy(), e))),
-			}
-		});
+					OsStr::from_bytes(key.as_bytes()),
+				) {
+					Ok(()) => Ok(Ok(true)),
+					Err(e) => Ok(Err(format!(
+						"failed to add SNI host with certificate {} and key {}: {}",
+						cert.to_string_lossy(),
+						key.to_string_lossy(),
+						e
+					))),
+				}
+			},
+		);
 	}
 }
 
 fn read_certs<P: AsRef<Path>>(fname: P) -> io::Result<Vec<rustls::Certificate>> {
 	let f = File::open(fname)?;
 	let mut f = io::BufReader::new(f);
-	Ok(rustls_pemfile::certs(&mut f)?.drain(..).map(|x| { rustls::Certificate(x) }).collect())
+	Ok(rustls_pemfile::certs(&mut f)?
+		.drain(..)
+		.map(|x| rustls::Certificate(x))
+		.collect())
 }
-
 
 fn read_keys<P: AsRef<Path>>(fname: P) -> io::Result<Vec<rustls::PrivateKey>> {
 	let f = File::open(fname)?;
 	let mut f = io::BufReader::new(f);
-	Ok(rustls_pemfile::rsa_private_keys(&mut f)?.drain(..).map(|x| { rustls::PrivateKey(x) }).collect())
+	Ok(rustls_pemfile::rsa_private_keys(&mut f)?
+		.drain(..)
+		.map(|x| rustls::PrivateKey(x))
+		.collect())
 }
 
 fn read_first_key<P: AsRef<Path>>(fname: P) -> io::Result<rustls::PrivateKey> {
 	let mut keys = read_keys(fname)?;
 	if keys.len() == 0 {
-		return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no key found in key file"));
+		return Err(io::Error::new(
+			io::ErrorKind::UnexpectedEof,
+			"no key found in key file",
+		));
 	}
 	Ok(keys.remove(0))
 }
 
-fn read_keypair<C: AsRef<Path>, K: AsRef<Path>>(cert: C, key: K) -> io::Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
+fn read_keypair<C: AsRef<Path>, K: AsRef<Path>>(
+	cert: C,
+	key: K,
+) -> io::Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
 	let certs = read_certs(cert)?;
 	let key = read_first_key(key)?;
 	Ok((certs, key))
 }
 
-fn keypair_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<(Vec<rustls::Certificate>, rustls::PrivateKey)>> {
+fn keypair_from_lua<'l>(
+	tbl: &'l LuaTable,
+) -> LuaResult<Option<(Vec<rustls::Certificate>, rustls::PrivateKey)>> {
 	let cert_file = tbl.get::<_, Option<LuaString>>("certificate")?;
 	let key_file = tbl.get::<_, Option<LuaString>>("key")?;
 	if cert_file.is_none() && key_file.is_none() {
-		return Ok(None)
+		return Ok(None);
 	}
 
 	if cert_file.is_none() != key_file.is_none() {
-		return Err(opaque("either both certificate and key must be set, or both must be absent. make up your mind!").into())
+		return Err(opaque("either both certificate and key must be set, or both must be absent. make up your mind!").into());
 	}
 
 	let cert_file = cert_file.unwrap();
 	let key_file = key_file.unwrap();
 	match read_keypair(
-			OsStr::from_bytes(cert_file.as_bytes()),
-			OsStr::from_bytes(key_file.as_bytes())
+		OsStr::from_bytes(cert_file.as_bytes()),
+		OsStr::from_bytes(key_file.as_bytes()),
 	) {
 		Ok(keypair) => Ok(Some(keypair)),
-		Err(e) => Err(opaque(format!("failed to load keypair from {} and {}: {}", cert_file.to_string_lossy(), key_file.to_string_lossy(), e)).into()),
+		Err(e) => Err(opaque(format!(
+			"failed to load keypair from {} and {}: {}",
+			cert_file.to_string_lossy(),
+			key_file.to_string_lossy(),
+			e
+		))
+		.into()),
 	}
 }
 
 fn certificatekey_from_lua<'l>(tbl: &'l LuaTable) -> LuaResult<Option<rustls::sign::CertifiedKey>> {
 	let (certs, key) = match keypair_from_lua(tbl)? {
 		Some(v) => v,
-		None => return Ok(None)
+		None => return Ok(None),
 	};
 	let key = match rustls::sign::RsaSigningKey::new(&key) {
 		Ok(v) => v,
 		Err(_) => return Err(opaque("invalid RSA key encountered").into()),
 	};
-	Ok(Some(rustls::sign::CertifiedKey{
+	Ok(Some(rustls::sign::CertifiedKey {
 		cert: certs,
 		key: Arc::new(key),
 		ocsp: None,
@@ -209,7 +257,10 @@ fn borrow_named_str<'l>(name: &str, v: &'l LuaValue<'l>) -> Result<&'l str, Stri
 	}
 }
 
-fn read_rootstore_file<P: AsRef<Path>>(name: P, into: &mut rustls::RootCertStore) -> io::Result<()> {
+fn read_rootstore_file<P: AsRef<Path>>(
+	name: P,
+	into: &mut rustls::RootCertStore,
+) -> io::Result<()> {
 	let f = File::open(name.as_ref())?;
 	let mut f = io::BufReader::new(f);
 	let mut certs = Vec::new();
@@ -224,7 +275,10 @@ fn read_rootstore_file<P: AsRef<Path>>(name: P, into: &mut rustls::RootCertStore
 	Ok(())
 }
 
-fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+fn parse_server_config<'l>(
+	lua: &'l Lua,
+	config: LuaTable,
+) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let resolver = DefaultingSNIResolver::new();
 	let default_keypair = match certificatekey_from_lua(&config) {
 		Ok(v) => v,
@@ -252,7 +306,7 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 			"cafile" => {
 				let fname = strerror_ok!(borrow_named_str(k, &v));
 				strerror_ok!(read_rootstore_file(fname, &mut root_store));
-			},
+			}
 			"capath" => {
 				let dirname = strerror_ok!(borrow_named_str(k, &v));
 				for entry in strerror_ok!(read_dir(dirname)) {
@@ -262,35 +316,42 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 					};
 					match entry.file_type() {
 						Err(_) => continue,
-						Ok(t) => if !t.is_file() {
-							continue
-						},
+						Ok(t) => {
+							if !t.is_file() {
+								continue;
+							}
+						}
 					};
 					strerror_ok!(read_rootstore_file(entry.path(), &mut root_store));
 				}
-			},
+			}
 			"verifyext" => {
 				let vs = match v {
 					LuaValue::Table(_) => {
 						strerror_ok!(Vec::<String>::from_lua(v, lua))
-					},
+					}
 					LuaValue::String(_) => {
 						let value = strerror_ok!(borrow_named_str(k, &v));
 						vec![value.into()]
-					},
-					_ => return Ok(Err(format!("invalid value for {:?} option (expected str or table)", k))),
+					}
+					_ => {
+						return Ok(Err(format!(
+							"invalid value for {:?} option (expected str or table)",
+							k
+						)))
+					}
 				};
 				for v in vs {
 					match v.as_str() {
 						"lsec_continue" => {
 							strict_verify = false;
-						},
+						}
 						"lsec_ignore_purpose" => continue,
 						// no idea what this one is supposed to do?!
-						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v)))
+						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v))),
 					};
 				}
-			},
+			}
 			// ignore unknown keys(?)
 			&_ => continue,
 		}
@@ -305,14 +366,19 @@ fn parse_server_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		.with_client_cert_verifier(recorder.clone())
 		.with_cert_resolver(resolver.clone());
 
-	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Server{
-		cfg: Arc::new(cfg),
-		resolver,
-		recorder,
-	})))?))
+	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(
+		TlsConfig::Server {
+			cfg: Arc::new(cfg),
+			resolver,
+			recorder,
+		},
+	)))?))
 }
 
-fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+fn parse_client_config<'l>(
+	lua: &'l Lua,
+	config: LuaTable,
+) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	let mut root_store = rustls::RootCertStore::empty();
 	let mut strict_verify = true;
 	let keypair = keypair_from_lua(&config)?;
@@ -331,7 +397,7 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 			"cafile" => {
 				let fname = strerror_ok!(borrow_named_str(k, &v));
 				strerror_ok!(read_rootstore_file(fname, &mut root_store));
-			},
+			}
 			"capath" => {
 				let dirname = strerror_ok!(borrow_named_str(k, &v));
 				for entry in strerror_ok!(read_dir(dirname)) {
@@ -341,35 +407,42 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 					};
 					match entry.file_type() {
 						Err(_) => continue,
-						Ok(t) => if !t.is_file() {
-							continue
-						},
+						Ok(t) => {
+							if !t.is_file() {
+								continue;
+							}
+						}
 					};
 					strerror_ok!(read_rootstore_file(entry.path(), &mut root_store));
 				}
-			},
+			}
 			"verifyext" => {
 				let vs = match v {
 					LuaValue::Table(_) => {
 						strerror_ok!(Vec::<String>::from_lua(v, lua))
-					},
+					}
 					LuaValue::String(_) => {
 						let value = strerror_ok!(borrow_named_str(k, &v));
 						vec![value.into()]
-					},
-					_ => return Ok(Err(format!("invalid value for {:?} option (expected str or table)", k))),
+					}
+					_ => {
+						return Ok(Err(format!(
+							"invalid value for {:?} option (expected str or table)",
+							k
+						)))
+					}
 				};
 				for v in vs {
 					match v.as_str() {
 						"lsec_continue" => {
 							strict_verify = false;
-						},
+						}
 						"lsec_ignore_purpose" => continue,
 						// no idea what this one is supposed to do?!
-						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v)))
+						_ => return Ok(Err(format!("invalid value for {:?}: {:?}", k, v))),
 					};
 				}
-			},
+			}
 			// ignore unknown keys(?)
 			&_ => continue,
 		}
@@ -388,18 +461,25 @@ fn parse_client_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<L
 		None => cfg.with_no_client_auth(),
 	};
 
-	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(TlsConfig::Client{
-		cfg: Arc::new(cfg),
-		recorder,
-	})))?))
+	Ok(Ok(lua.create_userdata(TlsConfigHandle(Arc::new(
+		TlsConfig::Client {
+			cfg: Arc::new(cfg),
+			recorder,
+		},
+	)))?))
 }
 
-
-pub(crate) fn new_tls_config<'l>(lua: &'l Lua, config: LuaTable) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
+pub(crate) fn new_tls_config<'l>(
+	lua: &'l Lua,
+	config: LuaTable,
+) -> LuaResult<Result<LuaAnyUserData<'l>, String>> {
 	match config.get::<_, String>("mode") {
 		Ok(v) if v == "server" => parse_server_config(lua, config),
 		Ok(v) if v == "client" => parse_client_config(lua, config),
-		Ok(v) => Ok(Err(format!("must be either \"server\" or \"client\", got {:?}", v))),
+		Ok(v) => Ok(Err(format!(
+			"must be either \"server\" or \"client\", got {:?}",
+			v
+		))),
 		Err(e) => Ok(Err(format!("mode is absent or of invalid type: {}", e))),
 	}
 }
@@ -412,7 +492,7 @@ fn protocol_str(p: rustls::ProtocolVersion) -> &'static str {
 		rustls::ProtocolVersion::TLSv1_1 => "TLSv1.1",
 		rustls::ProtocolVersion::TLSv1_2 => "TLSv1.2",
 		rustls::ProtocolVersion::TLSv1_3 => "TLSv1.3",
-		rustls::ProtocolVersion::Unknown(_) => "unknown"
+		rustls::ProtocolVersion::Unknown(_) => "unknown",
 	}
 }
 
@@ -428,7 +508,7 @@ pub(crate) struct HandshakeInfo {
 
 impl From<&rustls::server::ServerConnection> for HandshakeInfo {
 	fn from(other: &rustls::server::ServerConnection) -> Self {
-		Self{
+		Self {
 			protocol: other.protocol_version().unwrap(),
 			cipher: other.negotiated_cipher_suite().unwrap(),
 		}
@@ -437,7 +517,7 @@ impl From<&rustls::server::ServerConnection> for HandshakeInfo {
 
 impl From<&rustls::client::ClientConnection> for HandshakeInfo {
 	fn from(other: &rustls::client::ClientConnection) -> Self {
-		Self{
+		Self {
 			protocol: other.protocol_version().unwrap(),
 			cipher: other.negotiated_cipher_suite().unwrap(),
 		}

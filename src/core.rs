@@ -8,9 +8,9 @@ use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
 use std::ops::{Deref, Drop};
-use std::time::{SystemTime, Instant};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 
@@ -22,7 +22,7 @@ use tokio::sync;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use tokio_rustls::server::{TlsStream as ServerTlsStream};
+use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use crate::conversion::opaque;
 use crate::tls;
@@ -37,7 +37,7 @@ See the docs of the individual variants for details.
 #[derive(Debug)]
 pub(crate) enum Message {
 	/// A timer has elapsed.
-	TimerElapsed{
+	TimerElapsed {
 		/// The registry key of the timer handle.
 		handle: LuaRegistryHandle,
 		/// The timestamp at which the timer tripped.
@@ -49,7 +49,7 @@ pub(crate) enum Message {
 	},
 
 	/// A plain-text TCP-like connection has been accepted.
-	TcpAccept{
+	TcpAccept {
 		/// The registry key of the (server) handle to which the connection belongs
 		handle: LuaRegistryHandle,
 		/// The newly accepted stream
@@ -59,7 +59,7 @@ pub(crate) enum Message {
 	},
 
 	/// A TLS-encrypted TCP-like connection has been accepted.
-	TlsAccept{
+	TlsAccept {
 		/// The registry key of the (server) handle to which the connection belongs
 		handle: LuaRegistryHandle,
 		/// The newly accepted stream
@@ -71,19 +71,19 @@ pub(crate) enum Message {
 	},
 
 	/// TLS was started on an existing connection
-	TlsStarted{
+	TlsStarted {
 		/// The registry key of the connection handle
 		handle: LuaRegistryHandle,
 		/// Information about the TLS connection.
 		tls_info: tls::Info,
 	},
 
-	Incoming{
+	Incoming {
 		handle: LuaRegistryHandle,
 		data: Bytes,
 	},
 
-	ReadTimeout{
+	ReadTimeout {
 		handle: LuaRegistryHandle,
 
 		/// Reply channel to decide what to do with the socket
@@ -95,37 +95,37 @@ pub(crate) enum Message {
 		keepalive: oneshot::Sender<bool>,
 	},
 
-	Connect{
+	Connect {
 		/// The registry key of the connection handle
 		handle: LuaRegistryHandle,
 	},
 
-	Disconnect{
+	Disconnect {
 		/// The registry key of the connection handle
 		handle: LuaRegistryHandle,
 		error: Option<Box<dyn Error + Send + 'static>>,
 	},
 
 	/// watchfd notification
-	Readable{
+	Readable {
 		handle: LuaRegistryHandle,
 		confirm: oneshot::Sender<()>,
 	},
 
 	/// watchfd notification
-	Writable{
+	Writable {
 		handle: LuaRegistryHandle,
 		confirm: oneshot::Sender<()>,
 	},
 
-	Signal{
+	Signal {
 		/// The registry key of the function to invoke
 		handle: LuaRegistryHandle,
 	},
 
 	/// Error which is unrelated to a specific connection, e.g. during an accept()
 	#[cfg(feature = "prosody-log")]
-	Log{
+	Log {
 		level: &'static str,
 		message: Cow<'static, str>,
 		error: Option<Box<dyn Error + Send + 'static>>,
@@ -142,7 +142,10 @@ impl<T> MpscChannel<T> {
 	/// Create a new channel with the given depth
 	fn new(depth: usize) -> Self {
 		let (tx, rx) = mpsc::channel(depth);
-		Self{rx: Mutex::new(rx), tx}
+		Self {
+			rx: Mutex::new(rx),
+			tx,
+		}
 	}
 
 	/// Lock the receiver
@@ -151,7 +154,10 @@ impl<T> MpscChannel<T> {
 	pub(crate) fn lock_rx_lua(&self) -> LuaResult<MutexGuard<'_, mpsc::Receiver<T>>> {
 		match self.rx.lock() {
 			Ok(l) => Ok(l),
-			Err(_) => Err(opaque("something has paniced before and accessing the global receiver is unsafe now").into()),
+			Err(_) => Err(opaque(
+				"something has paniced before and accessing the global receiver is unsafe now",
+			)
+			.into()),
 		}
 	}
 
@@ -184,7 +190,9 @@ lazy_static! {
 	pub(crate) static ref GC_FLAG: AtomicBool = AtomicBool::new(false);
 }
 
-pub(crate) fn get_runtime<'x>(guard: &'x RwLockReadGuard<'x, Option<Runtime>>) -> LuaResult<&'x Runtime> {
+pub(crate) fn get_runtime<'x>(
+	guard: &'x RwLockReadGuard<'x, Option<Runtime>>,
+) -> LuaResult<&'x Runtime> {
 	match guard.as_ref() {
 		Some(v) => Ok(v),
 		None => Err(opaque("server backend runtime has exited").into()),
@@ -217,7 +225,7 @@ impl Drop for GcOnDrop {
 	}
 }
 
-pub(crate) struct GcLuaRegistryKey{
+pub(crate) struct GcLuaRegistryKey {
 	inner: LuaRegistryKey,
 	#[allow(dead_code)]
 	guard: GcOnDrop,
@@ -225,7 +233,10 @@ pub(crate) struct GcLuaRegistryKey{
 
 impl From<LuaRegistryKey> for GcLuaRegistryKey {
 	fn from(other: LuaRegistryKey) -> Self {
-		Self{inner: other, guard: GcOnDrop::prepare()}
+		Self {
+			inner: other,
+			guard: GcOnDrop::prepare(),
+		}
 	}
 }
 
@@ -305,7 +316,11 @@ impl<'s> fmt::Display for ListenerError<'s> {
 impl<'s> std::error::Error for ListenerError<'s> {}
 
 #[must_use]
-pub(crate) fn call_listener<'l, 'n, P: ToLuaMulti<'l>, R: FromLuaMulti<'l>>(listeners: &'l LuaTable<'l>, listener: &'n str, p: P) -> Result<R, ListenerError<'n>> {
+pub(crate) fn call_listener<'l, 'n, P: ToLuaMulti<'l>, R: FromLuaMulti<'l>>(
+	listeners: &'l LuaTable<'l>,
+	listener: &'n str,
+	p: P,
+) -> Result<R, ListenerError<'n>> {
 	let func = match listeners.get::<_, Option<LuaFunction>>(listener)? {
 		Some(func) => func,
 		None => return Err(ListenerError::NotFound(listener)),
@@ -314,7 +329,11 @@ pub(crate) fn call_listener<'l, 'n, P: ToLuaMulti<'l>, R: FromLuaMulti<'l>>(list
 }
 
 #[must_use]
-pub(crate) fn may_call_listener<'l, 'n, P: ToLuaMulti<'l>>(listeners: &'l LuaTable<'l>, listener: &'n str, p: P) -> LuaResult<()> {
+pub(crate) fn may_call_listener<'l, 'n, P: ToLuaMulti<'l>>(
+	listeners: &'l LuaTable<'l>,
+	listener: &'n str,
+	p: P,
+) -> LuaResult<()> {
 	match call_listener::<P, ()>(listeners, listener, p) {
 		Ok(()) => Ok(()),
 		Err(e) => e.lua_error(),
@@ -359,21 +378,22 @@ high overhead. Avoid calling this in places which may be invoked frequently.
 */
 #[macro_export]
 macro_rules! send_log {
-	($level:expr, $msg:literal, $error:expr) => {
+	($level:expr, $msg:literal, $error:expr) => {{
+		#[cfg(feature = "prosody-log")]
 		{
-			#[cfg(feature = "prosody-log")]
-			{
-				crate::core::MAIN_CHANNEL.fire_and_forget(crate::core::Message::Log{
+			crate::core::MAIN_CHANNEL
+				.fire_and_forget(crate::core::Message::Log {
 					level: $level,
 					message: std::borrow::Cow::Borrowed($msg),
-					error: $error.map(|x| { Box::new(x) as Box::<dyn std::error::Error + Send + 'static> }),
-				}).await;
-			}
-			#[cfg(not(feature = "prosody-log"))]
-			{
-				// silenced used value
-				let _ = ($level, $msg, $error);
-			}
+					error: $error
+						.map(|x| Box::new(x) as Box<dyn std::error::Error + Send + 'static>),
+				})
+				.await;
 		}
-	};
+		#[cfg(not(feature = "prosody-log"))]
+		{
+			// silenced used value
+			let _ = ($level, $msg, $error);
+		}
+	}};
 }

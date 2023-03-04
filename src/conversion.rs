@@ -10,7 +10,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct OpaqueError(String);
 
@@ -45,7 +44,6 @@ impl From<OpaqueError> for LuaError {
 	}
 }
 
-
 /**
 Convert a `Result<T, E>` into a `Result<T, String>` and return any error
 immediately (stringified)
@@ -59,7 +57,7 @@ macro_rules! strerror {
 			Ok(v) => v,
 			Err(e) => return Err(e.to_string()),
 		}
-	}
+	};
 }
 
 /**
@@ -75,9 +73,8 @@ macro_rules! strerror_ok {
 			Ok(v) => v,
 			Err(e) => return Ok(Err(e.to_string())),
 		}
-	}
+	};
 }
-
 
 pub(crate) fn borrow_str<'l>(v: &'l LuaValue<'l>) -> Result<&'l str, String> {
 	match v {
@@ -88,7 +85,6 @@ pub(crate) fn borrow_str<'l>(v: &'l LuaValue<'l>) -> Result<&'l str, String> {
 		_ => Err(format!("expected string, found {}", v.type_name())),
 	}
 }
-
 
 pub(crate) fn to_ipaddr<'l>(addr: &LuaValue<'l>) -> Result<IpAddr, String> {
 	let addr = borrow_str(&addr)?;
@@ -102,30 +98,31 @@ pub(crate) fn to_ipaddr<'l>(addr: &LuaValue<'l>) -> Result<IpAddr, String> {
 	}
 }
 
-
 pub(crate) fn to_duration<'l>(v: LuaValue) -> LuaResult<Duration> {
 	match v {
 		LuaValue::Number(fsecs) => {
 			let secs: u64 = match (fsecs as i64).try_into() {
 				Ok(v) => v,
-				Err(e) => return Err(LuaError::FromLuaConversionError{
-					from: v.type_name(),
-					to: "Duration",
-					message: Some(e.to_string()),
-				}),
+				Err(e) => {
+					return Err(LuaError::FromLuaConversionError {
+						from: v.type_name(),
+						to: "Duration",
+						message: Some(e.to_string()),
+					})
+				}
 			};
 			let nanos = (fsecs.fract() * 1e9) as u32;
 			Ok(Duration::new(secs, nanos))
-		},
+		}
 		LuaValue::Integer(secs) => match secs.try_into() {
 			Ok(v) => Ok(Duration::new(v, 0)),
-			Err(e) => Err(LuaError::FromLuaConversionError{
+			Err(e) => Err(LuaError::FromLuaConversionError {
 				from: v.type_name(),
 				to: "Duration",
 				message: Some(e.to_string()),
-			})
+			}),
 		},
-		_ => Err(LuaError::FromLuaConversionError{
+		_ => Err(LuaError::FromLuaConversionError {
 			from: v.type_name(),
 			to: "Duration",
 			message: Some("number required".to_string()),

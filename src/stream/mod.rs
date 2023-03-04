@@ -11,25 +11,17 @@ Related modules:
 - [`crate::server`] which handles listening sockets.
 */
 
-mod state;
-mod msg;
-mod worker;
 mod connect;
 mod handle;
 mod lua;
+mod msg;
+mod state;
+mod worker;
 
-pub(crate) use state::{
-	StateTransitionError,
-};
+pub(crate) use state::StateTransitionError;
 
-pub(crate) use handle::{
-	StreamHandle,
-};
+pub(crate) use handle::StreamHandle;
 
 pub(crate) use lua::{
-	get_listeners,
-	addclient,
-	wrapclient,
-	spawn_accepted_tcp_worker,
-	spawn_accepted_tlstcp_worker,
+	addclient, get_listeners, spawn_accepted_tcp_worker, spawn_accepted_tlstcp_worker, wrapclient,
 };

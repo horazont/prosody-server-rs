@@ -8,10 +8,8 @@ use std::time::Duration;
 
 use lazy_static::lazy_static;
 
-use crate::{strerror_ok, prosody_log_g};
-use crate::conversion::{
-	to_duration,
-};
+use crate::conversion::to_duration;
+use crate::{prosody_log_g, strerror_ok};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StreamConfig {
@@ -24,7 +22,7 @@ pub(crate) struct StreamConfig {
 impl Default for StreamConfig {
 	fn default() -> Self {
 		// these defaults are based on today's server_epoll
-		Self{
+		Self {
 			read_timeout: Duration::new(14 * 60, 0),
 			send_timeout: Duration::new(180, 0),
 			read_size: 8192,
@@ -42,7 +40,7 @@ pub(crate) struct ServerConfig {
 impl Default for ServerConfig {
 	fn default() -> Self {
 		// these defaults are based on today's server_epoll
-		Self{
+		Self {
 			accept_retry_interval: Duration::new(10, 0),
 		}
 	}
@@ -56,19 +54,18 @@ pub(crate) struct ClientConfig {
 impl Default for ClientConfig {
 	fn default() -> Self {
 		// these defaults are based on today's server_epoll
-		Self{
+		Self {
 			connect_timeout: Duration::new(20, 0),
 		}
 	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LoopConfig {
-}
+pub(crate) struct LoopConfig {}
 
 impl Default for LoopConfig {
 	fn default() -> Self {
-		Self{}
+		Self {}
 	}
 }
 
@@ -81,7 +78,11 @@ pub(crate) struct Config {
 }
 
 impl Config {
-	pub(crate) fn update<'l>(&mut self, lua: &'l Lua, options: LuaTable) -> LuaResult<Result<bool, String>> {
+	pub(crate) fn update<'l>(
+		&mut self,
+		lua: &'l Lua,
+		options: LuaTable,
+	) -> LuaResult<Result<bool, String>> {
 		for kv in options.pairs::<LuaValue, LuaValue>() {
 			let (k, v) = kv?;
 			let k = match k {
@@ -92,10 +93,19 @@ impl Config {
 				b"read_timeout" => self.stream.read_timeout = strerror_ok!(to_duration(v)),
 				b"send_timeout" => self.stream.send_timeout = strerror_ok!(to_duration(v)),
 				b"read_size" => self.stream.read_size = strerror_ok!(usize::from_lua(v, lua)),
-				b"ssl_handshake_timeout" => self.stream.ssl_handshake_timeout = strerror_ok!(to_duration(v)),
-				b"accept_retry_interval" => self.server.accept_retry_interval = strerror_ok!(to_duration(v)),
+				b"ssl_handshake_timeout" => {
+					self.stream.ssl_handshake_timeout = strerror_ok!(to_duration(v))
+				}
+				b"accept_retry_interval" => {
+					self.server.accept_retry_interval = strerror_ok!(to_duration(v))
+				}
 				b"connect_timeout" => self.client.connect_timeout = strerror_ok!(to_duration(v)),
-				_ => prosody_log_g!(lua, "warn", "ignoring unsupported network config option: %q", k),
+				_ => prosody_log_g!(
+					lua,
+					"warn",
+					"ignoring unsupported network config option: %q",
+					k
+				),
 			}
 		}
 		Ok(Ok(true))
@@ -111,6 +121,11 @@ pub(crate) fn reconfigure<'l>(lua: &'l Lua, options: LuaTable) -> LuaResult<Resu
 	strerror_ok!(new_config.update(lua, options)?);
 	let mut active_config = CONFIG.write().unwrap();
 	*active_config = new_config;
-	prosody_log_g!(lua, "debug", "Reconfigured: %s", format!("{:?}", *active_config));
+	prosody_log_g!(
+		lua,
+		"debug",
+		"Reconfigured: %s",
+		format!("{:?}", *active_config)
+	);
 	Ok(Ok(true))
 }

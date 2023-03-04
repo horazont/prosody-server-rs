@@ -6,10 +6,7 @@ use tokio_rustls::rustls;
 use crate::tls;
 use crate::verify;
 
-use super::msg::{
-	ControlMessage,
-};
-
+use super::msg::ControlMessage;
 
 /**
 TLS context configuration.
@@ -27,10 +24,8 @@ pub(crate) enum PreTlsConfig {
 	ClientSide(
 		/// The server name to connect to. This is mandatory in rustls.
 		rustls::ServerName,
-
 		/// The rustls client configuration.
 		Arc<rustls::ClientConfig>,
-
 		/// A handle on the verification recorder for use during the
 		/// handshake.
 		///
@@ -42,7 +37,6 @@ pub(crate) enum PreTlsConfig {
 	ServerSide(
 		/// The rustls server configuration.
 		Arc<rustls::ServerConfig>,
-
 		/// A handle on the verification recorder for use during the
 		/// handshake.
 		///
@@ -96,8 +90,12 @@ impl fmt::Display for StateTransitionError {
 			Self::TlsAlreadyConfirmed => f.write_str("invalid operation: TLS already confirmed"),
 			Self::TlsInProgress => f.write_str("invalid operation: TLS handshake in progress"),
 			Self::TlsEstablished => f.write_str("invalid operation: TLS already established"),
-			Self::ContextRequired => f.write_str("incomplete config: cannot start TLS without a context"),
-			Self::PeerNameRequired => f.write_str("incomplete config: peer name required to initiate TLS"),
+			Self::ContextRequired => {
+				f.write_str("incomplete config: cannot start TLS without a context")
+			}
+			Self::PeerNameRequired => {
+				f.write_str("incomplete config: peer name required to initiate TLS")
+			}
 			Self::NotConnected => f.write_str("invalid state: not connected"),
 			Self::Failed => f.write_str("connection handle poisoned"),
 		}
@@ -128,9 +126,7 @@ pub(crate) enum StreamState {
 	TlsHandshaking,
 
 	/// The TLS handshake has completed.
-	Tls{
-		info: tls::Info,
-	},
+	Tls { info: tls::Info },
 
 	/// The connection has been closed either locally or remotely.
 	Disconnected,
@@ -145,18 +141,21 @@ impl StreamState {
 	///
 	/// **Note:** If `f` panics, the `StreamState` will be set to `Failed`.
 	#[inline]
-	fn transition_impl<T, F: FnOnce(Self) -> Result<(Self, T), (Self, StateTransitionError)>>(&mut self, f: F) -> Result<T, StateTransitionError> {
+	fn transition_impl<T, F: FnOnce(Self) -> Result<(Self, T), (Self, StateTransitionError)>>(
+		&mut self,
+		f: F,
+	) -> Result<T, StateTransitionError> {
 		let mut tmp = Self::Failed;
 		std::mem::swap(&mut tmp, self);
 		let result = match f(tmp) {
 			Ok((new, v)) => {
 				tmp = new;
 				Ok(v)
-			},
+			}
 			Err((new, err)) => {
 				tmp = new;
 				Err(err)
-			},
+			}
 		};
 		std::mem::swap(&mut tmp, self);
 		result
@@ -169,13 +168,9 @@ impl StreamState {
 	///
 	/// Returns true if a transition took place.
 	pub(crate) fn connect<'l>(&mut self) -> Result<bool, StateTransitionError> {
-		self.transition_impl(|this| {
-			match this {
-				Self::Connecting(tls) => {
-					Ok((Self::Plain(tls), true))
-				},
-				_ => Ok((this, false)),
-			}
+		self.transition_impl(|this| match this {
+			Self::Connecting(tls) => Ok((Self::Plain(tls), true)),
+			_ => Ok((this, false)),
 		})
 	}
 
@@ -189,19 +184,16 @@ impl StreamState {
 	///
 	/// If the stream is in a state other than the ones mentioned above, an
 	/// error is returned and no transition takes place.
-	pub(crate) fn confirm_tls<'l>(&mut self, info: tls::Info) -> Result<bool, StateTransitionError> {
-		self.transition_impl(|this| {
-			match this {
-				Self::TlsHandshaking | Self::Plain(..) => {
-					Ok((Self::Tls{info}, false))
-				},
-				Self::Connecting(..) => {
-					Ok((Self::Tls{info}, true))
-				},
-				Self::Disconnected => Err((this, StateTransitionError::NotConnected)),
-				Self::Failed => Err((this, StateTransitionError::Failed)),
-				Self::Tls{..} => Err((this, StateTransitionError::TlsAlreadyConfirmed)),
-			}
+	pub(crate) fn confirm_tls<'l>(
+		&mut self,
+		info: tls::Info,
+	) -> Result<bool, StateTransitionError> {
+		self.transition_impl(|this| match this {
+			Self::TlsHandshaking | Self::Plain(..) => Ok((Self::Tls { info }, false)),
+			Self::Connecting(..) => Ok((Self::Tls { info }, true)),
+			Self::Disconnected => Err((this, StateTransitionError::NotConnected)),
+			Self::Failed => Err((this, StateTransitionError::Failed)),
+			Self::Tls { .. } => Err((this, StateTransitionError::TlsAlreadyConfirmed)),
 		})
 	}
 
@@ -212,11 +204,9 @@ impl StreamState {
 	///
 	/// Returns true if the state was previously not `Disconnected`.
 	pub(crate) fn disconnect<'l>(&mut self) -> Result<bool, StateTransitionError> {
-		self.transition_impl(|this| {
-			match this {
-				Self::Disconnected => Ok((this, false)),
-				_ => Ok((Self::Disconnected, true)),
-			}
+		self.transition_impl(|this| match this {
+			Self::Disconnected => Ok((this, false)),
+			_ => Ok((Self::Disconnected, true)),
 		})
 	}
 
@@ -230,33 +220,47 @@ impl StreamState {
 	///
 	/// Otherwise, the [`ControlMessage`] required to initiate or accept a TLS
 	/// connection is returned and the state transitions to `TlsHandshaking`.
-	pub(super) fn start_tls(&mut self, given_config: Option<&tls::TlsConfig>, given_servername: Option<rustls::ServerName>) -> Result<ControlMessage, StateTransitionError> {
+	pub(super) fn start_tls(
+		&mut self,
+		given_config: Option<&tls::TlsConfig>,
+		given_servername: Option<rustls::ServerName>,
+	) -> Result<ControlMessage, StateTransitionError> {
 		self.transition_impl(|this| {
 			let tls_config = match this {
 				Self::TlsHandshaking => return Err((this, StateTransitionError::TlsInProgress)),
-				Self::Tls{..} => return Err((this, StateTransitionError::TlsEstablished)),
+				Self::Tls { .. } => return Err((this, StateTransitionError::TlsEstablished)),
 				Self::Failed => return Err((this, StateTransitionError::Failed)),
-				Self::Connecting(_) | Self::Disconnected => return Err((this, StateTransitionError::NotConnected)),
+				Self::Connecting(_) | Self::Disconnected => {
+					return Err((this, StateTransitionError::NotConnected))
+				}
 				Self::Plain(ref tls) => tls,
 			};
 
 			let msg = match tls_config {
 				PreTlsConfig::None => match given_config {
 					// We can only *accept* connections based on the given config, as we lack a target hostname
-					Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
-						Some(v) => ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()),
+					Some(tls::TlsConfig::Client { cfg, recorder }) => match given_servername {
+						Some(v) => {
+							ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone())
+						}
 						None => return Err((this, StateTransitionError::PeerNameRequired)),
 					},
-					Some(tls::TlsConfig::Server{cfg, recorder, ..}) => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
+					Some(tls::TlsConfig::Server { cfg, recorder, .. }) => {
+						ControlMessage::AcceptTls(cfg.clone(), recorder.clone())
+					}
 					None => return Err((this, StateTransitionError::ContextRequired)),
 				},
 				PreTlsConfig::ServerSide(cfg, recorder) => match given_config {
 					// We can only *accept* connections based on the given config, as we lack a target hostname
-					Some(tls::TlsConfig::Client{cfg, recorder}) => match given_servername {
-						Some(v) => ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone()),
+					Some(tls::TlsConfig::Client { cfg, recorder }) => match given_servername {
+						Some(v) => {
+							ControlMessage::ConnectTls(v.to_owned(), cfg.clone(), recorder.clone())
+						}
 						None => return Err((this, StateTransitionError::PeerNameRequired)),
 					},
-					Some(tls::TlsConfig::Server{cfg, recorder, ..}) => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
+					Some(tls::TlsConfig::Server { cfg, recorder, .. }) => {
+						ControlMessage::AcceptTls(cfg.clone(), recorder.clone())
+					}
 					None => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
 				},
 				PreTlsConfig::ClientSide(name, cfg, recorder) => {
@@ -266,11 +270,15 @@ impl StreamState {
 					};
 					match given_config {
 						// We can only *accept* connections based on the given config, as we lack a target hostname
-						Some(tls::TlsConfig::Client{cfg, recorder}) => ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone()),
-						Some(tls::TlsConfig::Server{cfg, recorder, ..}) => ControlMessage::AcceptTls(cfg.clone(), recorder.clone()),
+						Some(tls::TlsConfig::Client { cfg, recorder }) => {
+							ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone())
+						}
+						Some(tls::TlsConfig::Server { cfg, recorder, .. }) => {
+							ControlMessage::AcceptTls(cfg.clone(), recorder.clone())
+						}
 						None => ControlMessage::ConnectTls(name, cfg.clone(), recorder.clone()),
 					}
-				},
+				}
 			};
 
 			Ok((StreamState::TlsHandshaking, msg))
